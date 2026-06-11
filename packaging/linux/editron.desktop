@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Editron
+GenericName=Videoschnitt
+GenericName[en]=Video Editor
+Comment=Natives Videoschnittprogramm
+Comment[en]=Native video editor
+Exec=editron %f
+Icon=editron
+Terminal=false
+Categories=AudioVideo;AudioVideoEditing;Video;
+MimeType=application/x-editron-project;
+StartupWMClass=editron

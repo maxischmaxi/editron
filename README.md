@@ -1,26 +1,63 @@
 # Editron
 
-Ein modernes, modulares Videoschnittprogramm — gebaut mit **Rust, Tauri 2 und FFmpeg**, mit dem Anspruch, mit DaVinci Resolve und Adobe Premiere Pro mitzuhalten.
+Ein modernes, modulares Videoschnittprogramm — komplett in **Rust mit raylib
+und FFmpeg** gebaut, mit dem Anspruch, mit DaVinci Resolve und Adobe Premiere
+Pro mitzuhalten. Kein Webview, kein Electron: das gesamte UI ist ein eigenes
+komponentenbasiertes Immediate-Mode-Framework auf raylib, alles läuft in einem
+einzigen nativen Prozess.
 
 ## Highlights
 
-- **Modulares Panel-System wie in Premiere:** alle Panels (Timeline, Monitore, Medien-Browser, Effekte, …) sind andockbare Tabs und frei anordenbar (dockview).
-- **Workspaces:** Medien · Schnitt · Farbe · Effekte · Audio · Grafik — ein Klick wechselt den Kontext, Layout-Änderungen werden pro Workspace gespeichert.
-- **Shortcuts für alles:** Jede Funktion ist ein Command und frei belegbar (inkl. Mehrfach-Sequenzen wie `Strg+K Strg+S`). Presets für **Adobe Premiere Pro** und **DaVinci Resolve** erleichtern den Umstieg. Funktioniert auf Windows, macOS und Linux.
-- **FFmpeg-Engine:** Medien-Analyse (ffprobe), Thumbnails, Waveforms und Export/Transcode mit Live-Fortschritt laufen über FFmpeg im Rust-Backend.
+- **Modulares Panel-System wie in Premiere:** alle Panels (Timeline, Monitore,
+  Medien-Browser, Effekte, …) sind andockbare Tabs und frei anordenbar —
+  inklusive Tab-Drag&Drop mit Drop-Zonen und Sash-Resize.
+- **Workspaces:** Medien · Schnitt · Farbe · Effekte · Audio · Grafik — ein
+  Klick wechselt den Kontext, Layout-Änderungen werden pro Workspace gespeichert.
+- **Shortcuts für alles:** Jede Funktion ist ein Command und frei belegbar
+  (inkl. Mehrfach-Sequenzen wie `Strg+K Strg+S`). Presets für **Adobe Premiere
+  Pro** und **DaVinci Resolve** erleichtern den Umstieg.
+- **Timeline-Editing:** verknüpfte A/V-Clips, Undo/Redo, Overwrite-Insert,
+  Trim/Ripple/Roll/Slip/Slide/Razor, Snapping mit Hilfslinie, Marquee,
+  Drag&Drop aus dem Medien-Browser mit Platzierungs-Vorschau.
+- **FFmpeg-Engine:** Medien-Analyse (ffprobe), Thumbnails, Waveforms und
+  Export/Transcode mit Live-Fortschritt; die Wiedergabe dekodiert Video über
+  ffmpeg-Pipes direkt in GPU-Texturen und Audio in raylib-AudioStreams.
 
 ## Entwicklung
 
-Voraussetzungen: Rust (stable), Node 20+, pnpm, FFmpeg/ffprobe im PATH (alternativ `EDITRON_FFMPEG_PATH`/`EDITRON_FFPROBE_PATH` setzen). Unter Linux zusätzlich webkit2gtk 4.1.
+Voraussetzungen: Rust (stable), FFmpeg/ffprobe im PATH (alternativ
+`EDITRON_FFMPEG_PATH`/`EDITRON_FFPROBE_PATH` setzen). Unter Linux zusätzlich
+`cmake` und X11-/Wayland-Dev-Pakete (raylib wird aus dem Quelltext mitgebaut)
+sowie `fontconfig` für die Schrift-Auflösung (Inter → Noto Sans, JetBrains Mono).
 
 ```bash
-pnpm install
-pnpm tauri dev    # App starten
-pnpm typecheck    # TypeScript prüfen
+cargo run             # App starten (Dev-Profil)
+cargo check           # Typen/Borrows prüfen
+cargo build --release # Release-Build
 ```
 
-### Bekannte Stolperfalle: NVIDIA + Wayland
+## Test- & Debug-Flags
 
-webkit2gtk crasht mit dem proprietären NVIDIA-Treiber unter Wayland (GDK „Error 71"). Editron setzt deshalb auf solchen Systemen automatisch `WEBKIT_DISABLE_DMABUF_RENDERER=1` (siehe `src-tauri/src/main.rs`). Wer das Verhalten selbst steuern will, kann die Variable vor dem Start explizit setzen.
+| Variable | Wirkung |
+| --- | --- |
+| `EDITRON_SHOT=pfad.png` | Screenshot nach N Frames, dann beenden |
+| `EDITRON_SHOT_FRAME=300` | Frame-Nummer für den Screenshot (Default 30) |
+| `EDITRON_TEST_IMPORT=a.mp4:b.mp3` | Dateien beim Start importieren |
+| `EDITRON_TEST_TIMELINE=1` | Importierte Medien ans Sequenzende einfügen |
+| `EDITRON_TEST_PLAY=1` | Programm-Wiedergabe automatisch starten |
+| `EDITRON_TEST_WORKSPACE=media` | Workspace beim Start wechseln |
 
-Architektur-Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+Beispiel für einen visuellen Smoke-Test ohne Interaktion:
+
+```bash
+EDITRON_SHOT=shot.png EDITRON_SHOT_FRAME=300 \
+EDITRON_TEST_IMPORT=clip.mp4 EDITRON_TEST_TIMELINE=1 EDITRON_TEST_PLAY=1 \
+./target/debug/editron
+```
+
+## Architektur
+
+Siehe [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Kurzfassung: Alles ist
+ein Command (Registry + when-Klauseln), Panels sind Module mit eigenem
+UI-State, Workspaces sind persistierte Dock-Layouts, FFmpeg ist bewusst ein
+externes Binary.

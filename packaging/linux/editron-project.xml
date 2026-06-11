@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-editron-project">
+    <comment>Editron-Projekt</comment>
+    <comment xml:lang="en">Editron project</comment>
+    <sub-class-of type="application/json"/>
+    <glob pattern="*.etron"/>
+    <!-- JSON beginnt mit {"format":"editron-project", … -->
+    <magic priority="80">
+      <match type="string" offset="0:64" value="editron-project"/>
+    </magic>
+    <icon name="editron"/>
+  </mime-type>
+</mime-info>

@@ -1,10 +1,8 @@
-# Node
-node_modules/
-dist/
+# Rust
+target/
 
-# Rust / Tauri
-src-tauri/target/
-src-tauri/gen/schemas/
+# Screenshots aus dem EDITRON_SHOT-Testmodus
+/*.png
 
 # Misc
 .DS_Store
