@@ -73,6 +73,8 @@ pub struct AppStore {
     pub status_message: Option<String>,
     status_deadline: f64,
     pub ffmpeg: Option<FfmpegInfo>,
+    /// Verfügbare ffmpeg-Encoder (None = noch nicht erfragt).
+    pub encoders: Option<std::collections::HashSet<String>>,
     /// Fokussiertes Panel (Kontext-Key `panel`) — zuletzt angeklicktes Panel.
     pub focused_panel: String,
 }
@@ -87,6 +89,7 @@ impl Default for AppStore {
             status_message: None,
             status_deadline: 0.0,
             ffmpeg: None,
+            encoders: None,
             focused_panel: String::new(),
         }
     }

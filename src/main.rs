@@ -96,8 +96,14 @@ impl App {
                             ),
                             now,
                         );
+                    } else {
+                        // Encoder-Liste für die Export-Validierung nachladen.
+                        self.services.request_encoder_list();
                     }
                     self.state.app.ffmpeg = Some(info);
+                }
+                ServiceEvent::EncoderListReady(set) => {
+                    self.state.app.encoders = Some(set);
                 }
                 ServiceEvent::AssetImported(asset) => {
                     // Duplikate (gleicher Pfad) überspringen.
@@ -140,18 +146,38 @@ impl App {
                 ServiceEvent::WaveformFailed { asset_id } => {
                     self.state.media.waveforms.insert(asset_id, None);
                 }
-                ServiceEvent::TranscodeProgress {
+                ServiceEvent::SequenceExportProgress {
                     job_id,
-                    progress_pct,
-                    speed,
-                    ..
+                    pct,
+                    phase,
+                    frames_done,
+                    frames_total,
+                    render_fps,
+                    eta_sec,
                 } => {
-                    self.export_dialog.on_progress(&job_id, progress_pct, speed);
+                    self.export_dialog.on_progress(
+                        &job_id,
+                        pct,
+                        phase,
+                        frames_done,
+                        frames_total,
+                        render_fps,
+                        eta_sec,
+                    );
                 }
-                ServiceEvent::TranscodeDone { job_id, ok, error } => {
-                    self.export_dialog.on_done(&job_id, ok, error.clone());
+                ServiceEvent::SequenceExportDone {
+                    job_id,
+                    ok,
+                    cancelled,
+                    error,
+                    output,
+                } => {
+                    self.export_dialog
+                        .on_done(&job_id, ok, cancelled, error.clone(), &output);
                     let msg = if ok {
-                        "Export abgeschlossen".to_string()
+                        format!("Export abgeschlossen: {output}")
+                    } else if cancelled {
+                        "Export abgebrochen".to_string()
                     } else {
                         format!("Export fehlgeschlagen: {}", error.unwrap_or_default())
                     };
@@ -333,6 +359,15 @@ fn main() {
     if let Ok(ws) = std::env::var("EDITRON_TEST_WORKSPACE") {
         state::set_active_workspace(&mut app.state, &ws);
     }
+    // Testmodus: Dialog beim Start öffnen (EDITRON_TEST_DIALOG=export|shortcuts|relink)
+    if let Ok(dialog) = std::env::var("EDITRON_TEST_DIALOG") {
+        app.state.app.open_dialog = match dialog.as_str() {
+            "export" => Some(stores::DialogId::Export),
+            "shortcuts" => Some(stores::DialogId::Shortcuts),
+            "relink" => Some(stores::DialogId::Relink),
+            _ => None,
+        };
+    }
     // Testmodus: Werkzeug vorwählen (EDITRON_TEST_TOOL=razor) und Maus
     // synthetisch positionieren (EDITRON_TEST_MOUSE=x,y) — für Screenshots
     // von Hover-Zuständen (z. B. Razor-Vorschau, Tooltips).
@@ -506,14 +541,20 @@ fn main() {
         }
     }
 
+    // Laufende Exporte hart beenden — sonst rendern ffmpeg-Waisen weiter.
+    app.services.cancel_all_jobs();
     // Layout des aktiven Workspace sichern (pagehide-Pendant).
     let ws = app.state.app.active_workspace.clone();
     app.state.dock.save_layout_for(&ws);
     app.state.keymap.save();
     // Ungespeicherte Projektänderungen sichern: mit Pfad direkt speichern,
     // ohne Pfad als Sitzungs-Autosave (Datei-Menü → „Letzte Sitzung …“).
-    if let Some(msg) = project::safeguard_unsaved(&mut app.state) {
-        eprintln!("[project] {msg}");
+    // Nicht im Screenshot-/Testmodus — Testläufe würden sonst den
+    // Sitzungs-Autosave des Nutzers mit Test-Timelines überschreiben.
+    if shot_path.is_none() {
+        if let Some(msg) = project::safeguard_unsaved(&mut app.state) {
+            eprintln!("[project] {msg}");
+        }
     }
 }
 

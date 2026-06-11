@@ -56,6 +56,9 @@ src/
 │   │                    # ProjectStore (dirty/recent), Autosave
 │   ├── dock.rs          # Dock-Modell: Split-Baum, Gruppen, Default-Layouts,
 │   │                    # Persistenz (~/.local/share/editron/layouts/)
+│   ├── export.rs        # Sequenz-Export: Codec-Katalog, Presets, Validierung,
+│   │                    # Renderplan + Render-Worker (Mixdown → WAV, Video-
+│   │                    # Segmente → ffmpeg-Encoder, atomares Finalisieren)
 │   ├── playback.rs      # Transport-Routing Quelle/Programm, JKL, Loop, Tick
 │   ├── player.rs        # Decode-Engine (ffmpeg → Texturen/AudioStreams)
 │   ├── timecode.rs      # HH:MM:SS:FF + Dauer-Formatierung
@@ -214,10 +217,46 @@ kommen als `ServiceEvent` über einen Kanal in den UI-Thread:
 | Funktion | Zweck |
 | --- | --- |
 | `ffmpeg_info` | Binary-Discovery + Version (PATH bzw. `EDITRON_FFMPEG_PATH`) |
+| `request_encoder_list` | verfügbare Encoder (`ffmpeg -encoders`) für die Export-Validierung |
 | Import-Pipeline | Datei-Dialog (rfd) → ffprobe → Thumbnail → `MediaAsset` |
 | `extract_waveform` | Peaks 0..1 (PCM-Streaming, Bucket-Faltung) |
-| `start_transcode`/`cancel_job` | Export mit `-progress`-Parsing (Fortschritt/Speed) |
+| `start_sequence_export`/`cancel_job`/`cancel_all_jobs` | Render-Worker des Sequenz-Exports (Abbruch-Flag + Kill der ffmpeg-Kinder; `cancel_all_jobs` beim App-Ende gegen Waisenprozesse) |
 | `reveal_in_file_manager` | Finder/Explorer/FileManager1-D-Bus/xdg-open |
+
+## Sequenz-Export
+
+`src/core/export.rs` + `src/overlays/export_dialog.rs` — Export der Timeline
+in eine Datei, semantisch identisch zur Wiedergabe (oberster aktiver
+Video-Clip gewinnt; Audio-Summe mit Spur-Gain/Pan, Clip-Gain, Master-Fader,
+Mute/Solo, `enabled`):
+
+- **Katalog:** Container (MP4, MOV, MKV, WebM, WAV, MP3, FLAC, M4A) ×
+  Video-Codecs (H.264, H.265 — `hvc1`-Tag, ProRes mit Profilen, DNxHR mit
+  Profilen, VP9 — CRF braucht `-b:v 0`, SVT-AV1) × Audio-Codecs (AAC, MP3,
+  Opus — erzwingt 48 kHz, FLAC, PCM 16/24/32f). Render-Presets (YouTube,
+  Vimeo, Master, ProRes/DNxHR, Audio-only) als Settings-Fabriken.
+- **Renderplan** (`build_render_plan`, pur + getestet): Zeitachse in
+  Ziel-Frames quantisiert, an Clip-Grenzen geschnitten, pro Abschnitt
+  gewinnt der oberste sichtbare Clip; Lücken werden Schwarzbild, Standbilder
+  rendern über `-loop 1`. Audio-Clips mit vorgerechneten Links/Rechts-Gains.
+- **Validierung** (`validate`): FFmpeg/Encoder vorhanden, Timeline/Bereich
+  nicht leer, Offline-Medien (Warnung), Auflösung gerade/in Grenzen,
+  Zielordner existiert, Ziel ≠ Quelldatei (Fehler!), Überschreib-Warnung,
+  WAV-4-GB-Grenze. Fehler blockieren den Start, Warnungen nicht.
+- **Worker** (`run_export_worker`, eigener Thread, `catch_unwind`):
+  Phase A mischt Audio clipweise per ffmpeg-`f32le`-Decoder via
+  Read-Modify-Write in eine temporäre Float-WAV (konstanter RAM, Stille via
+  `set_len`); Phase B dekodiert Video segmentweise (`rawvideo/rgba`,
+  `scale`+`pad`+`fps`, exakte Frame-Zahl, fehlende Frames wiederholen den
+  letzten) in einen ffmpeg-Encoder-Prozess (BT.709-Matrix + Tags, expliziter
+  Muxer). Geschrieben wird nach `<ziel>.part`, bei Erfolg atomar umbenannt;
+  Abbruch/Fehler räumen `.part` + WAV auf. Fortschritt als Events
+  (% über Phasen-Gewichte, Frame x/y, fps, ETA über geglättete Rate).
+- **Dialog:** modal (Overlay blockiert Hauptschicht auf allen OS), links
+  Presets, rechts Einstellungen mit Live-Validierung und Größenschätzung;
+  während des Renderns sind Schließen/Esc gesperrt, „Abbrechen“ killt die
+  ffmpeg-Kinder über die Job-Registry. Erfolgsansicht mit „Im Dateimanager
+  zeigen“, Fehleransicht mit ffmpeg-stderr-Auszug.
 
 ## Bewusste Entscheidungen
 
@@ -242,5 +281,6 @@ kommen als `ServiceEvent` über einen Kanal in den UI-Thread:
   Block-Granularität, ≤ 85 ms) und Audio-Drift-Korrektur gegen die
   Hardware-Clock über lange Wiedergaben.
 - Scopes analysieren bis zum Engine-Ausbau das Thumbnail des Clips am Playhead.
-- Effekt-Anwendung (FFmpeg-Filtergraph), Marker, Titel-Rendering,
-  Sequenz-Export (der Export-Dialog exportiert Einzel-Assets).
+- Effekt-Anwendung (FFmpeg-Filtergraph), Marker, Titel-Rendering.
+- Export: Hardware-Encoder (NVENC/VideoToolbox/QSV), Render-Queue mit
+  mehreren Jobs, eigene Presets speichern.

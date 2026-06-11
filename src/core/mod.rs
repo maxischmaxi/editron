@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod dock;
+pub mod export;
 pub mod keyboard;
 pub mod playback;
 pub mod player;

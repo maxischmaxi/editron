@@ -21,18 +21,25 @@ pub enum ServiceEvent {
     ImportCancelled,
     WaveformReady { asset_id: String, peaks: Vec<f32> },
     WaveformFailed { asset_id: String },
-    /// `transcode://progress`-Pendant.
-    TranscodeProgress {
+    /// Verfügbare ffmpeg-Encoder (für die Validierung im Export-Dialog).
+    EncoderListReady(HashSet<String>),
+    /// Fortschritt eines laufenden Sequenz-Exports.
+    SequenceExportProgress {
         job_id: String,
-        out_time_sec: f64,
-        progress_pct: Option<f64>,
-        speed: Option<f64>,
+        pct: f64,
+        phase: crate::core::export::ExportPhase,
+        frames_done: u64,
+        frames_total: u64,
+        render_fps: f64,
+        eta_sec: Option<f64>,
     },
-    /// `transcode://done`-Pendant.
-    TranscodeDone {
+    /// Sequenz-Export beendet (Erfolg, Abbruch oder Fehler).
+    SequenceExportDone {
         job_id: String,
         ok: bool,
+        cancelled: bool,
         error: Option<String>,
+        output: String,
     },
     /// Ziel im Speichern-Dialog gewählt (Export).
     ExportTargetPicked(Option<PathBuf>),
@@ -70,17 +77,10 @@ pub struct RelinkTarget {
     pub size_bytes: u64,
 }
 
-/// Transcode-Optionen für den Export.
-#[derive(Clone, Default)]
-pub struct TranscodeOptions {
-    pub input: String,
-    pub output: String,
-    pub video_codec: Option<String>,
-    pub audio_codec: Option<String>,
-    pub crf: Option<u32>,
-    pub preset: Option<String>,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
+/// Laufender Sequenz-Export: Abbruch-Flag + Kindprozesse für hartes Beenden.
+struct ExportJobHandle {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    children: std::sync::Arc<Mutex<Vec<(u64, std::process::Child)>>>,
 }
 
 pub struct Services {
@@ -88,7 +88,7 @@ pub struct Services {
     rx: Receiver<ServiceEvent>,
     waveform_pending: Mutex<HashSet<String>>,
     next_job_id: std::sync::atomic::AtomicU64,
-    jobs: Mutex<std::collections::HashMap<String, std::sync::Arc<Mutex<Option<std::process::Child>>>>>,
+    jobs: Mutex<std::collections::HashMap<String, ExportJobHandle>>,
     /// Abbruch-Flag des laufenden Relink-Scans (neuer Scan ersetzt es).
     relink_cancel: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
 }
@@ -120,6 +120,9 @@ impl Services {
             | ServiceEvent::WaveformFailed { asset_id } = &ev
             {
                 self.waveform_pending.lock().unwrap().remove(asset_id);
+            }
+            if let ServiceEvent::SequenceExportDone { job_id, .. } = &ev {
+                self.jobs.lock().unwrap().remove(job_id);
             }
             events.push(ev);
         }
@@ -200,129 +203,66 @@ impl Services {
         });
     }
 
-    /// Transcode-Job starten: spawnt ffmpeg, parst die `-progress`-Ausgabe.
-    pub fn start_transcode(&self, options: TranscodeOptions) -> Result<String, String> {
-        use std::io::{BufRead, BufReader};
-        use std::sync::atomic::Ordering;
+    /// Sequenz-Export starten: Render-Worker-Thread mit Abbruch-Flag und
+    /// Kindprozess-Registry (für hartes Beenden über `cancel_job`).
+    pub fn start_sequence_export(
+        &self,
+        plan: crate::core::export::RenderPlan,
+        settings: crate::core::export::ExportSettings,
+    ) -> Result<String, String> {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        // Quelldauer für progress_pct (best effort)
-        let duration = probe_media(&options.input)
-            .ok()
-            .map(|m| m.duration_sec)
-            .filter(|d| *d > 0.0);
-
-        let mut cmd = Command::new(ffmpeg_bin());
-        cmd.args(["-y", "-i", &options.input]);
-        if let Some(codec) = &options.video_codec {
-            cmd.args(["-c:v", codec]);
+        if settings.video.is_none() && settings.audio.is_none() {
+            return Err("Weder Video noch Audio ausgewählt".to_string());
         }
-        if let Some(crf) = options.crf {
-            cmd.args(["-crf", &crf.to_string()]);
-        }
-        if let Some(preset) = &options.preset {
-            cmd.args(["-preset", preset]);
-        }
-        let filter = match (options.width, options.height) {
-            (Some(w), Some(h)) => Some(format!("scale={w}:{h}")),
-            (Some(w), None) => Some(format!("scale={w}:-2")),
-            (None, Some(h)) => Some(format!("scale=-2:{h}")),
-            (None, None) => None,
-        };
-        if let Some(filter) = filter {
-            cmd.args(["-vf", &filter]);
-        }
-        if let Some(codec) = &options.audio_codec {
-            cmd.args(["-c:a", codec]);
-        }
-        // Audio-only-Export: keine Videospur mappen.
-        if options.video_codec.is_none() && options.audio_codec.is_some() {
-            cmd.arg("-vn");
-        }
-        cmd.args(["-progress", "pipe:1", "-nostats", "-loglevel", "error"]);
-        cmd.arg(&options.output);
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("ffmpeg konnte nicht gestartet werden: {e}"))?;
-        let stdout = child.stdout.take().ok_or("ffmpeg-stdout nicht verfügbar")?;
-        let mut stderr = child.stderr.take().ok_or("ffmpeg-stderr nicht verfügbar")?;
-
-        let job_id = format!("job-{}", self.next_job_id.fetch_add(1, Ordering::Relaxed));
-        let handle = Arc::new(Mutex::new(Some(child)));
-        self.jobs
-            .lock()
-            .unwrap()
-            .insert(job_id.clone(), Arc::clone(&handle));
+        let job_id = format!("export-{}", self.next_job_id.fetch_add(1, Ordering::Relaxed));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let children: Arc<Mutex<Vec<(u64, std::process::Child)>>> = Arc::new(Mutex::new(Vec::new()));
+        self.jobs.lock().unwrap().insert(
+            job_id.clone(),
+            ExportJobHandle {
+                cancel: Arc::clone(&cancel),
+                children: Arc::clone(&children),
+            },
+        );
 
         let tx = self.tx.clone();
         let id = job_id.clone();
-        let output = options.output.clone();
         std::thread::spawn(move || {
-            let stderr_task = std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = stderr.read_to_end(&mut buf);
-                buf
-            });
-
-            let mut out_time_sec = 0.0_f64;
-            let mut speed: Option<f64> = None;
-            for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
-                let Some((key, value)) = line.split_once('=') else { continue };
-                let value = value.trim();
-                match key.trim() {
-                    "out_time_us" | "out_time_ms" => {
-                        if let Ok(us) = value.parse::<i64>() {
-                            out_time_sec = us.max(0) as f64 / 1_000_000.0;
-                        }
-                    }
-                    "speed" => speed = value.trim_end_matches('x').trim().parse().ok(),
-                    "progress" => {
-                        let progress_pct =
-                            duration.map(|d| (out_time_sec / d * 100.0).clamp(0.0, 100.0));
-                        let _ = tx.send(ServiceEvent::TranscodeProgress {
-                            job_id: id.clone(),
-                            out_time_sec,
-                            progress_pct,
-                            speed,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-
-            let child = handle.lock().unwrap().take();
-            let status = child.and_then(|mut c| c.wait().ok());
-            let stderr_buf = stderr_task.join().unwrap_or_default();
-            let ok = status.map(|s| s.success()).unwrap_or(false);
-            if !ok {
-                let _ = std::fs::remove_file(&output);
-            }
-            let error = if ok {
-                None
-            } else {
-                let tail = stderr_tail(&stderr_buf);
-                Some(if tail.is_empty() {
-                    "Job abgebrochen oder ohne Fehlermeldung beendet".to_string()
-                } else {
-                    tail
-                })
-            };
-            let _ = tx.send(ServiceEvent::TranscodeDone { job_id: id, ok, error });
+            crate::core::export::run_export_worker(id, plan, settings, tx, cancel, children);
         });
-
         Ok(job_id)
     }
 
-    /// Killt den ffmpeg-Prozess; unbekannte IDs (bereits fertig) sind ok.
+    /// Bricht einen Export ab: Flag setzen und Kindprozesse killen, damit
+    /// blockierende Pipe-Reads sofort enden. Unbekannte IDs sind ok.
     pub fn cancel_job(&self, job_id: &str) {
-        let handle = self.jobs.lock().unwrap().get(job_id).cloned();
-        if let Some(handle) = handle {
-            if let Some(child) = handle.lock().unwrap().as_mut() {
+        let jobs = self.jobs.lock().unwrap();
+        if let Some(handle) = jobs.get(job_id) {
+            handle.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut children = handle.children.lock().unwrap_or_else(|p| p.into_inner());
+            for (_, child) in children.iter_mut() {
                 let _ = child.kill();
             }
         }
+    }
+
+    /// Beim App-Ende: alle laufenden Exporte hart beenden (keine Waisen).
+    pub fn cancel_all_jobs(&self) {
+        let ids: Vec<String> = self.jobs.lock().unwrap().keys().cloned().collect();
+        for id in ids {
+            self.cancel_job(&id);
+        }
+    }
+
+    /// Verfügbare Encoder einmalig erfragen (`ffmpeg -encoders`).
+    pub fn request_encoder_list(&self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let set = list_encoders();
+            let _ = tx.send(ServiceEvent::EncoderListReady(set));
+        });
     }
 
     // ------------------------------------------------------------- Projekt
@@ -552,6 +492,26 @@ pub fn ffmpeg_bin() -> String {
 
 pub fn ffprobe_bin() -> String {
     std::env::var("EDITRON_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+}
+
+/// Encoder-Namen aus `ffmpeg -encoders` (Zeilenformat ` V..... name  Beschreibung`).
+fn list_encoders() -> HashSet<String> {
+    let mut set = HashSet::new();
+    let Ok(out) = Command::new(ffmpeg_bin())
+        .args(["-hide_banner", "-encoders"])
+        .output()
+    else {
+        return set;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines().skip_while(|l| !l.contains("------")).skip(1) {
+        let mut parts = line.split_whitespace();
+        let (Some(_flags), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        set.insert(name.to_string());
+    }
+    set
 }
 
 fn ffmpeg_info() -> FfmpegInfo {
