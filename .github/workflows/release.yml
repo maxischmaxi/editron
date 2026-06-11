@@ -89,7 +89,7 @@ jobs:
           stage="$RUNNER_TEMP/$pkg"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/editron" "$stage/"
-          cp README.md "$stage/"
+          cp README.md LICENSE THIRD-PARTY-NOTICES.md "$stage/"
           # Die Doppelklick-Integration für .etron liegt dem Linux-Paket bei.
           if [ "$RUNNER_OS" = "Linux" ]; then
             mkdir -p "$stage/desktop-integration"

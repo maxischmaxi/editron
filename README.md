@@ -88,3 +88,10 @@ Siehe [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Kurzfassung: Alles ist
 ein Command (Registry + when-Klauseln), Panels sind Module mit eigenem
 UI-State, Workspaces sind persistierte Dock-Layouts, FFmpeg ist bewusst ein
 externes Binary.
+
+## Lizenz
+
+Editron ist freie Software unter der **GPL-3.0-or-later** — siehe
+[`LICENSE`](LICENSE). Die eingebetteten Lucide-Icons stehen unter ISC/MIT,
+Details in [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). FFmpeg wird
+nicht mitgeliefert, sondern zur Laufzeit als externes Programm aufgerufen.
