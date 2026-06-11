@@ -43,7 +43,7 @@ jobs:
           # - target: x86_64-pc-windows-msvc
           #   os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Tag und Cargo.toml müssen dieselbe Version nennen — sonst hießen die
       # Artefakte anders als das Release.
@@ -99,7 +99,7 @@ jobs:
           # COPYFILE_DISABLE: keine macOS-Metadaten (._*) im Tarball.
           COPYFILE_DISABLE=1 tar -czf "$pkg.tar.gz" -C "$RUNNER_TEMP" "$pkg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tarball-${{ matrix.target }}
           path: "*.tar.gz"
@@ -113,9 +113,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
