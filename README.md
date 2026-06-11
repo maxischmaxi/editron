@@ -23,6 +23,22 @@ einzigen nativen Prozess.
   Export/Transcode mit Live-Fortschritt; die Wiedergabe dekodiert Video über
   ffmpeg-Pipes direkt in GPU-Texturen und Audio in raylib-AudioStreams.
 
+## Installation
+
+Fertige Binaries gibt es für **Linux (x86_64)** und **macOS (Apple Silicon)** —
+der Installer erkennt die Plattform und wählt automatisch die passende:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/maxischmaxi/editron/main/install.sh | sh
+```
+
+Installiert nach `~/.local/bin` (Zielverzeichnis über `EDITRON_INSTALL_DIR`,
+bestimmte Version über `EDITRON_VERSION=0.1.0` wählbar). Zur Laufzeit braucht
+Editron **FFmpeg/ffprobe** im PATH (`apt install ffmpeg` · `pacman -S ffmpeg` ·
+`brew install ffmpeg`). Alle Artefakte samt `SHA256SUMS` liegen auf der
+[Releases-Seite](https://github.com/maxischmaxi/editron/releases); andere
+Plattformen bauen aus dem Quelltext (siehe unten).
+
 ## Entwicklung
 
 Voraussetzungen: Rust (stable), FFmpeg/ffprobe im PATH (alternativ
@@ -34,6 +50,17 @@ sowie `fontconfig` für die Schrift-Auflösung (Inter → Noto Sans, JetBrains M
 cargo run             # App starten (Dev-Profil)
 cargo check           # Typen/Borrows prüfen
 cargo build --release # Release-Build
+```
+
+### Release veröffentlichen
+
+Version in `Cargo.toml` anheben, committen, Versions-Tag pushen — die
+[Release-Pipeline](.github/workflows/release.yml) baut die Linux- und
+macOS-Binaries und veröffentlicht sie mitsamt `SHA256SUMS` als
+GitHub-Release (Windows ist bewusst noch ausgespart):
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
 ```
 
 ## Test- & Debug-Flags

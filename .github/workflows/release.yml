@@ -1,0 +1,152 @@
+# Release-Pipeline: baut bei einem Versions-Tag (vX.Y.Z) Binaries für alle
+# unterstützten Plattformen und veröffentlicht sie als GitHub-Release.
+#
+# Artefakt-Schnittstelle (stabil halten — darauf bauen install.sh und künftige
+# Verteilungswege wie Homebrew/AUR/Website auf):
+#   https://github.com/maxischmaxi/editron/releases/download/v<ver>/editron-<ver>-<target>.tar.gz
+#   https://github.com/maxischmaxi/editron/releases/download/v<ver>/SHA256SUMS
+#
+# Weitere Plattform = neuer Eintrag in der Build-Matrix (Windows, macOS Intel
+# und Linux arm64 sind unten als Kommentar vorbereitet).
+
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # Manueller Dry-Run (z. B. auf main): baut und paketiert alles,
+  # veröffentlicht aber kein Release.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ältestes unterstütztes Ubuntu-Image = älteste glibc → die Binary
+          # läuft auf möglichst vielen Distros.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Apple-Silicon-Runner (nativer arm64-Build).
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # Geplante Targets — bei Bedarf einkommentieren:
+          # - target: x86_64-apple-darwin
+          #   os: macos-13          # oder Cross-Build auf dem ARM-Runner
+          # - target: x86_64-pc-windows-msvc
+          #   os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag und Cargo.toml müssen dieselbe Version nennen — sonst hießen die
+      # Artefakte anders als das Release.
+      - name: Tag-Version gegen Cargo.toml prüfen
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::Tag v$tag passt nicht zur Cargo.toml-Version $crate"
+            exit 1
+          fi
+
+      # raylib wird aus dem Quelltext mitgebaut: cmake + X11/Wayland/GL/ALSA-Header.
+      - name: Linux-Build-Abhängigkeiten installieren
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake libasound2-dev libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libgl1-mesa-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev
+
+      - name: Rust-Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build-Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Bauen
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Paketieren
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          pkg="editron-${version}-${{ matrix.target }}"
+          stage="$RUNNER_TEMP/$pkg"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/editron" "$stage/"
+          cp README.md "$stage/"
+          # Die Doppelklick-Integration für .etron liegt dem Linux-Paket bei.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            mkdir -p "$stage/desktop-integration"
+            cp packaging/linux/editron.desktop packaging/linux/editron-project.xml \
+               packaging/linux/install.sh "$stage/desktop-integration/"
+          fi
+          # COPYFILE_DISABLE: keine macOS-Metadaten (._*) im Tarball.
+          COPYFILE_DISABLE=1 tar -czf "$pkg.tar.gz" -C "$RUNNER_TEMP" "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  # Nur bei Tag-Läufen — der manuelle Dry-Run endet nach dem Build.
+  publish:
+    name: GitHub-Release veröffentlichen
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: SHA256SUMS erzeugen
+        run: cd dist && sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Release anlegen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > release-notes.md <<'NOTES'
+          ## Installation
+
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/maxischmaxi/editron/main/install.sh | sh
+          ```
+
+          Lädt automatisch das passende Binary (Linux x86_64 · macOS Apple
+          Silicon) nach `~/.local/bin`. Zur Laufzeit wird FFmpeg/ffprobe im
+          PATH benötigt. Prüfsummen aller Artefakte: `SHA256SUMS`.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag \
+            --title "Editron ${GITHUB_REF_NAME#v}" \
+            --notes-file release-notes.md \
+            --generate-notes
+
+# Anschlussstellen für spätere Verteilungswege (jeweils `needs: publish`):
+#   - homebrew: Formula in einem Tap-Repo (z. B. maxischmaxi/homebrew-tap)
+#     aktualisieren — URL + sha256 kommen aus SHA256SUMS.
+#   - aur:      PKGBUILD/.SRCINFO rendern und ins AUR pushen (yay).
+#   - website:  Download-Manifest (JSON mit Version, URLs, Prüfsummen)
+#     deployen — die oben genannten Release-URLs sind die stabile API.
