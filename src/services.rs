@@ -67,6 +67,10 @@ pub enum ServiceEvent {
     RelinkFailed { asset_id: String, error: String },
     /// Ordnersuche beendet.
     RelinkScanFinished { cancelled: bool, unresolved: usize },
+    /// SRT-Datei im Untertitel-Import-Dialog gewählt.
+    SubtitleImportPicked(Option<PathBuf>),
+    /// Ziel im Untertitel-Export-Dialog (SRT) gewählt.
+    SubtitleExportTargetPicked(Option<PathBuf>),
 }
 
 /// Fehlendes Medium als Suchauftrag für den Relink-Scan.
@@ -290,6 +294,35 @@ impl Services {
                 .add_filter("Editron-Projekt", &[crate::core::project::PROJECT_EXT])
                 .save_file();
             let _ = tx.send(ServiceEvent::ProjectSaveTargetPicked(picked));
+        });
+    }
+
+    // ---------------------------------------------------------- Untertitel
+
+    /// Öffnen-Dialog für SRT-Untertitel (eigener Thread).
+    pub fn pick_subtitle_import(&self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Untertitel importieren")
+                .add_filter("SRT-Untertitel", &["srt"])
+                .add_filter("Alle Dateien", &["*"])
+                .pick_file();
+            let _ = tx.send(ServiceEvent::SubtitleImportPicked(picked));
+        });
+    }
+
+    /// Speichern-Dialog für den SRT-Export der aktiven Untertitel-Spur.
+    pub fn pick_subtitle_export_target(&self, default_name: &str) {
+        let tx = self.tx.clone();
+        let default_name = default_name.to_string();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Untertitel exportieren (SRT)")
+                .set_file_name(&default_name)
+                .add_filter("SRT-Untertitel", &["srt"])
+                .save_file();
+            let _ = tx.send(ServiceEvent::SubtitleExportTargetPicked(picked));
         });
     }
 

@@ -78,7 +78,17 @@ pub fn context_value(state: &AppState, key: &str) -> Value {
         "mediaSelected" => (!state.media.selected_asset_ids.is_empty()).into(),
         "timelineHasClips" => (!state.timeline.clips.is_empty()).into(),
         "timelineClipSelected" => (!state.timeline.selected_clip_ids.is_empty()).into(),
+        "timelineTransitionSelected" => {
+            (!state.timeline.selected_transition_ids.is_empty()).into()
+        }
         "timelineClipboard" => (!state.timeline.clipboard.is_empty()).into(),
+        "timelineHasSubtitles" => state
+            .timeline
+            .tracks
+            .iter()
+            .any(|t| t.kind == TrackKind::Subtitle)
+            .into(),
+        "timelineAttrClipboard" => state.timeline.has_attr_clipboard().into(),
         "timelineCanUndo" => state.timeline.can_undo().into(),
         "timelineCanRedo" => state.timeline.can_redo().into(),
         "timelineInOutSet" => {
@@ -199,6 +209,20 @@ fn open_project_with_status(ctx: &mut CommandCtx, path: &std::path::Path) {
     }
 }
 
+/// Übergang auf die Kanten der Auswahl anwenden + Statusmeldung.
+fn apply_transition_kind(ctx: &mut CommandCtx, kind: crate::core::transitions::TransitionKind) {
+    let n = ctx.state.timeline.apply_transition_to_selection(kind);
+    let msg = if n == 0 {
+        format!(
+            "„{}“ nicht anwendbar — Kanten belegt, falsche Spurart oder zu wenig Material (Handles)",
+            kind.label()
+        )
+    } else {
+        format!("„{}“ auf {} Schnittkante(n) angewendet", kind.label(), n)
+    };
+    status(ctx, &msg);
+}
+
 /// Playhead zum nächsten/vorherigen Keyframe (alle Parameter der Auswahl).
 fn jump_to_keyframe(ctx: &mut CommandCtx, dir: i32) {
     use crate::core::animation::ParamId;
@@ -213,8 +237,8 @@ fn jump_to_keyframe(ctx: &mut CommandCtx, dir: i32) {
     {
         for param in ParamId::ALL {
             for k in &clip.fx.param(param).keyframes {
-                // Keyframe-Medienzeit → Sequenzzeit.
-                let t_seq = clip.start + (k.t - clip.src_in);
+                // Keyframe-Medienzeit → Sequenzzeit (speed-bewusst).
+                let t_seq = clip.seq_time_of_media(k.t);
                 let candidate = if dir > 0 {
                     t_seq > playhead + 1e-4
                 } else {
@@ -287,6 +311,12 @@ pub fn build_registry() -> CommandRegistry {
     commands.push(cmd("app.export", "Exportieren…", "Anwendung", |ctx, _| {
         ctx.state.app.open_dialog = Some(DialogId::Export)
     }));
+    commands.push(cmd(
+        "sequence.settings",
+        "Sequenzeinstellungen…",
+        "Sequenz",
+        |ctx, _| ctx.state.app.open_dialog = Some(DialogId::SequenceSettings),
+    ));
     commands.push(cmd(
         "app.settings",
         "Einstellungen…",
@@ -710,14 +740,20 @@ pub fn build_registry() -> CommandRegistry {
     commands.push(with_when(
         cmd(
             "timeline.deleteSelected",
-            "Ausgewählte Clips löschen",
+            "Auswahl löschen (Clips/Übergänge)",
             "Timeline",
             |ctx, _| {
+                // Übergangsauswahl hat Vorrang (sie schließt Clips aus).
+                let trs = ctx.state.timeline.selected_transition_ids.clone();
+                if !trs.is_empty() {
+                    ctx.state.timeline.remove_transitions(&trs);
+                    return;
+                }
                 let ids = ctx.state.timeline.selected_clip_ids.clone();
                 ctx.state.timeline.delete_clips(&ids, false);
             },
         ),
-        "timelineClipSelected",
+        "timelineClipSelected || timelineTransitionSelected",
     ));
     commands.push(with_when(
         cmd(
@@ -825,6 +861,29 @@ pub fn build_registry() -> CommandRegistry {
         ),
         "timelineClipSelected",
     ));
+    // ------------------------------------------- Clip: Geschwindigkeit/Dauer
+    commands.push(with_when(
+        cmd(
+            "clip.speedDuration",
+            "Geschwindigkeit/Dauer…",
+            "Clip",
+            |ctx, _| ctx.state.app.open_dialog = Some(DialogId::ClipSpeed),
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "clip.freezeFrame",
+            "Frame einfrieren (am Playhead)",
+            "Clip",
+            |ctx, _| {
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                ctx.state.timeline.freeze_frame_at_playhead(&ids);
+            },
+        ),
+        "timelineClipSelected",
+    ));
+
     // ------------------------------------------------ Clip: Effekte/Keyframes
     commands.push(with_when(
         cmd(
@@ -856,6 +915,378 @@ pub fn build_registry() -> CommandRegistry {
         ),
         "timelineClipSelected",
     )));
+
+    // ----------------------------------------------------- Clip: Farbe
+    commands.push(with_when(
+        cmd(
+            "clip.resetGrade",
+            "Farbkorrektur zurücksetzen",
+            "Clip",
+            |ctx, _| {
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                ctx.state.timeline.grade_reset(&ids);
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "clip.toggleGrade",
+            "Farbkorrektur umgehen (Bypass)",
+            "Clip",
+            |ctx, _| {
+                // Alle ausgewählten Video-Clips gemeinsam umschalten.
+                let ids: Vec<String> = ctx
+                    .state
+                    .timeline
+                    .selected_clip_ids
+                    .iter()
+                    .filter(|id| {
+                        ctx.state
+                            .timeline
+                            .clip(id)
+                            .is_some_and(|c| c.kind == TrackKind::Video)
+                    })
+                    .cloned()
+                    .collect();
+                for id in ids {
+                    ctx.state.timeline.grade_toggle_enabled(&id);
+                }
+            },
+        ),
+        "timelineClipSelected",
+    ));
+
+    // ----------------------------------------------------- Clip: Effekte
+    commands.push(with_when(
+        cmd(
+            "clip.addEffect",
+            "Effekt anwenden…",
+            "Effekte",
+            |ctx, args| {
+                let Some(kind) = args
+                    .and_then(|v| v.get("kind"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|key| {
+                        crate::core::effects::EffectKind::ALL
+                            .iter()
+                            .find(|k| k.key() == key)
+                            .copied()
+                    })
+                else {
+                    status(ctx, "Unbekannter Effekt");
+                    return;
+                };
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                // Doppelte Ziele vermeiden (A/V-Paare zeigen auf denselben Clip).
+                let mut applied: Vec<String> = Vec::new();
+                for id in &ids {
+                    if let Some(target) = ctx.state.timeline.effect_target_clip(id, kind) {
+                        if !applied.contains(&target) {
+                            ctx.state.timeline.effects_add(id, kind);
+                            applied.push(target);
+                        }
+                    }
+                }
+                if applied.is_empty() {
+                    status(
+                        ctx,
+                        &format!("„{}“ passt nicht zur Auswahl", kind.label()),
+                    );
+                } else {
+                    status(
+                        ctx,
+                        &format!("„{}“ auf {} Clip(s) angewendet", kind.label(), applied.len()),
+                    );
+                }
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    // Je Effekt ein Palette-Eintrag mit gebundenem Argument.
+    for kind in crate::core::effects::EffectKind::ALL {
+        let id = format!("clip.addEffect.{}", kind.key());
+        let title = format!("Effekt anwenden: {}", kind.label());
+        let mut c = cmd(&id, &title, "Effekte", |ctx, args| {
+            if let Some(registry_cmd) = args {
+                let arg = registry_cmd.clone();
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                let Some(kind) = arg
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .and_then(|key| {
+                        crate::core::effects::EffectKind::ALL
+                            .iter()
+                            .find(|k| k.key() == key)
+                            .copied()
+                    })
+                else {
+                    return;
+                };
+                let mut applied: Vec<String> = Vec::new();
+                for id in &ids {
+                    if let Some(target) = ctx.state.timeline.effect_target_clip(id, kind) {
+                        if !applied.contains(&target) {
+                            ctx.state.timeline.effects_add(id, kind);
+                            applied.push(target);
+                        }
+                    }
+                }
+            }
+        });
+        c.when = Some("timelineClipSelected");
+        c.bound_arg = Some(serde_json::json!({ "kind": kind.key() }));
+        commands.push(c);
+    }
+    // ----------------------------------------------------- Übergänge
+    commands.push(with_when(
+        cmd(
+            "clip.applyDefaultVideoTransition",
+            "Standard-Videoübergang anwenden",
+            "Übergänge",
+            |ctx, _| {
+                apply_transition_kind(
+                    ctx,
+                    crate::core::transitions::TransitionKind::default_for_audio(false),
+                )
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "clip.applyDefaultAudioTransition",
+            "Standard-Audioübergang anwenden",
+            "Übergänge",
+            |ctx, _| {
+                apply_transition_kind(
+                    ctx,
+                    crate::core::transitions::TransitionKind::default_for_audio(true),
+                )
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "clip.applyTransition",
+            "Übergang anwenden…",
+            "Übergänge",
+            |ctx, args| {
+                let Some(kind) = args
+                    .and_then(|v| v.get("kind"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|key| {
+                        crate::core::transitions::TransitionKind::ALL
+                            .iter()
+                            .find(|k| k.key() == key)
+                            .copied()
+                    })
+                else {
+                    status(ctx, "Unbekannter Übergang");
+                    return;
+                };
+                apply_transition_kind(ctx, kind);
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    // Je Übergang ein Palette-Eintrag mit gebundenem Argument.
+    for kind in crate::core::transitions::TransitionKind::ALL {
+        let id = format!("clip.applyTransition.{}", kind.key());
+        let title = format!("Übergang anwenden: {}", kind.label());
+        let mut c = cmd(&id, &title, "Übergänge", |ctx, args| {
+            let Some(kind) = args
+                .and_then(|v| v.get("kind"))
+                .and_then(|v| v.as_str())
+                .and_then(|key| {
+                    crate::core::transitions::TransitionKind::ALL
+                        .iter()
+                        .find(|k| k.key() == key)
+                        .copied()
+                })
+            else {
+                return;
+            };
+            apply_transition_kind(ctx, kind);
+        });
+        c.when = Some("timelineClipSelected");
+        c.bound_arg = Some(serde_json::json!({ "kind": kind.key() }));
+        commands.push(c);
+    }
+    commands.push(with_when(
+        cmd(
+            "transition.remove",
+            "Ausgewählte Übergänge entfernen",
+            "Übergänge",
+            |ctx, _| {
+                let ids = ctx.state.timeline.selected_transition_ids.clone();
+                ctx.state.timeline.remove_transitions(&ids);
+            },
+        ),
+        "timelineTransitionSelected",
+    ));
+
+    commands.push(with_when(
+        cmd(
+            "clip.removeAllEffects",
+            "Alle Effekte entfernen",
+            "Effekte",
+            |ctx, _| {
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                ctx.state.timeline.effects_clear(&ids);
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "clip.toggleEffects",
+            "Effekte umgehen (Bypass)",
+            "Effekte",
+            |ctx, _| {
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                ctx.state.timeline.effects_toggle_bypass(&ids);
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "clip.copyAttributes",
+            "Attribute kopieren",
+            "Clip",
+            |ctx, _| {
+                let Some(id) = ctx.state.timeline.selected_clip_ids.first().cloned() else {
+                    return;
+                };
+                if ctx.state.timeline.copy_attributes(&id) {
+                    status(ctx, "Attribute kopiert (Bewegung, Farbe, Effekte)");
+                }
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "clip.pasteAttributes",
+            "Attribute einfügen",
+            "Clip",
+            |ctx, _| {
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                ctx.state.timeline.paste_attributes(&ids);
+            },
+        ),
+        "timelineClipSelected && timelineAttrClipboard",
+    ));
+
+    // ----------------------------------------------------------- Grafik/Titel
+    // „Titel hinzufügen“: legt einen Titel-Clip am Playhead auf der nächsten
+    // freien Videospur an; je Vorlage ein Palette-Eintrag mit gebundenem
+    // Argument. Die Abspann-Vorlage erhält ihre Scroll-Keyframes hier.
+    fn add_title(ctx: &mut CommandCtx, args: Option<&Value>) {
+        use crate::core::title::TitleTemplate;
+        let template = args
+            .and_then(|v| v.get("template"))
+            .and_then(|v| v.as_str())
+            .and_then(TitleTemplate::from_key)
+            .unwrap_or(TitleTemplate::Plain);
+        let at = ctx.state.timeline.playhead_sec;
+        let duration = template.default_duration();
+        let id = ctx
+            .state
+            .timeline
+            .add_title_clip(template.build(), at, duration);
+        if template.scrolls() {
+            // Scroll-Animation: Block läuft von unterhalb des Frames nach
+            // oben hinaus (Keyframes in Medienzeit — Teil desselben Snapshots).
+            if let Some(clip) = ctx.state.timeline.clips.iter_mut().find(|c| c.id == id) {
+                clip.fx.pos_y.upsert_key(0.0, 110.0);
+                clip.fx.pos_y.upsert_key(duration, -110.0);
+            }
+        }
+        ctx.state.dock.open_panel("graphics");
+        let msg = format!("„{}“ am Playhead eingefügt", template.label());
+        status(ctx, &msg);
+    }
+    commands.push(cmd(
+        "title.add",
+        "Titel hinzufügen",
+        "Grafik",
+        add_title,
+    ));
+    for template in crate::core::title::TitleTemplate::ALL {
+        let mut c = cmd(
+            &format!("title.add.{}", template.key()),
+            &format!("Titel hinzufügen: {}", template.label()),
+            "Grafik",
+            add_title,
+        );
+        c.bound_arg = Some(serde_json::json!({ "template": template.key() }));
+        commands.push(c);
+    }
+    commands.push(cmd(
+        "monitor.toggleSafeMargins",
+        "Sichere Ränder im Programmmonitor",
+        "Wiedergabe",
+        |ctx, _| {
+            ctx.state.monitor.safe_margins = !ctx.state.monitor.safe_margins;
+        },
+    ));
+
+    // ------------------------------------------------------------ Untertitel
+    commands.push(cmd(
+        "subtitle.addAtPlayhead",
+        "Untertitel am Playhead hinzufügen",
+        "Untertitel",
+        |ctx, _| {
+            let at = ctx.state.timeline.playhead_sec;
+            match ctx.state.timeline.add_subtitle_clip("Untertitel", at) {
+                Ok(_) => {
+                    ctx.state.dock.open_panel("subtitles");
+                }
+                Err(err) => {
+                    let msg = err.clone();
+                    status(ctx, &msg);
+                }
+            }
+        },
+    ));
+    commands.push(cmd(
+        "subtitle.addTrack",
+        "Untertitelspur hinzufügen",
+        "Untertitel",
+        |ctx, _| {
+            ctx.state.timeline.add_track(TrackKind::Subtitle);
+        },
+    ));
+    commands.push(cmd(
+        "subtitle.importSrt",
+        "Untertitel importieren (SRT)…",
+        "Untertitel",
+        |ctx, _| ctx.services.pick_subtitle_import(),
+    ));
+    commands.push(with_when(
+        cmd(
+            "subtitle.exportSrt",
+            "Untertitel exportieren (SRT)…",
+            "Untertitel",
+            |ctx, _| {
+                let Some(track) = ctx.state.timeline.active_subtitle_track() else {
+                    status(ctx, "Keine Untertitel-Spur vorhanden");
+                    return;
+                };
+                let track_id = track.id.clone();
+                if ctx.state.timeline.subtitle_cues(&track_id).is_empty() {
+                    status(ctx, "Die aktive Untertitel-Spur enthält keine Segmente");
+                    return;
+                }
+                let name = format!("{}.srt", ctx.state.project.display_name());
+                ctx.services.pick_subtitle_export_target(&name);
+            },
+        ),
+        "timelineHasSubtitles",
+    ));
 
     commands.push(cmd(
         "timeline.addVideoTrack",

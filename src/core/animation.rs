@@ -392,6 +392,24 @@ impl ParamId {
     }
 }
 
+/// Vereinheitlichte Identität eines animierbaren Parameters: eingebaute
+/// Bewegungs-/Deckkraft-/Lautstärke-Parameter ODER ein Parameter eines
+/// angewendeten Effekts (Effekt-Instanz-ID + Spec-Index). Grundlage der
+/// generischen Keyframe-Operationen im `TimelineStore` (`kf_*`) und im
+/// Panel Effekteinstellungen.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ParamRef {
+    Builtin(ParamId),
+    Effect { fx_id: String, index: usize },
+}
+
+impl From<ParamId> for ParamRef {
+    fn from(id: ParamId) -> ParamRef {
+        ParamRef::Builtin(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

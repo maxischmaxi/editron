@@ -2,7 +2,7 @@
 //! Commands wirken auf den aktiven Monitor: Fokus auf dem Quellmonitor
 //! steuert die Quelle, alles andere das Programm (Timeline).
 
-use crate::core::timeline::{sequence_end, SEQUENCE_FPS};
+use crate::core::timeline::sequence_end;
 use crate::state::AppState;
 
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +42,20 @@ fn source_duration(state: &AppState) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Framerate des Quellmonitor-Mediums (Frame-Stepping läuft dort gegen die
+/// native Rate des Materials, nicht gegen die Sequenzrate).
+fn source_fps(state: &AppState) -> f64 {
+    state
+        .playback
+        .source_asset_id
+        .as_ref()
+        .and_then(|id| state.media.asset(id))
+        .and_then(|a| a.info.video.first())
+        .map(|v| v.fps)
+        .filter(|f| *f > 0.0)
+        .unwrap_or(25.0)
+}
+
 /// JKL-Shuttle: startet bei ±1, verdoppelt bis ±8, Richtungswechsel resettet.
 fn shuttle_rate(current: f64, playing: bool, dir: f64) -> f64 {
     if !playing || current.signum() != dir.signum() || current == 0.0 {
@@ -60,6 +74,7 @@ pub fn dispatch(state: &mut AppState, cmd: PlaybackCmd) {
 
 fn source_dispatch(state: &mut AppState, cmd: PlaybackCmd) {
     let dur = source_duration(state);
+    let fps = source_fps(state);
     let s = &mut state.playback.source;
     match cmd {
         PlaybackCmd::Toggle => {
@@ -78,7 +93,7 @@ fn source_dispatch(state: &mut AppState, cmd: PlaybackCmd) {
         }
         PlaybackCmd::StepFrames(frames) => {
             s.playing = false;
-            s.position = (s.position + frames / SEQUENCE_FPS).clamp(0.0, dur);
+            s.position = (s.position + frames / fps).clamp(0.0, dur);
         }
         PlaybackCmd::GoToStart => s.position = 0.0,
         PlaybackCmd::GoToEnd => s.position = dur,

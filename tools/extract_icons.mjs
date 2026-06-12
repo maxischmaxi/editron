@@ -16,7 +16,7 @@ if (!lucideRoot) {
 
 const NAMES = [
   "activity","arrow-right-from-line","arrow-right-to-line","audio-lines","audio-waveform",
-  "ban","blend","check","chevrons-left-right","arrow-left-right","clipboard-paste","chevron-down","chevron-left","chevron-right","chevron-up","circle-alert",
+  "ban","blend","captions","check","chevrons-left-right","arrow-left-right","clipboard-paste","chevron-down","chevron-left","chevron-right","chevron-up","circle-alert",
   "circle-check","clapperboard","clock","copy","crop","droplets","eye","eye-off","file-output",
   "film","focus","folder-open","folder-search","gauge","grip-vertical","hand","headphones",
   "history","image","import","info","keyboard","layout-grid","link-2","list","list-video",
@@ -25,6 +25,9 @@ const NAMES = [
   "pause","play","plus","repeat","rotate-ccw","scissors","search","skip-back","skip-forward",
   "sliders-horizontal","sparkles","square-terminal","step-back","step-forward",
   "stretch-horizontal","timer","trash-2","triangle-alert","type","volume-2","x","zoom-in","zoom-out",
+  // Effekte-Panel
+  "sun","sun-medium","wand-sparkles","contrast","flip-horizontal-2","grid-2x2","layers",
+  "image-minus","mic-off","timer-reset","zap","pipette",
 ];
 
 function rustStr(s) {

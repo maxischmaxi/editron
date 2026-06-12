@@ -9,6 +9,8 @@
 
 use crate::core::animation::ClipFx;
 use crate::core::timeline::{TimelineClip, TimelineStore, TrackKind};
+use crate::core::title::TitleSpec;
+use crate::core::transitions::{self, TransitionFx, TransitionRole};
 
 /// Ausgewertete Parameter zu einem Zeitpunkt (Deckkraft normiert 0–1).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -21,9 +23,11 @@ pub struct EvalFx {
     pub opacity: f64,
 }
 
-/// Medienzeit eines Clips zur Sequenzzeit `t_seq`.
+/// Medienzeit eines Clips zur Sequenzzeit `t_seq` — DIE gemeinsame
+/// Abbildung (speed-, rückwärts- und standbild-bewusst) für Player,
+/// Compositor, Renderplan, Scopes, Gizmo und Keyframe-Editor.
 pub fn clip_media_time(clip: &TimelineClip, t_seq: f64) -> f64 {
-    clip.src_in + (t_seq - clip.start)
+    clip.media_time_at(t_seq)
 }
 
 pub fn eval_fx(fx: &ClipFx, media_t: f64) -> EvalFx {
@@ -85,6 +89,7 @@ impl LayerQuad {
 
 /// Sichtbare Video-Clips am Zeitpunkt `t`, von der untersten zur obersten
 /// Spur (Zeichenreihenfolge). Mute/Solo der Spuren greifen wie im Player.
+/// OHNE Übergangs-Erweiterung — für Scopes/Farbe-Panel (ein Clip je Spur).
 pub fn visible_video_clips<'a>(timeline: &'a TimelineStore, t: f64) -> Vec<&'a TimelineClip> {
     let solo_any = timeline.tracks.iter().any(|tr| tr.solo);
     timeline
@@ -102,6 +107,136 @@ pub fn visible_video_clips<'a>(timeline: &'a TimelineStore, t: f64) -> Vec<&'a T
         .collect()
 }
 
+// ------------------------------------------------------ Programm-Layer
+// Layer-Auflösung MIT Übergängen: während eines Übergangs trägt eine Spur
+// zwei Clip-Layer (ausgehend unten, eingehend darüber) und bei Dips eine
+// Farbfläche. Programmmonitor und Player-Decoder-Targets nutzen diese
+// Funktion; der Export-Planer bildet dieselbe Semantik segmentweise ab.
+
+/// Ein aufgelöster Layer der Programmausgabe (Zeichenreihenfolge).
+pub enum ProgramLayer<'a> {
+    Clip {
+        clip: &'a TimelineClip,
+        /// Übergangs-Auswirkung (Identität, wenn kein Übergang aktiv).
+        t_fx: TransitionFx,
+    },
+    /// Volldeckende Farbfläche (Dip zu Schwarz/Weiß) mit Alpha 0–1.
+    Solid { white: bool, alpha: f64 },
+}
+
+/// Sichtbare Programm-Layer am Zeitpunkt `t` (unten → oben), inklusive der
+/// Übergangs-Logik: innerhalb eines Übergangsfensters laufen ausgehender
+/// und eingehender Clip parallel (Medienzeit über die Schnittkante hinaus —
+/// durch die Handles-Klemmung im Modell garantiert vorhanden).
+/// Untertitel-Spuren liegen über dem Video-Block und werden zuletzt
+/// gezeichnet; Solo (Video) blendet sie nicht aus, `muted` (= ausgeblendet)
+/// schon.
+pub fn visible_program_layers<'a>(timeline: &'a TimelineStore, t: f64) -> Vec<ProgramLayer<'a>> {
+    let solo_any = timeline.tracks.iter().any(|tr| tr.solo);
+    let mut out: Vec<ProgramLayer<'a>> = Vec::new();
+    for track in timeline.tracks.iter().rev().filter(|tr| match tr.kind {
+        TrackKind::Video => !tr.muted && (!solo_any || tr.solo),
+        TrackKind::Subtitle => !tr.muted,
+        TrackKind::Audio => false,
+    }) {
+        // Aktiver Übergang dieser Spur am Zeitpunkt t?
+        let active = timeline.transitions.iter().find_map(|tr| {
+            if tr.kind.is_audio() {
+                return None;
+            }
+            let (from, to) = transitions::resolve_clips(&timeline.clips, tr);
+            if from.or(to)?.track_id != track.id {
+                return None;
+            }
+            let (w0, w1) = transitions::window(from, to, tr.alignment, tr.duration)?;
+            (t >= w0 && t < w1 && w1 > w0).then_some((tr, from, to, w0, w1))
+        });
+        if let Some((tr, from, to, w0, w1)) = active {
+            let p = ((t - w0) / (w1 - w0)).clamp(0.0, 1.0);
+            let two_sided = from.is_some() && to.is_some();
+            if let Some(f) = from.filter(|c| c.enabled) {
+                let role = if two_sided { TransitionRole::Out } else { TransitionRole::OutSolo };
+                out.push(ProgramLayer::Clip {
+                    clip: f,
+                    t_fx: transitions::eval_video(tr.kind, tr.direction, role, p),
+                });
+            }
+            if let Some(c) = to.filter(|c| c.enabled) {
+                let role = if two_sided { TransitionRole::In } else { TransitionRole::InSolo };
+                out.push(ProgramLayer::Clip {
+                    clip: c,
+                    t_fx: transitions::eval_video(tr.kind, tr.direction, role, p),
+                });
+            }
+            if tr.kind.is_dip() {
+                let role = if two_sided {
+                    TransitionRole::Dip
+                } else if from.is_some() {
+                    TransitionRole::DipOut
+                } else {
+                    TransitionRole::DipIn
+                };
+                let fx = transitions::eval_video(tr.kind, tr.direction, role, p);
+                if fx.opacity > 0.0 {
+                    out.push(ProgramLayer::Solid {
+                        white: tr.kind == crate::core::transitions::TransitionKind::DipToWhite,
+                        alpha: fx.opacity,
+                    });
+                }
+            }
+        } else if let Some(clip) = timeline
+            .clips
+            .iter()
+            .find(|c| c.track_id == track.id && c.enabled && t >= c.start && t < c.end())
+        {
+            out.push(ProgramLayer::Clip {
+                clip,
+                t_fx: TransitionFx::IDENTITY,
+            });
+        }
+    }
+    out
+}
+
+/// Text-Spec eines Layers auflösen: Titel-Clips tragen ihren Spec selbst,
+/// Untertitel-Segmente synthetisieren ihn aus Spurstil + Text. Eine
+/// Funktion für Titel-Engine (Monitor), Scopes und Export — die Optik ist
+/// damit überall identisch und Stiländerungen invalidieren den Raster-Cache
+/// über den `content_hash` des synthetisierten Specs.
+pub fn layer_title_spec(timeline: &TimelineStore, clip: &TimelineClip) -> Option<TitleSpec> {
+    if let Some(spec) = &clip.title {
+        return Some(spec.clone());
+    }
+    let sub = clip.subtitle.as_ref()?;
+    Some(timeline.subtitle_style(&clip.track_id).title_spec(&sub.text))
+}
+
+/// Übergangs-Auswirkung auf ein Layer-Quad anwenden: Versatz in Frame-
+/// Bruchteilen, Skalierung um den Quad-Mittelpunkt. Eine Formel für GPU-
+/// Vorschau (Canvas-Maße) und CPU-Export (Zielauflösung).
+pub fn apply_transition_to_quad(quad: &mut LayerQuad, t_fx: &TransitionFx, frame_w: f64, frame_h: f64) {
+    quad.cx += t_fx.offset_x * frame_w;
+    quad.cy += t_fx.offset_y * frame_h;
+    quad.w *= t_fx.scale;
+    quad.h *= t_fx.scale;
+}
+
+/// Wipe-Maske in ganzzahlige Framepixel umrechnen (x0, y0, x1, y1 — Ende
+/// exklusiv). Identische Rundung in Vorschau und Export.
+pub fn mask_to_pixels(
+    mask: &crate::core::transitions::MaskFrac,
+    frame_w: usize,
+    frame_h: usize,
+) -> (usize, usize, usize, usize) {
+    let px = |f: f64, n: usize| ((f * n as f64).round().clamp(0.0, n as f64)) as usize;
+    (
+        px(mask[0], frame_w),
+        px(mask[1], frame_h),
+        px(mask[2], frame_w),
+        px(mask[3], frame_h),
+    )
+}
+
 // ------------------------------------------------------- CPU-Compositing
 // Software-Renderer für den Export: Layer (RGBA-Puffer, die das volle Frame
 // in Decode-Auflösung repräsentieren — transparent gepolstert) werden per
@@ -117,6 +252,9 @@ pub struct CpuLayerFrame<'a> {
     pub quad: LayerQuad,
     /// 0–1; multipliziert das Sample-Alpha.
     pub opacity: f64,
+    /// Sichtbarer Canvas-Ausschnitt in Pixeln (x0, y0, x1, y1 — Ende
+    /// exklusiv); None = voll sichtbar. Harte Kante (Wipe-Übergang).
+    pub mask: Option<(usize, usize, usize, usize)>,
 }
 
 /// Alle Layer (unten → oben) auf ein opakes Canvas mischen; Zeilenbänder
@@ -155,10 +293,17 @@ fn composite_band(band: &mut [u8], w: usize, y0: usize, rows: usize, layer: &Cpu
     let max_x = corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max);
     let min_y = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
     let max_y = corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max);
-    let x0 = (min_x.floor().max(0.0)) as usize;
-    let x1 = (max_x.ceil().min(w as f64)).max(0.0) as usize;
-    let row_start = (min_y.floor().max(y0 as f64)) as usize;
-    let row1 = (max_y.ceil().min((y0 + rows) as f64)).max(0.0) as usize;
+    let mut x0 = (min_x.floor().max(0.0)) as usize;
+    let mut x1 = (max_x.ceil().min(w as f64)).max(0.0) as usize;
+    let mut row_start = (min_y.floor().max(y0 as f64)) as usize;
+    let mut row1 = (max_y.ceil().min((y0 + rows) as f64)).max(0.0) as usize;
+    // Wipe-Maske: zusätzlich auf den sichtbaren Frame-Ausschnitt beschneiden.
+    if let Some((mx0, my0, mx1, my1)) = layer.mask {
+        x0 = x0.max(mx0);
+        x1 = x1.min(mx1);
+        row_start = row_start.max(my0);
+        row1 = row1.min(my1);
+    }
     if x1 <= x0 || row1 <= row_start {
         return;
     }
@@ -314,7 +459,7 @@ mod tests {
             &mut canvas,
             w,
             h,
-            &[CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0 }],
+            &[CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0, mask: None }],
             2,
         );
         assert_eq!(px(&canvas, w, 4, 4)[0], 255, "Mitte muss rot sein");
@@ -333,12 +478,32 @@ mod tests {
             &mut canvas,
             w,
             h,
-            &[CpuLayerFrame { data: &white, w, h, quad, opacity: 0.5 }],
+            &[CpuLayerFrame { data: &white, w, h, quad, opacity: 0.5, mask: None }],
             1,
         );
         let p = px(&canvas, w, 2, 2);
         assert!((p[0] as i32 - 128).abs() <= 2, "50 % Weiß auf Schwarz ≈ 128: {p:?}");
         assert_eq!(p[3], 255);
+    }
+
+    #[test]
+    fn composite_respects_mask() {
+        // Wipe-Halbzeit: weißer Layer nur in der linken Hälfte sichtbar.
+        let (w, h) = (4usize, 4usize);
+        let mut canvas = black_canvas(w, h);
+        let white: Vec<u8> = std::iter::repeat([255u8; 4]).take(w * h).flatten().collect();
+        let fx = eval_fx(&ClipFx::default(), 0.0);
+        let quad = layer_quad(w as f64, h as f64, w as f64, h as f64, &fx);
+        let mask = mask_to_pixels(&[0.0, 0.0, 0.5, 1.0], w, h);
+        composite_frame(
+            &mut canvas,
+            w,
+            h,
+            &[CpuLayerFrame { data: &white, w, h, quad, opacity: 1.0, mask: Some(mask) }],
+            1,
+        );
+        assert_eq!(px(&canvas, w, 1, 2)[0], 255, "links sichtbar");
+        assert_eq!(px(&canvas, w, 2, 2), [0, 0, 0, 255], "rechts maskiert");
     }
 
     #[test]
@@ -354,8 +519,8 @@ mod tests {
             w,
             h,
             &[
-                CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0 },
-                CpuLayerFrame { data: &green, w, h, quad, opacity: 1.0 },
+                CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0, mask: None },
+                CpuLayerFrame { data: &green, w, h, quad, opacity: 1.0, mask: None },
             ],
             1,
         );

@@ -295,6 +295,17 @@ pub fn presets() -> Vec<KeymapPreset> {
 
 fn shared_timeline_bindings() -> Vec<Keybinding> {
     vec![
+        // Standardübergänge wie Premiere: Mod+D Video, Mod+Shift+D Audio.
+        Keybinding::new("clip.applyDefaultVideoTransition", "Mod+D"),
+        Keybinding::new("clip.applyDefaultAudioTransition", "Mod+Shift+D"),
+        // Geschwindigkeit/Dauer wie Premiere: Mod+R.
+        Keybinding::new("clip.speedDuration", "Mod+R"),
+        // Titel am Playhead (Premiere: Strg+T = neue Textebene).
+        Keybinding::new("title.add", "Mod+T"),
+        // Untertitel am Playhead (Untertitel-Workflow, alle Presets gleich).
+        Keybinding::new("subtitle.addAtPlayhead", "Mod+U"),
+        Keybinding::new("subtitle.importSrt", "Mod+Alt+U"),
+        Keybinding::new("subtitle.exportSrt", "Mod+Shift+U"),
         Keybinding::when("timeline.deleteSelected", "Delete", "panel == 'timeline'"),
         Keybinding::when("timeline.deleteSelected", "Backspace", "panel == 'timeline'"),
         Keybinding::when("timeline.rippleDelete", "Shift+Delete", "panel == 'timeline'"),
@@ -374,6 +385,13 @@ fn editron_preset() -> KeymapPreset {
         Keybinding::new("timeline.splitAtPlayhead", "Mod+B"),
         Keybinding::new("timeline.toggleLink", "Mod+L"),
         Keybinding::new("timeline.toggleClipEnabled", "Shift+E"),
+        // Farbe — Shift+D wie Resolves „Bypass Color Grades“.
+        Keybinding::new("clip.toggleGrade", "Shift+D"),
+        Keybinding::new("clip.resetGrade", "Mod+Shift+R"),
+        // Effekte + Attribute (Premiere: Strg+Alt+V = Attribute einfügen).
+        Keybinding::new("clip.toggleEffects", "Mod+Shift+E"),
+        Keybinding::new("clip.copyAttributes", "Mod+Alt+C"),
+        Keybinding::new("clip.pasteAttributes", "Mod+Alt+V"),
         // Audio — "=" zusätzlich zu "+" (siehe Zoom-Kommentar oben).
         Keybinding::new("timeline.clipGainUp", "Alt++"),
         Keybinding::new("timeline.clipGainUp", "Alt+="),
@@ -388,6 +406,7 @@ fn editron_preset() -> KeymapPreset {
         Keybinding::when("media.removeSelected", "Delete", "panel == 'media'"),
         // Anwendung
         Keybinding::new("app.export", "Mod+E"),
+        Keybinding::new("sequence.settings", "Mod+Alt+S"),
         Keybinding::new("app.commandPalette", "Mod+Shift+P"),
         Keybinding::new("app.shortcutEditor", "Mod+K Mod+S"),
         // Workspaces
@@ -447,6 +466,7 @@ fn premiere_preset() -> KeymapPreset {
         Keybinding::when("media.removeSelected", "Backspace", "panel == 'media'"),
         // Premiere: Medien exportieren = Ctrl/Cmd+M, Tastaturbefehle = Ctrl+Alt+K
         Keybinding::new("app.export", "Mod+M"),
+        Keybinding::new("sequence.settings", "Mod+Alt+S"),
         Keybinding::new("app.shortcutEditor", "Mod+Alt+K"),
         Keybinding::new("app.commandPalette", "Mod+Shift+P"),
         // Premiere: Alt+Shift+1..9 für Arbeitsbereiche
@@ -498,6 +518,8 @@ fn resolve_preset() -> KeymapPreset {
         Keybinding::new("app.shortcutEditor", "Mod+Alt+K"),
         Keybinding::new("app.export", "Shift+8"),
         Keybinding::new("app.export", "Mod+Shift+E"),
+        // Resolve: Projekteinstellungen = Shift+9 — hier Sequenzeinstellungen.
+        Keybinding::new("sequence.settings", "Shift+9"),
         Keybinding::new("app.commandPalette", "Mod+Shift+P"),
         // Resolve-Seiten Shift+2..7
         Keybinding::new("workspace.switch.media", "Shift+2"),

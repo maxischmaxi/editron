@@ -24,6 +24,12 @@ pub enum DialogId {
     Settings,
     /// Wizard zum Wiederverknüpfen fehlender Medien.
     Relink,
+    /// Sequenzeinstellungen (Auflösung, Framerate, Drop-Frame-Timecode).
+    SequenceSettings,
+    /// Prompt „Sequenz an Medien anpassen?“ nach dem ersten Clip-Drop.
+    MatchMedia,
+    /// „Geschwindigkeit/Dauer“ der ausgewählten Clips (Mod+R).
+    ClipSpeed,
 }
 
 pub type TimelineTool = &'static str;
@@ -77,6 +83,21 @@ pub struct AppStore {
     pub encoders: Option<std::collections::HashSet<String>>,
     /// Fokussiertes Panel (Kontext-Key `panel`) — zuletzt angeklicktes Panel.
     pub focused_panel: String,
+    /// Aktive Farbpipette (Chroma-Key): Zielparameter, die der nächste Klick
+    /// in den Programmmonitor mit der angeklickten Quellfarbe füllt.
+    pub color_pick: Option<ColorPickRequest>,
+    /// Übergangs-ID, deren Dauer-Eingabe die Timeline öffnen soll
+    /// (gesetzt vom Kontextmenü, gelesen + geleert vom Timeline-Panel).
+    pub edit_transition_duration: Option<String>,
+}
+
+/// Ziel einer Farbaufnahme: drei aufeinanderfolgende Effekt-Parameter
+/// (R, G, B) einer Effekt-Instanz.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColorPickRequest {
+    pub clip_id: String,
+    pub fx_id: String,
+    pub p_idx: usize,
 }
 
 impl Default for AppStore {
@@ -91,6 +112,8 @@ impl Default for AppStore {
             ffmpeg: None,
             encoders: None,
             focused_panel: String::new(),
+            color_pick: None,
+            edit_transition_duration: None,
         }
     }
 }
@@ -221,6 +244,22 @@ pub const PREVIEW_SCALES: [(f64, &str); 4] =
 pub struct MonitorStore {
     pub source_scale: f64,
     pub program_scale: f64,
+    /// Downgesampelte Kopie des zuletzt dekodierten Frames je Programm-Clip
+    /// (clip_id) — Bildquelle der Scopes (CPU-seitig, ohne GPU-Readback).
+    pub preview_frames: std::collections::HashMap<String, MiniFrame>,
+    /// Canvas-Größe des Programmmonitors in Pixeln (vom Panel gemeldet) —
+    /// Raster-Auflösung der Titel-Engine (scharf in Anzeigegröße).
+    pub program_canvas: (u32, u32),
+    /// Sichere Ränder (Action-/Title-Safe) im Programmmonitor einblenden.
+    pub safe_margins: bool,
+}
+
+/// Kleines RGBA-Standbild (Scopes-Analyse).
+#[derive(Clone)]
+pub struct MiniFrame {
+    pub w: usize,
+    pub h: usize,
+    pub rgba: Vec<u8>,
 }
 
 impl Default for MonitorStore {
@@ -228,6 +267,9 @@ impl Default for MonitorStore {
         MonitorStore {
             source_scale: 1.0,
             program_scale: 1.0,
+            preview_frames: Default::default(),
+            program_canvas: (0, 0),
+            safe_margins: false,
         }
     }
 }

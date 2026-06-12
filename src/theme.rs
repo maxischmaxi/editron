@@ -34,6 +34,8 @@ pub const ACCENT_SOFT: Color = rgb(0x24, 0x40, 0x6e);
 pub const DANGER: Color = rgb(0xff, 0x5c, 0x5c);
 pub const WARNING: Color = rgb(0xff, 0xb5, 0x47);
 pub const SUCCESS: Color = rgb(0x3e, 0xe0, 0x8f);
+/// Grafik-/Titel-Clips (Violett — Premiere-Konvention für Grafiken).
+pub const GRAPHIC: Color = rgb(0xb1, 0x8c, 0xff);
 
 pub const WHITE: Color = rgb(0xff, 0xff, 0xff);
 pub const BLACK: Color = rgb(0x00, 0x00, 0x00);

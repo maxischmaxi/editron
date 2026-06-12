@@ -36,7 +36,10 @@ struct App {
     shortcut_editor: overlays::shortcut_editor::ShortcutEditor,
     export_dialog: overlays::export_dialog::ExportDialog,
     relink_dialog: overlays::relink_dialog::RelinkDialog,
+    sequence_dialog: overlays::sequence_dialog::SequenceDialog,
+    speed_dialog: overlays::speed_dialog::SpeedDialog,
     player: crate::core::player::PlayerEngine,
+    titles: crate::core::title_engine::TitleEngine,
 }
 
 impl App {
@@ -57,7 +60,10 @@ impl App {
             shortcut_editor: Default::default(),
             export_dialog: Default::default(),
             relink_dialog: Default::default(),
+            sequence_dialog: Default::default(),
+            speed_dialog: Default::default(),
             player: crate::core::player::PlayerEngine::new(),
+            titles: Default::default(),
         }
     }
 
@@ -70,6 +76,65 @@ impl App {
             Ok(0) => format!("Projekt geöffnet: {}", self.state.project.display_name()),
             Ok(n) => format!("Projekt geöffnet — {n} Medien fehlen"),
             Err(err) => format!("Öffnen fehlgeschlagen: {err}"),
+        };
+        self.state.app.set_status_message(Some(msg), now);
+    }
+
+    /// SRT-Datei in eine neue Untertitel-Spur importieren + Statusmeldung.
+    fn import_srt(&mut self, path: &std::path::Path, now: f64) {
+        let msg = match std::fs::read(path) {
+            Err(e) => format!("SRT konnte nicht gelesen werden: {e}"),
+            Ok(bytes) => {
+                let raw = crate::core::subtitle::decode_subtitle_bytes(&bytes);
+                match crate::core::subtitle::parse_srt(&raw) {
+                    Err(err) => format!("SRT-Import fehlgeschlagen: {err}"),
+                    Ok(cues) => {
+                        let total = cues.len();
+                        let (track_id, n) = self.state.timeline.import_subtitle_cues(&cues);
+                        let name = self
+                            .state
+                            .timeline
+                            .tracks
+                            .iter()
+                            .find(|t| t.id == track_id)
+                            .map(|t| {
+                                crate::core::timeline::track_name(t, &self.state.timeline.tracks)
+                            })
+                            .unwrap_or_default();
+                        self.state.dock.open_panel("subtitles");
+                        if n < total {
+                            format!("{n} von {total} Untertiteln importiert (Spur {name})")
+                        } else {
+                            format!("{n} Untertitel importiert (Spur {name})")
+                        }
+                    }
+                }
+            }
+        };
+        self.state.app.set_status_message(Some(msg), now);
+    }
+
+    /// Aktive Untertitel-Spur als SRT-Datei schreiben + Statusmeldung.
+    fn export_srt(&mut self, path: std::path::PathBuf, now: f64) {
+        let path = match path.extension() {
+            Some(ext) if ext.eq_ignore_ascii_case("srt") => path,
+            _ => path.with_extension("srt"),
+        };
+        let msg = match self.state.timeline.active_subtitle_track() {
+            None => "Keine Untertitel-Spur vorhanden".to_string(),
+            Some(track) => {
+                let cues = self.state.timeline.subtitle_cues(&track.id.clone());
+                if cues.is_empty() {
+                    "Die aktive Untertitel-Spur enthält keine Segmente".to_string()
+                } else {
+                    match std::fs::write(&path, crate::core::subtitle::format_srt(&cues)) {
+                        Ok(()) => {
+                            format!("{} Untertitel exportiert: {}", cues.len(), path.display())
+                        }
+                        Err(e) => format!("SRT-Export fehlgeschlagen: {e}"),
+                    }
+                }
+            }
         };
         self.state.app.set_status_message(Some(msg), now);
     }
@@ -117,6 +182,183 @@ impl App {
                             self.state
                                 .timeline
                                 .insert_assets(&assets, &[asset_id], at, None);
+                            // Headless: Media-Match-Vorschlag automatisch
+                            // übernehmen (kein modaler Prompt im Smoke-Test);
+                            // EDITRON_TEST_DIALOG=match lässt ihn stehen
+                            // (Screenshot des Prompts), EDITRON_TEST_SEQUENCE=
+                            // "29.97df@1280x720" setzt die Sequenz explizit.
+                            let keep_prompt = std::env::var("EDITRON_TEST_DIALOG")
+                                .is_ok_and(|d| d == "match");
+                            if !keep_prompt {
+                                if let Some(m) = self.state.timeline.pending_media_match.take() {
+                                    self.state.timeline.set_sequence_settings(m.settings);
+                                }
+                            }
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_SEQUENCE") {
+                                if let Some(s) = crate::core::sequence::parse_test_sequence(&spec) {
+                                    self.state.timeline.set_sequence_settings(s);
+                                }
+                            }
+                            // Farbkorrektur für Smoke-Tests, z. B.
+                            // EDITRON_TEST_GRADE="saturation=0,vignette=80"
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_GRADE") {
+                                let grade = crate::core::grade::parse_test_grade(&spec);
+                                for clip in &mut self.state.timeline.clips {
+                                    clip.grade = grade.clone();
+                                }
+                            }
+                            // Effekte für Smoke-Tests, z. B.
+                            // EDITRON_TEST_EFFECT="gaussianBlur:strength=40;invert"
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_EFFECT") {
+                                let fx = crate::core::effects::parse_test_effects(&spec);
+                                for clip in &mut self.state.timeline.clips {
+                                    clip.effects = fx
+                                        .iter()
+                                        .filter(|e| {
+                                            e.kind.is_audio()
+                                                == (clip.kind
+                                                    == crate::core::timeline::TrackKind::Audio)
+                                        })
+                                        .cloned()
+                                        .collect();
+                                }
+                            }
+                            // Geschwindigkeit für Smoke-Tests, z. B.
+                            // EDITRON_TEST_SPEED="0.5" (Faktor; negativ =
+                            // rückwärts, "freeze" = Standbild) auf die
+                            // eingefügten Test-Clips (mit Ripple).
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_SPEED") {
+                                let sel = self.state.timeline.selected_clip_ids.clone();
+                                if spec.trim().eq_ignore_ascii_case("freeze") {
+                                    self.state
+                                        .timeline
+                                        .set_clip_speed(&sel, 1.0, false, true, true);
+                                } else if let Ok(v) = spec.trim().replace(',', ".").parse::<f64>()
+                                {
+                                    self.state.timeline.set_clip_speed(
+                                        &sel,
+                                        v.abs(),
+                                        v < 0.0,
+                                        false,
+                                        true,
+                                    );
+                                }
+                            }
+                            // Übergang für Smoke-Tests, z. B.
+                            // EDITRON_TEST_TRANSITION="wipe" oder "crossDissolve:0.8":
+                            // teilt das eingefügte Material in der Mitte, setzt den
+                            // Übergang an die Kante und parkt den Playhead mittig.
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_TRANSITION") {
+                                let (key, dur) = spec
+                                    .split_once(':')
+                                    .map(|(k, d)| (k, d.parse().unwrap_or(1.0)))
+                                    .unwrap_or((spec.as_str(), 1.0));
+                                let kind = crate::core::transitions::TransitionKind::ALL
+                                    .iter()
+                                    .find(|k| k.key() == key)
+                                    .copied();
+                                if let Some(kind) = kind {
+                                    let sel = self.state.timeline.selected_clip_ids.clone();
+                                    let (mut a, mut b) = (f64::INFINITY, 0.0f64);
+                                    for c in self
+                                        .state
+                                        .timeline
+                                        .clips
+                                        .iter()
+                                        .filter(|c| sel.contains(&c.id))
+                                    {
+                                        a = a.min(c.start);
+                                        b = b.max(c.end());
+                                    }
+                                    if b > a {
+                                        let mid = (a + b) / 2.0;
+                                        self.state.timeline.split_at(mid, None);
+                                        let enders: Vec<String> = self
+                                            .state
+                                            .timeline
+                                            .clips
+                                            .iter()
+                                            .filter(|c| {
+                                                (c.end() - mid).abs() < 1e-6
+                                                    && kind.is_audio()
+                                                        == (c.kind
+                                                            == crate::core::timeline::TrackKind::Audio)
+                                            })
+                                            .map(|c| c.id.clone())
+                                            .collect();
+                                        for id in enders {
+                                            if let Err(err) = self.state.timeline.add_transition(
+                                                kind,
+                                                &id,
+                                                crate::core::timeline::TrimEdge::End,
+                                                dur,
+                                            ) {
+                                                eprintln!("[test] Übergang: {err}");
+                                            }
+                                        }
+                                        self.state.timeline.set_playhead(mid);
+                                    }
+                                }
+                            }
+                            // Titel für Smoke-Tests, z. B.
+                            // EDITRON_TEST_TITLE="lowerThird:Maria Muster\nReporterin":
+                            // legt einen Titel-Clip über die gesamte Test-
+                            // Timeline und parkt den Playhead mittig.
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_TITLE") {
+                                let (template, spec) =
+                                    crate::core::title::parse_test_title(&spec);
+                                let end = crate::core::timeline::sequence_end(
+                                    &self.state.timeline.clips,
+                                );
+                                let duration = if end > 0.0 {
+                                    end
+                                } else {
+                                    template.default_duration()
+                                };
+                                let id = self
+                                    .state
+                                    .timeline
+                                    .add_title_clip(spec, 0.0, duration);
+                                if template.scrolls() {
+                                    if let Some(clip) = self
+                                        .state
+                                        .timeline
+                                        .clips
+                                        .iter_mut()
+                                        .find(|c| c.id == id)
+                                    {
+                                        clip.fx.pos_y.upsert_key(0.0, 110.0);
+                                        clip.fx.pos_y.upsert_key(duration, -110.0);
+                                    }
+                                }
+                                self.state.timeline.set_playhead(duration / 2.0);
+                            }
+                            // Untertitel für Smoke-Tests, z. B.
+                            // EDITRON_TEST_SUBTITLE="Hallo Welt\nZweite Zeile":
+                            // legt eine Untertitelspur mit einem Segment über
+                            // die gesamte Test-Timeline und parkt den Playhead
+                            // mittig (Verifikation in Monitor/Scopes/Export).
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_SUBTITLE") {
+                                let text = spec.replace("\\n", "\n");
+                                let end = crate::core::timeline::sequence_end(
+                                    &self.state.timeline.clips,
+                                );
+                                let dur = if end > 0.0 { end } else { 3.0 };
+                                let cues = vec![crate::core::subtitle::SrtCue {
+                                    start: 0.0,
+                                    end: dur,
+                                    text,
+                                }];
+                                self.state.timeline.import_subtitle_cues(&cues);
+                                self.state.timeline.set_playhead(dur / 2.0);
+                                self.state.dock.open_panel("subtitles");
+                            }
+                            // Geschwindigkeit/Dauer-Dialog erst nach dem
+                            // (asynchronen) Import öffnen — er braucht den
+                            // selektierten Clip als Referenz.
+                            if std::env::var("EDITRON_TEST_DIALOG").is_ok_and(|d| d == "speed") {
+                                self.state.app.open_dialog = Some(stores::DialogId::ClipSpeed);
+                            }
                             if std::env::var("EDITRON_TEST_PLAY").is_ok() {
                                 self.state.playback.program_playing = true;
                                 self.state.playback.program_rate = 1.0;
@@ -246,6 +488,16 @@ impl App {
                 ServiceEvent::RelinkFailed { asset_id, error } => {
                     self.relink_dialog.on_failed(&asset_id, error);
                 }
+                ServiceEvent::SubtitleImportPicked(path) => {
+                    if let Some(path) = path {
+                        self.import_srt(&path, now);
+                    }
+                }
+                ServiceEvent::SubtitleExportTargetPicked(path) => {
+                    if let Some(path) = path {
+                        self.export_srt(path, now);
+                    }
+                }
                 ServiceEvent::RelinkScanFinished { cancelled, unresolved } => {
                     self.relink_dialog.on_finished(cancelled, unresolved);
                     let msg = if cancelled {
@@ -322,6 +574,10 @@ fn main() {
 
     let fonts = ui::text::Fonts::load(&mut rl, &thread);
     let icons = ui::icons::IconSet::load();
+    let mut grade_shader = ui::grade_shader::GradeShader::load(&mut rl, &thread);
+    let mut fx_renderer = ui::fx_shader::EffectChainRenderer::load(&mut rl, &thread);
+    // Effekt-Jobs des letzten Frames — werden vor dem nächsten verarbeitet.
+    let mut pending_fx_jobs: Vec<ui::fx_shader::EffectJob> = Vec::new();
     let mut app = App::new();
     let mut window_title = String::new();
 
@@ -359,12 +615,15 @@ fn main() {
     if let Ok(ws) = std::env::var("EDITRON_TEST_WORKSPACE") {
         state::set_active_workspace(&mut app.state, &ws);
     }
-    // Testmodus: Dialog beim Start öffnen (EDITRON_TEST_DIALOG=export|shortcuts|relink)
+    // Testmodus: Dialog beim Start öffnen
+    // (EDITRON_TEST_DIALOG=export|shortcuts|relink|sequence)
     if let Ok(dialog) = std::env::var("EDITRON_TEST_DIALOG") {
         app.state.app.open_dialog = match dialog.as_str() {
             "export" => Some(stores::DialogId::Export),
             "shortcuts" => Some(stores::DialogId::Shortcuts),
             "relink" => Some(stores::DialogId::Relink),
+            "sequence" => Some(stores::DialogId::SequenceSettings),
+            "speed" => Some(stores::DialogId::ClipSpeed),
             _ => None,
         };
     }
@@ -409,8 +668,9 @@ fn main() {
             }
         }
         if !input.dropped_files.is_empty() {
-            // Natives File-Drop: Projektdateien öffnen, Medien importieren.
-            let (projects, media): (Vec<_>, Vec<_>) = input
+            // Natives File-Drop: Projektdateien öffnen, SRT-Untertitel auf
+            // eine neue Untertitel-Spur importieren, Medien importieren.
+            let (projects, rest): (Vec<_>, Vec<_>) = input
                 .dropped_files
                 .clone()
                 .into_iter()
@@ -418,8 +678,14 @@ fn main() {
                     p.extension()
                         .is_some_and(|e| e.eq_ignore_ascii_case(project::PROJECT_EXT))
                 });
+            let (srt, media): (Vec<_>, Vec<_>) = rest
+                .into_iter()
+                .partition(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("srt")));
             if let Some(path) = projects.first() {
                 app.open_project(path, now);
+            }
+            for path in &srt {
+                app.import_srt(path, now);
             }
             if !media.is_empty() {
                 app.state.media.importing = true;
@@ -429,8 +695,28 @@ fn main() {
         app.handle_keyboard(&input, now);
         playback::tick(&mut app.state, dt);
         app.state.app.tick_status(now);
+        // „Sequenz an Medien anpassen?“ — ausstehenden Vorschlag (erster
+        // Clip-Drop in eine leere Timeline) als modalen Prompt öffnen,
+        // sobald kein anderer Dialog im Weg ist.
+        if app.state.timeline.pending_media_match.is_some()
+            && app.state.app.open_dialog.is_none()
+        {
+            app.state.app.open_dialog = Some(stores::DialogId::MatchMedia);
+        }
         app.player
             .tick(&mut rl, &thread, &mut app.state, &mut app.textures, now);
+        // Sichtbare Titel-Clips rastern + als Texturen hochladen (CPU-
+        // Rasterizer — identisch zum Export-Pfad).
+        app.titles
+            .tick(&mut rl, &thread, &mut app.state, &mut app.textures);
+        // Effekt-Ketten auf den frischen Decode-Frames rendern (GPU,
+        // zwischen den Frames wie Texture-Uploads).
+        fx_renderer.process(
+            &mut rl,
+            &thread,
+            &app.textures,
+            std::mem::take(&mut pending_fx_jobs),
+        );
 
         // ---- UI-Frame ----
         let overlay_open = app.state.context_menu.open
@@ -451,6 +737,8 @@ fn main() {
             dt as f32,
             screen,
         );
+        ui.grade_shader = grade_shader.as_mut();
+        ui.fx_outputs = Some(&fx_renderer);
 
         ui.begin_main_layer(overlay_open);
         let mut area = screen;
@@ -487,6 +775,8 @@ fn main() {
             .render(&mut ui, &mut app.state, &app.services);
         app.relink_dialog
             .render(&mut ui, &mut app.state, &app.services);
+        app.sequence_dialog.render(&mut ui, &mut app.state);
+        app.speed_dialog.render(&mut ui, &mut app.state);
         render_select_popup(&mut ui);
 
         // Drag-Ghost (z. B. Assets aus dem Medien-Browser)
@@ -499,6 +789,7 @@ fn main() {
         let cursor = ui.take_cursor();
         let dispatch = std::mem::take(&mut ui.dispatch);
         let texture_requests = std::mem::take(&mut ui.texture_requests);
+        pending_fx_jobs = std::mem::take(&mut ui.effect_requests);
         drop(ui);
         d.set_mouse_cursor(cursor);
         drop(d);
@@ -577,23 +868,53 @@ fn apply_custom_action(state: &mut AppState, action: overlays::context_menu::Cus
         }
         FxSetInterp { keys, interp } => {
             for_each_clip_keys(keys, |clip_id, keys| {
-                state.timeline.fx_set_interp(clip_id, keys, interp)
+                state.timeline.kf_set_interp(clip_id, keys, interp)
             });
         }
         FxRemoveKeyframes { keys } => {
             for_each_clip_keys(keys, |clip_id, keys| {
-                state.timeline.fx_remove_keyframes(clip_id, keys)
+                state.timeline.kf_remove_keyframes(clip_id, keys)
             });
         }
+        FxResetParam { clip_id, pref } => state.timeline.kf_reset_param(&clip_id, &pref),
+        EffectsApplyToClips { kind, clip_ids } => {
+            // Doppelte Ziele vermeiden (A/V-Paare zeigen auf denselben Clip).
+            let mut applied: Vec<String> = Vec::new();
+            for id in clip_ids {
+                if let Some(target) = state.timeline.effect_target_clip(&id, kind) {
+                    if !applied.contains(&target) {
+                        state.timeline.effects_add(&id, kind);
+                        applied.push(target);
+                    }
+                }
+            }
+        }
+        EffectsMove { clip_id, fx_id, delta } => {
+            state.timeline.effects_move(&clip_id, &fx_id, delta)
+        }
+        EffectsRemove { clip_id, fx_id } => state.timeline.effects_remove(&clip_id, &fx_id),
+        EffectsToggle { clip_id, fx_id } => {
+            state.timeline.effects_toggle_enabled(&clip_id, &fx_id)
+        }
+        EffectsReset { clip_id, fx_id } => state.timeline.effects_reset(&clip_id, &fx_id),
+        TransitionRemove { id } => state.timeline.remove_transitions(&[id]),
+        TransitionReplace { id, kind } => state.timeline.set_transition_kind(&id, kind),
+        TransitionAlign { id, alignment } => {
+            state.timeline.set_transition_alignment(&id, alignment)
+        }
+        TransitionDirection { id, direction } => {
+            state.timeline.set_transition_direction(&id, direction)
+        }
+        TransitionEditDuration { id } => state.app.edit_transition_duration = Some(id),
     }
 }
 
 /// Keyframe-Listen aus Menüaktionen nach Clip gruppieren.
 fn for_each_clip_keys(
-    keys: Vec<(String, crate::core::animation::ParamId, f64)>,
-    mut f: impl FnMut(&str, &[(crate::core::animation::ParamId, f64)]),
+    keys: Vec<(String, crate::core::animation::ParamRef, f64)>,
+    mut f: impl FnMut(&str, &[(crate::core::animation::ParamRef, f64)]),
 ) {
-    let mut by_clip: std::collections::HashMap<String, Vec<(crate::core::animation::ParamId, f64)>> =
+    let mut by_clip: std::collections::HashMap<String, Vec<(crate::core::animation::ParamRef, f64)>> =
         Default::default();
     for (clip_id, param, t) in keys {
         by_clip.entry(clip_id).or_default().push((param, t));
@@ -614,6 +935,8 @@ fn draw_drag_ghost(ui: &mut Ui, payload: &DragPayload) {
             }
         }
         DragPayload::Tab { panel } => crate::panels::panel_title(panel).to_string(),
+        DragPayload::Effect(kind) => kind.label().to_string(),
+        DragPayload::Transition(kind) => kind.label().to_string(),
     };
     let w = ui.font(FontKind::Sans12).width(&label) + 24.0;
     let rect = Rect::new(ui.input.mouse.x + 12.0, ui.input.mouse.y + 14.0, w, 24.0);

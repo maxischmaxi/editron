@@ -22,12 +22,46 @@ pub enum CustomAction {
     MediaShowInBrowser { asset_id: String },
     /// Interpolation ausgewählter Keyframes setzen: (Clip, Parameter, Medienzeit).
     FxSetInterp {
-        keys: Vec<(String, crate::core::animation::ParamId, f64)>,
+        keys: Vec<(String, crate::core::animation::ParamRef, f64)>,
         interp: crate::core::animation::Interp,
     },
     FxRemoveKeyframes {
-        keys: Vec<(String, crate::core::animation::ParamId, f64)>,
+        keys: Vec<(String, crate::core::animation::ParamRef, f64)>,
     },
+    /// Einzelnen Parameter auf den Standardwert zurücksetzen.
+    FxResetParam {
+        clip_id: String,
+        pref: crate::core::animation::ParamRef,
+    },
+    /// Effekt aus dem Katalog auf Clips anwenden.
+    EffectsApplyToClips {
+        kind: crate::core::effects::EffectKind,
+        clip_ids: Vec<String>,
+    },
+    /// Effekt-Instanz im Stapel verschieben (−1 = nach oben, +1 = nach unten).
+    EffectsMove { clip_id: String, fx_id: String, delta: i32 },
+    /// Effekt-Instanz vom Clip entfernen.
+    EffectsRemove { clip_id: String, fx_id: String },
+    /// Bypass einer Effekt-Instanz umschalten.
+    EffectsToggle { clip_id: String, fx_id: String },
+    /// Alle Parameter einer Effekt-Instanz zurücksetzen.
+    EffectsReset { clip_id: String, fx_id: String },
+    /// Übergang entfernen.
+    TransitionRemove { id: String },
+    /// Übergangsart ersetzen.
+    TransitionReplace { id: String, kind: crate::core::transitions::TransitionKind },
+    /// Ausrichtung relativ zur Schnittkante setzen.
+    TransitionAlign {
+        id: String,
+        alignment: crate::core::transitions::TransitionAlignment,
+    },
+    /// Richtung (Wischen/Schieben) setzen.
+    TransitionDirection {
+        id: String,
+        direction: crate::core::transitions::TransitionDirection,
+    },
+    /// Dauer-Eingabe in der Timeline öffnen.
+    TransitionEditDuration { id: String },
 }
 
 #[derive(Clone)]

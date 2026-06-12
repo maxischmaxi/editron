@@ -4,13 +4,13 @@
 //! Pixelgröße gerastert und bilinear herunterskaliert (sauberes Antialiasing
 //! mit Subpixel-Positionierung).
 
+use crate::core::text_raster::fc_match;
 use raylib::consts::TextureFilter;
 use raylib::core::text::Font;
 use raylib::core::RaylibHandle;
 use raylib::ffi;
 use raylib::math::Vector2;
 use raylib::RaylibThread;
-use std::process::Command;
 
 /// Codepoints, die in die Atlanten gerastert werden: ASCII, Latin-1
 /// (Umlaute!), typografische Zeichen (– — „ “ … ›), Pfeile.
@@ -28,31 +28,20 @@ fn codepoints() -> Vec<char> {
     cps
 }
 
-/// fontconfig-Anfrage: liefert (Familie, Pfad) des besten Matches.
-fn fc_match(query: &str) -> Option<(String, String)> {
-    let out = Command::new("fc-match")
-        .arg("-f")
-        .arg("%{family}\t%{file}")
-        .arg(query)
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    let (family, file) = s.split_once('\t')?;
-    Some((family.trim().to_string(), file.trim().to_string()))
-}
-
 /// Sucht entlang einer Familien-Präferenzliste den ersten echten Treffer
-/// (fc-match liefert sonst stillschweigend einen Fallback).
+/// (fc-match liefert sonst stillschweigend einen Fallback). Die fc-match-
+/// Anbindung teilt sich die UI mit dem Titel-Rasterizer
+/// (`core::text_raster`).
 fn resolve_font(families: &[&str], fc_weight: u32) -> Option<String> {
     for fam in families {
-        if let Some((matched, file)) = fc_match(&format!("{fam}:weight={fc_weight}")) {
+        if let Some((matched, file, _)) = fc_match(&format!("{fam}:weight={fc_weight}")) {
             if matched.to_lowercase().contains(&fam.to_lowercase()) {
                 return Some(file);
             }
         }
     }
     // Letzte Rettung: irgendein Sans der Plattform
-    fc_match(&format!("sans-serif:weight={fc_weight}")).map(|(_, f)| f)
+    fc_match(&format!("sans-serif:weight={fc_weight}")).map(|(_, f, _)| f)
 }
 
 const SANS_STACK: &[&str] = &["Inter", "Segoe UI", "Noto Sans", "DejaVu Sans"];

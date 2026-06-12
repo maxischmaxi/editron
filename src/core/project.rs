@@ -3,6 +3,7 @@
 //! (tmp + rename + .bak), Zuletzt-geöffnet-Liste und Autosave der Sitzung.
 
 use crate::core::timeline::{TimelineClip, TimelineTrack};
+use crate::core::transitions::Transition;
 use crate::core::types::MediaAsset;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,20 @@ use std::path::{Path, PathBuf};
 
 pub const PROJECT_EXT: &str = "etron";
 pub const PROJECT_FORMAT: &str = "editron-project";
-pub const PROJECT_VERSION: u32 = 1;
+/// v2: Sequenz-Einstellungen (`timeline.sequence`); v1-Dateien laden mit
+/// 25 fps und aus den Medien geratener Auflösung weiter.
+/// v3: Titel-Clips (`clips[].title`, Generator ohne Mediendatei) — ältere
+/// App-Versionen würden sie als verwaiste Clips verwerfen, deshalb der
+/// Versionssprung; v2-Dateien laden unverändert.
+/// v4: Untertitel (Spurtyp `subtitle`, `tracks[].subtitleStyle`,
+/// `clips[].subtitle`, `timeline.activeSubtitleTrackId`) — ältere App-
+/// Versionen können den Spurtyp nicht deserialisieren, deshalb der
+/// Versionssprung; v3-Dateien laden unverändert.
+/// v5: Clip-Geschwindigkeit (`clips[].speed/reverse/freeze`) — ältere
+/// App-Versionen würden die Felder ignorieren und Clips mit falschem
+/// Tempo abspielen, deshalb der Versionssprung; v4-Dateien laden
+/// unverändert (Default: 100 % vorwärts).
+pub const PROJECT_VERSION: u32 = 5;
 const RECENT_LIMIT: usize = 10;
 
 // ------------------------------------------------------------------- Format
@@ -40,10 +54,18 @@ pub struct ProjectFile {
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineDoc {
+    /// Sequenz-Einstellungen (ab Formatversion 2). None = Altprojekt:
+    /// 25 fps, Auflösung wird beim Laden aus den Medien geraten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<crate::core::sequence::SequenceSettings>,
     #[serde(default)]
     pub tracks: Vec<TimelineTrack>,
     #[serde(default)]
     pub clips: Vec<TimelineClip>,
+    /// Übergänge an Schnittkanten — `default` hält ältere Projektdateien
+    /// (ohne Feld) lesbar; ältere App-Versionen ignorieren das Feld.
+    #[serde(default)]
+    pub transitions: Vec<Transition>,
     #[serde(default)]
     pub playhead_sec: f64,
     #[serde(default)]
@@ -59,6 +81,9 @@ pub struct TimelineDoc {
     /// Summen-Fader des Audio-Mixers in dB.
     #[serde(default)]
     pub master_gain_db: f64,
+    /// Aktive Untertitel-Spur (Ziel von „Untertitel hinzufügen“/SRT-Export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_subtitle_track_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -200,8 +225,10 @@ pub fn collect(state: &AppState) -> ProjectFile {
         media: state.media.assets.clone(),
         selected_asset_ids: state.media.selected_asset_ids.clone(),
         timeline: TimelineDoc {
+            sequence: Some(state.timeline.settings),
             tracks: state.timeline.tracks.clone(),
             clips: state.timeline.clips.clone(),
+            transitions: state.timeline.transitions.clone(),
             playhead_sec: state.timeline.playhead_sec,
             in_point: state.timeline.in_point,
             out_point: state.timeline.out_point,
@@ -209,6 +236,7 @@ pub fn collect(state: &AppState) -> ProjectFile {
             snapping: state.timeline.snapping,
             selected_clip_ids: state.timeline.selected_clip_ids.clone(),
             master_gain_db: state.timeline.master_gain_db,
+            active_subtitle_track_id: state.timeline.active_subtitle_track_id.clone(),
         },
         source_monitor: SourceMonitorDoc {
             asset_id: state.playback.source_asset_id.clone(),
@@ -309,9 +337,12 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
     state.media.revision += 1;
 
     let t = file.timeline;
+    let legacy_sequence = t.sequence.is_none();
     state.timeline.load_document(
+        t.sequence,
         t.tracks,
         t.clips,
+        t.transitions,
         t.playhead_sec,
         t.in_point,
         t.out_point,
@@ -319,17 +350,31 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
         t.snapping,
         t.selected_clip_ids,
         t.master_gain_db,
+        t.active_subtitle_track_id,
     );
+    // Altprojekt (v1, ohne Sequenz-Einstellungen): 25 fps bleiben, die
+    // Auflösung wird wie früher aus dem Material geraten.
+    if legacy_sequence {
+        let (w, h) = crate::core::export::suggested_resolution(&state.timeline, &state.media);
+        state.timeline.settings.width = w;
+        state.timeline.settings.height = h;
+    }
     // Clips verwaister Assets entfernen (Asset aus der Datei gelöscht o. ä.).
+    // Titel-/Untertitel-Clips sind Generatoren ohne Asset und bleiben immer.
     let orphans: Vec<String> = state
         .timeline
         .clips
         .iter()
-        .filter(|c| !asset_ids.contains(c.asset_id.as_str()))
+        .filter(|c| !c.is_generator() && !asset_ids.contains(c.asset_id.as_str()))
         .map(|c| c.id.clone())
         .collect();
     if !orphans.is_empty() {
         state.timeline.clips.retain(|c| !orphans.contains(&c.id));
+        // Übergänge an entfernten Clips ebenfalls aufräumen.
+        state.timeline.transitions.retain(|t| {
+            let gone = |id: &Option<String>| id.as_ref().is_some_and(|id| orphans.contains(id));
+            !gone(&t.from_clip_id) && !gone(&t.to_clip_id)
+        });
     }
 
     let sm = file.source_monitor;
@@ -412,7 +457,8 @@ pub fn safeguard_unsaved(state: &mut AppState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::timeline::{TrackKind, SEQUENCE_FPS};
+    use crate::core::sequence::{FrameRate, SequenceSettings};
+    use crate::core::timeline::{TrackKind, MIN_CLIP_DURATION};
 
     /// Recent-Liste in ein Test-Verzeichnis umlenken, damit Tests nie die
     /// echte Nutzer-Config anfassen. Alle Tests setzen denselben Wert —
@@ -467,6 +513,31 @@ mod tests {
                 fx.opacity.value = 80.0;
                 fx
             },
+            grade: {
+                // Farbkorrektur muss den Roundtrip überleben.
+                let mut g = crate::core::grade::ColorGrade::default();
+                g.temperature = 25.0;
+                g.look = crate::core::grade::GradeLook::TealOrange;
+                g.gain = crate::core::grade::WheelValue { x: 0.3, y: -0.1, luma: 0.05 };
+                g.vignette_amount = 30.0;
+                g
+            },
+            effects: {
+                // Effekt-Stapel inkl. Keyframes muss den Roundtrip überleben.
+                let mut blur =
+                    crate::core::effects::EffectInstance::new(crate::core::effects::EffectKind::GaussianBlur);
+                blur.params[0].upsert_key(0.5, 0.0);
+                blur.params[0].upsert_key(4.5, 60.0);
+                let mut key =
+                    crate::core::effects::EffectInstance::new(crate::core::effects::EffectKind::ChromaKey);
+                key.enabled = false;
+                vec![blur, key]
+            },
+            title: None,
+            subtitle: None,
+            speed: 1.0,
+            reverse: false,
+            freeze: false,
         });
         // Standbild mit unendlicher Quelldauer (Infinity-Roundtrip).
         let track_id = state.timeline.tracks[1].id.clone();
@@ -484,6 +555,48 @@ mod tests {
             enabled: false,
             gain_db: 0.0,
             fx: Default::default(),
+            grade: Default::default(),
+            effects: Vec::new(),
+            title: None,
+            subtitle: None,
+            speed: 1.0,
+            reverse: false,
+            freeze: false,
+        });
+        // Rückwärts-Clip mit 37 % muss den Roundtrip exakt überleben.
+        let track_id = state.timeline.tracks[0].id.clone();
+        state.timeline.clips.push(TimelineClip {
+            id: "clip-3".into(),
+            track_id,
+            asset_id: "asset-1".into(),
+            name: "speed.mp4".into(),
+            kind: TrackKind::Video,
+            start: 12.0,
+            duration: 3.0,
+            src_in: 1.0,
+            src_duration: 12.0,
+            link_id: None,
+            enabled: true,
+            gain_db: 0.0,
+            fx: Default::default(),
+            grade: Default::default(),
+            effects: Vec::new(),
+            title: None,
+            subtitle: None,
+            speed: 0.37,
+            reverse: true,
+            freeze: false,
+        });
+        // Übergang (Einblenden auf clip-1) muss den Roundtrip überleben.
+        state.timeline.transitions.push({
+            let mut tr = crate::core::transitions::Transition::new(
+                crate::core::transitions::TransitionKind::Wipe,
+                None,
+                Some("clip-1".into()),
+                1.5,
+            );
+            tr.direction = crate::core::transitions::TransitionDirection::Down;
+            tr
         });
         state.timeline.playhead_sec = 3.25;
         state.timeline.in_point = Some(1.0);
@@ -491,6 +604,13 @@ mod tests {
         state.timeline.master_gain_db = -4.5;
         state.timeline.tracks[2].gain_db = 2.0;
         state.timeline.tracks[2].pan = -0.5;
+        // NTSC-Sequenz mit Drop-Frame muss den Roundtrip exakt überleben.
+        state.timeline.settings = SequenceSettings {
+            rate: FrameRate::new(30000, 1001),
+            width: 1280,
+            height: 720,
+            drop_frame: true,
+        };
         state
     }
 
@@ -509,8 +629,16 @@ mod tests {
         assert_eq!(file.format, PROJECT_FORMAT);
         assert_eq!(file.version, PROJECT_VERSION);
         assert_eq!(file.media.len(), 1);
-        assert_eq!(file.timeline.clips.len(), 2);
+        assert_eq!(file.timeline.clips.len(), 3);
         assert_eq!(file.timeline.playhead_sec, 3.25);
+        // Clip-Geschwindigkeit exakt erhalten (rückwärts, 37 %).
+        let speedy = file.timeline.clips.iter().find(|c| c.id == "clip-3").unwrap();
+        assert_eq!(speedy.speed, 0.37);
+        assert!(speedy.reverse);
+        assert!(!speedy.freeze);
+        // Normale Clips bleiben bei 100 % vorwärts.
+        assert_eq!(file.timeline.clips[0].speed, 1.0);
+        assert!(!file.timeline.clips[0].reverse);
         assert_eq!(file.timeline.in_point, Some(1.0));
         assert!(file.timeline.clips[1].src_duration.is_infinite());
         assert!(!file.timeline.clips[1].enabled);
@@ -521,18 +649,42 @@ mod tests {
         assert_eq!(fx.pos_x.keyframes[0].interp, crate::core::animation::Interp::EaseInOut);
         assert_eq!(fx.opacity.value, 80.0);
         assert!(fx.pos_x.is_animated());
-        // Unveränderte Clips speichern kein fx-Feld (schlanke Datei).
+        let g = &file.timeline.clips[0].grade;
+        assert_eq!(g.temperature, 25.0);
+        assert_eq!(g.look, crate::core::grade::GradeLook::TealOrange);
+        assert_eq!(g.gain.x, 0.3);
+        assert_eq!(g.vignette_amount, 30.0);
+        // Unveränderte Clips speichern kein fx-/grade-Feld (schlanke Datei).
         assert!(file.timeline.clips[1].fx.is_default());
+        assert!(file.timeline.clips[1].grade.is_default());
         assert_eq!(file.timeline.tracks[2].gain_db, 2.0);
         assert_eq!(file.timeline.tracks[2].pan, -0.5);
+        // Übergang vollständig erhalten.
+        assert_eq!(file.timeline.transitions.len(), 1);
+        let tr = &file.timeline.transitions[0];
+        assert_eq!(tr.kind, crate::core::transitions::TransitionKind::Wipe);
+        assert_eq!(tr.direction, crate::core::transitions::TransitionDirection::Down);
+        assert_eq!(tr.to_clip_id.as_deref(), Some("clip-1"));
+        assert_eq!(tr.duration, 1.5);
+
+        // Sequenz-Einstellungen exakt erhalten (NTSC-Bruch, kein Float).
+        let seq = file.timeline.sequence.expect("Sequenz-Einstellungen gespeichert");
+        assert_eq!(seq.rate, FrameRate::new(30000, 1001));
+        assert_eq!((seq.width, seq.height), (1280, 720));
+        assert!(seq.drop_frame);
 
         let mut target = AppState::default();
         let offline = apply(&mut target, file, Some(path.clone()));
         // Quelldatei existiert nicht → offline erkannt.
         assert_eq!(offline, 1);
         assert!(target.media.assets[0].offline);
-        assert_eq!(target.timeline.clips.len(), 2);
+        assert_eq!(target.timeline.settings.rate, FrameRate::new(30000, 1001));
+        assert!(target.timeline.settings.drop_frame);
+        assert_eq!(target.timeline.clips.len(), 3);
         assert_eq!(target.timeline.clips[0].start, 1.0);
+        assert_eq!(target.timeline.clip("clip-3").unwrap().speed, 0.37);
+        assert!(target.timeline.clip("clip-3").unwrap().reverse);
+        assert_eq!(target.timeline.transitions.len(), 1, "Übergang geladen");
         assert_eq!(target.timeline.master_gain_db, -4.5);
         assert_eq!(target.timeline.tracks[2].pan, -0.5);
         assert!(!target.project.dirty);
@@ -606,6 +758,13 @@ mod tests {
             enabled: true,
             gain_db: 0.0,
             fx: Default::default(),
+            grade: Default::default(),
+            effects: Vec::new(),
+            title: None,
+            subtitle: None,
+            speed: 1.0,
+            reverse: false,
+            freeze: false,
         };
         let mut orphan = good.clone();
         orphan.id = "orphan".into();
@@ -615,10 +774,12 @@ mod tests {
         broken.start = f64::NAN;
         let mut tiny = good.clone();
         tiny.id = "tiny".into();
-        tiny.duration = 0.5 / SEQUENCE_FPS;
+        tiny.duration = 0.5 * MIN_CLIP_DURATION;
         tl.load_document(
+            None,
             vec![track],
             vec![good, orphan, broken, tiny],
+            Vec::new(),
             f64::NAN,
             None,
             None,
@@ -626,10 +787,207 @@ mod tests {
             true,
             vec!["ok".into(), "orphan".into()],
             0.0,
+            None,
         );
         assert_eq!(tl.clips.len(), 1);
         assert_eq!(tl.clips[0].id, "ok");
         assert_eq!(tl.playhead_sec, 0.0);
         assert_eq!(tl.selected_clip_ids, vec!["ok".to_string()]);
+        // Ohne gespeicherte Sequenz-Einstellungen: 25-fps-Default.
+        assert_eq!(tl.settings.rate, FrameRate::PAL_25);
+    }
+
+    #[test]
+    fn legacy_v1_project_loads_with_pal_and_guessed_resolution() {
+        isolate_config();
+        // v1-Datei: kein `sequence`-Feld, Medium mit 4K-Videostream.
+        let raw = format!(
+            r#"{{
+                "format": "{PROJECT_FORMAT}",
+                "version": 1,
+                "activeWorkspace": "edit",
+                "media": [{{
+                    "id": "a1",
+                    "path": "/tmp/missing.mp4",
+                    "name": "missing.mp4",
+                    "kind": "video",
+                    "info": {{
+                        "path": "/tmp/missing.mp4",
+                        "fileName": "missing.mp4",
+                        "container": "mov,mp4",
+                        "durationSec": 10.0,
+                        "sizeBytes": 1,
+                        "video": [{{
+                            "index": 0, "codec": "h264", "width": 3840,
+                            "height": 2160, "fps": 29.97, "pixFmt": null,
+                            "bitrate": null
+                        }}],
+                        "audio": []
+                    }},
+                    "thumbnailPath": null,
+                    "importedAt": 0.0,
+                    "offline": false
+                }}],
+                "timeline": {{
+                    "tracks": [{{ "id": "v1", "kind": "video" }}],
+                    "clips": [{{
+                        "id": "c1", "trackId": "v1", "assetId": "a1",
+                        "name": "missing.mp4", "kind": "video",
+                        "start": 0.0, "duration": 5.0, "srcIn": 0.0,
+                        "srcDuration": 10.0, "linkId": null
+                    }}]
+                }}
+            }}"#
+        );
+        let dir = std::env::temp_dir().join(format!("editron-proj-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.etron");
+        std::fs::write(&path, raw).unwrap();
+
+        let file = load_from(&path).expect("v1 lädt");
+        let mut state = AppState::default();
+        apply(&mut state, file, Some(path));
+        // Framerate bleibt 25 (Altverhalten), Auflösung aus dem Material.
+        assert_eq!(state.timeline.settings.rate, FrameRate::PAL_25);
+        assert!(!state.timeline.settings.drop_frame);
+        assert_eq!(
+            (state.timeline.settings.width, state.timeline.settings.height),
+            (3840, 2160)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn title_clips_survive_roundtrip_and_orphan_cleanup() {
+        isolate_config();
+        let mut state = AppState::default();
+        let mut spec = crate::core::title::TitleTemplate::LowerThird.build();
+        spec.text = "Roundtrip\nBauchbinde".into();
+        spec.stroke_width = 3.5;
+        let title_id = state.timeline.add_title_clip(spec.clone(), 1.0, 4.0);
+        // Titel-Transform-Keyframes (Abspann-Mechanik) müssen mitkommen.
+        if let Some(c) = state.timeline.clips.iter_mut().find(|c| c.id == title_id) {
+            c.fx.pos_y.upsert_key(0.0, 110.0);
+            c.fx.pos_y.upsert_key(4.0, -110.0);
+        }
+        // Verwaister Medien-Clip (Asset fehlt in der Datei): fliegt beim
+        // Laden raus — der Titel-Clip (ohne Asset) muss bleiben.
+        let track_id = state.timeline.tracks[0].id.clone();
+        state.timeline.clips.push(TimelineClip {
+            id: "orphan".into(),
+            track_id,
+            asset_id: "missing-asset".into(),
+            name: "weg".into(),
+            kind: crate::core::timeline::TrackKind::Video,
+            start: 10.0,
+            duration: 2.0,
+            src_in: 0.0,
+            src_duration: 5.0,
+            link_id: None,
+            enabled: true,
+            gain_db: 0.0,
+            fx: Default::default(),
+            grade: Default::default(),
+            effects: Vec::new(),
+            title: None,
+            subtitle: None,
+            speed: 1.0,
+            reverse: false,
+            freeze: false,
+        });
+
+        let dir = std::env::temp_dir().join(format!("editron-proj-title-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("titel.etron");
+        save_to(&mut state, &path).expect("save");
+
+        let file = load_from(&path).expect("load");
+        assert_eq!(file.version, PROJECT_VERSION);
+        let saved = file
+            .timeline
+            .clips
+            .iter()
+            .find(|c| c.id == title_id)
+            .expect("Titel-Clip gespeichert");
+        assert_eq!(saved.title.as_ref(), Some(&spec));
+        assert_eq!(saved.fx.pos_y.keyframes.len(), 2);
+
+        let mut target = AppState::default();
+        apply(&mut target, file, Some(path));
+        let loaded = target.timeline.clip(&title_id).expect("Titel-Clip überlebt das Laden");
+        assert_eq!(loaded.title.as_ref(), Some(&spec));
+        assert!(loaded.src_duration.is_infinite());
+        assert!(
+            target.timeline.clip("orphan").is_none(),
+            "verwaiste Medien-Clips werden weiterhin entfernt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subtitle_tracks_survive_roundtrip_with_style_and_active_track() {
+        isolate_config();
+        let mut state = AppState::default();
+        // Zwei Spuren mit Segmenten + Spurstil; U2 ist die aktive Spur.
+        let (u1, _) = state.timeline.import_subtitle_cues(&[
+            crate::core::subtitle::SrtCue { start: 0.0, end: 2.0, text: "Erstes Segment".into() },
+            crate::core::subtitle::SrtCue {
+                start: 2.0,
+                end: 4.0,
+                text: "Zweites\nmit Umbruch".into(),
+            },
+        ]);
+        state.timeline.subtitle_style_update(&u1, |s| {
+            s.size = 56.0;
+            s.color = crate::core::title::RgbaColor::rgb(255, 230, 0);
+            s.pos_y = -38.0;
+            s.bg_enabled = false;
+            s.stroke_width = 3.0;
+        });
+        let (u2, _) = state.timeline.import_subtitle_cues(&[crate::core::subtitle::SrtCue {
+            start: 1.0,
+            end: 3.0,
+            text: "Zweite Sprache".into(),
+        }]);
+        // Spur U1 ausgeblendet (muted = Sichtbarkeit der Untertitel-Spur).
+        if let Some(t) = state.timeline.tracks.iter_mut().find(|t| t.id == u1) {
+            t.muted = true;
+        }
+        state.timeline.set_active_subtitle_track(&u2);
+
+        let dir = std::env::temp_dir().join(format!("editron-proj-subs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("untertitel.etron");
+        save_to(&mut state, &path).expect("save");
+
+        let file = load_from(&path).expect("load");
+        assert_eq!(file.version, PROJECT_VERSION);
+        assert_eq!(file.timeline.active_subtitle_track_id.as_deref(), Some(u2.as_str()));
+
+        let mut target = AppState::default();
+        apply(&mut target, file, Some(path));
+        let style = target.timeline.subtitle_style(&u1);
+        assert_eq!(style.size, 56.0);
+        assert_eq!(style.color, crate::core::title::RgbaColor::rgb(255, 230, 0));
+        assert_eq!(style.pos_y, -38.0);
+        assert!(!style.bg_enabled);
+        assert_eq!(style.stroke_width, 3.0);
+        assert!(target.timeline.tracks.iter().find(|t| t.id == u1).unwrap().muted);
+        assert_eq!(target.timeline.active_subtitle_track().unwrap().id, u2);
+        // Segmente (Generatoren ohne Asset) überleben die Verwaisten-Bereinigung.
+        let texts: Vec<String> = target
+            .timeline
+            .clips
+            .iter()
+            .filter(|c| c.track_id == u1)
+            .filter_map(|c| c.subtitle.as_ref().map(|s| s.text.clone()))
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert!(texts.contains(&"Zweites\nmit Umbruch".to_string()));
+        // SRT-Export nach dem Laden bleibt deckungsgleich.
+        let cues = target.timeline.subtitle_cues(&u2);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "Zweite Sprache");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
+

@@ -173,7 +173,7 @@ impl DockManager {
             // Medien + Effekte als Tabs, unten rechts die Timeline.
             "edit" => {
                 let preview = self.group(&["program", "source"], 0);
-                let media = self.group(&["media", "effects"], 0);
+                let media = self.group(&["media", "effects", "subtitles"], 0);
                 let timeline = self.group(&["timeline"], 0);
                 DockNode::Split {
                     dir: SplitDir::Col,

@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 rfd = "0.15"
+swash = "0.2.9"
 
 # Apple-Event-Handling („Öffnen mit“) — nur macOS.
 [target.'cfg(target_os = "macos")'.dependencies]

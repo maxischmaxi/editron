@@ -9,9 +9,12 @@
 //! Asset-Thumbnail (Video) bzw. Bild/Music-Icon.
 
 use crate::core::compose::{self, LayerQuad};
+use crate::core::effects;
 use crate::core::player::clip_texture_key;
-use crate::core::timeline::{sequence_end, SEQUENCE_FPS};
-use crate::core::timecode::format_timecode;
+use crate::ui::fx_shader::{fx_output_key, EffectJob};
+use crate::core::sequence::SequenceSettings;
+use crate::core::timeline::sequence_end;
+use crate::core::timecode::{format_sequence_timecode, format_timecode};
 use crate::core::types::{MediaAsset, MediaKind};
 use crate::panels::transform_gizmo::TransformGizmo;
 use crate::panels::Panel;
@@ -30,11 +33,27 @@ const TRANSPORT_H: f32 = 48.0;
 const SCRUBBER_H: f32 = 8.0;
 
 /// Aufgelöster Programm-Layer: Texture + Transform-Quad in Bühnenkoordinaten.
+#[derive(Clone)]
 pub struct ResolvedLayer {
     pub clip_id: String,
     pub tex_key: String,
     pub quad: LayerQuad,
     pub alpha: u8,
+    /// Farbkorrektur des Clips (Identität = ungegradet).
+    pub grade: crate::core::grade::GradeParams,
+    /// Sichtbarer Canvas-Ausschnitt (Wipe-Übergang); None = voll sichtbar.
+    pub mask: Option<Rect>,
+    /// Titel-Layer: vertikaler Raster-Erweiterungsfaktor (Abspann-Rolle);
+    /// 1 bei Video/Bildern. Das Quad ist bereits um den Faktor gestreckt.
+    pub extend_k: f64,
+    /// Titel-Clip (Doppelklick öffnet die Textbearbeitung im Monitor).
+    pub is_title: bool,
+}
+
+/// Ein Eintrag der Programm-Zeichenliste: Clip-Layer oder Farbfläche (Dip).
+pub enum StageLayer {
+    Clip(ResolvedLayer),
+    Solid { white: bool, alpha: u8 },
 }
 
 /// Bühnen-Inhalt eines Monitors.
@@ -45,7 +64,7 @@ enum StageContent<'a> {
     /// Programmmonitor: komponierte Layer auf dem Programm-Canvas.
     Program {
         canvas: Rect,
-        layers: &'a [ResolvedLayer],
+        layers: &'a [StageLayer],
     },
 }
 
@@ -55,6 +74,9 @@ struct MonitorChrome<'a> {
     time: f64,
     duration: f64,
     fps: f64,
+    /// Programmmonitor: Timecode folgt den Sequenz-Einstellungen
+    /// (exakte NTSC-Frame-Zählung, Drop-Frame-Notation). None = Quelle.
+    seq: Option<SequenceSettings>,
     playing: bool,
     has_media: bool,
     in_point: Option<f64>,
@@ -128,16 +150,33 @@ fn render_monitor(
             // außerhalb des Programm-Frames wird beschnitten (wie im Export).
             ui.push_clip(*canvas);
             for layer in layers.iter() {
-                let q = &layer.quad;
-                ui.draw_texture_quad(
-                    &layer.tex_key,
-                    q.cx as f32,
-                    q.cy as f32,
-                    q.w as f32,
-                    q.h as f32,
-                    q.rot_deg as f32,
-                    layer.alpha,
-                );
+                match layer {
+                    StageLayer::Clip(layer) => {
+                        // Wipe-Maske: harter Frame-Ausschnitt (Scissor) —
+                        // dieselbe Rechteck-Mathematik wie der CPU-Export.
+                        if let Some(mask) = layer.mask {
+                            ui.push_clip(mask);
+                        }
+                        let q = &layer.quad;
+                        ui.draw_texture_quad_graded(
+                            &layer.tex_key,
+                            q.cx as f32,
+                            q.cy as f32,
+                            q.w as f32,
+                            q.h as f32,
+                            q.rot_deg as f32,
+                            layer.alpha,
+                            &layer.grade,
+                        );
+                        if layer.mask.is_some() {
+                            ui.pop_clip();
+                        }
+                    }
+                    StageLayer::Solid { white, alpha } => {
+                        let base = if *white { theme::WHITE } else { theme::BLACK };
+                        ui.fill(*canvas, theme::with_alpha(base, *alpha));
+                    }
+                }
             }
             ui.pop_clip();
         }
@@ -197,7 +236,10 @@ fn render_monitor(
     let inner = transport.inset_xy(12.0, 0.0);
 
     // Timecode links (w-24, mono text-xs)
-    let tc = format_timecode(chrome.time, chrome.fps);
+    let tc = match &chrome.seq {
+        Some(seq) => format_sequence_timecode(chrome.time, seq),
+        None => format_timecode(chrome.time, chrome.fps),
+    };
     ui.text_left(
         &tc,
         Rect::new(inner.x, inner.y, 96.0, inner.h),
@@ -207,7 +249,10 @@ fn render_monitor(
 
     // Rechts: Auflösungs-Select + Gesamtdauer (w-40)
     let right = Rect::new(inner.right() - 160.0, inner.y, 160.0, inner.h);
-    let dur_label = format_timecode(chrome.duration, chrome.fps);
+    let dur_label = match &chrome.seq {
+        Some(seq) => format_sequence_timecode(chrome.duration, seq),
+        None => format_timecode(chrome.duration, chrome.fps),
+    };
     let dur_w = ui.font(FontKind::Mono12).width(&dur_label);
     ui.text_left(
         &dur_label,
@@ -411,6 +456,7 @@ impl Panel for SourceMonitorPanel {
             time: app.playback.source.position,
             duration,
             fps,
+            seq: None,
             playing: app.playback.source.playing,
             has_media,
             in_point: app.playback.source.in_mark,
@@ -479,45 +525,131 @@ impl Panel for SourceMonitorPanel {
 pub struct ProgramMonitorPanel {
     scrub_active: bool,
     gizmo: TransformGizmo,
+    title_editor: crate::panels::title_editor::TitleTextEditor,
+}
+
+/// Sichere Ränder über das Programm-Canvas zeichnen: Action-Safe (90 %)
+/// und Title-Safe (80 %) — EBU/SMPTE-Konvention.
+fn draw_safe_margins(ui: &mut Ui, canvas: Rect) {
+    let line = theme::with_alpha(theme::WHITE, 90);
+    for frac in [0.9f32, 0.8] {
+        let w = canvas.w * frac;
+        let h = canvas.h * frac;
+        let r = Rect::new(
+            canvas.x + (canvas.w - w) / 2.0,
+            canvas.y + (canvas.h - h) / 2.0,
+            w,
+            h,
+        );
+        ui.stroke(r, 1.0, line);
+    }
+    // Zentrumskreuz
+    let (cx, cy) = (canvas.x + canvas.w / 2.0, canvas.y + canvas.h / 2.0);
+    ui.fill(Rect::new(cx - 8.0, cy, 16.0, 1.0), line);
+    ui.fill(Rect::new(cx, cy - 8.0, 1.0, 16.0), line);
 }
 
 /// Sichtbare Layer am Playhead in Zeichenreihenfolge auflösen: Texture-Key
 /// (Bild = Datei, Video = Live-Frame, Fallback Thumbnail), Transform-Quad in
 /// Bühnenkoordinaten und Deckkraft. Layer ohne geladene Texture liefern noch
-/// kein Quad (Anforderung läuft über den TextureCache).
+/// kein Quad (Anforderung läuft über den TextureCache). Clips mit aktiven
+/// Effekten melden einen Effekt-Job an und zeichnen das `fx://`-Ergebnis,
+/// sobald es vorliegt (bis dahin die Roh-Texture).
 fn resolve_program_layers(
     ui: &mut Ui,
     app: &AppState,
     canvas: Rect,
     t: f64,
-) -> Vec<ResolvedLayer> {
-    compose::visible_video_clips(&app.timeline, t)
+) -> Vec<StageLayer> {
+    compose::visible_program_layers(&app.timeline, t)
         .into_iter()
-        .filter_map(|clip| {
-            let asset = app.media.asset(&clip.asset_id)?;
-            if asset.offline {
+        .filter_map(|layer| {
+            let (clip, t_fx) = match layer {
+                compose::ProgramLayer::Clip { clip, t_fx } => (clip, t_fx),
+                compose::ProgramLayer::Solid { white, alpha } => {
+                    return Some(StageLayer::Solid {
+                        white,
+                        alpha: (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+                    });
+                }
+            };
+            let media_t = compose::clip_media_time(clip, t);
+            let fx = compose::eval_fx(&clip.fx, media_t);
+            let opacity = fx.opacity * t_fx.opacity;
+            if opacity <= 0.0 {
                 return None;
             }
-            let fx = compose::eval_fx(&clip.fx, compose::clip_media_time(clip, t));
-            if fx.opacity <= 0.0 {
-                return None;
-            }
-            let mut keys: Vec<String> = Vec::new();
-            match asset.kind {
-                MediaKind::Image => keys.push(asset.path.clone()),
-                MediaKind::Video => {
-                    keys.push(clip_texture_key(&clip.id));
-                    if let Some(thumb) = &asset.thumbnail_path {
-                        keys.push(thumb.clone());
+            // Text-Generatoren (Titel + Untertitel): Textur kommt aus der
+            // Titel-Engine (CPU-gerastert in Canvas-Auflösung) statt aus
+            // einem Decoder.
+            let mut extend_k = 1.0f64;
+            let (mut tex_key, (nw, nh)) = if clip.is_generator() {
+                let key = crate::core::title_engine::title_texture_key(&clip.id);
+                let size = ui.texture_size(&key)?;
+                // Erweiterungsfaktor (Abspann-Rolle) aus dem Seitenverhältnis
+                // der Textur gegen das Canvas ableiten (Breite = 1 Frame).
+                extend_k = ((size.1 as f64 * canvas.w as f64)
+                    / (size.0 as f64 * canvas.h as f64))
+                    .round()
+                    .max(1.0);
+                // Quad-Basis ist das volle Frame — NICHT die Texturmaße
+                // (Überabtastung/Erweiterung stecken in der Textur).
+                (key, (canvas.w, canvas.h))
+            } else {
+                let asset = app.media.asset(&clip.asset_id)?;
+                if asset.offline {
+                    return None;
+                }
+                let mut keys: Vec<String> = Vec::new();
+                match asset.kind {
+                    MediaKind::Image => keys.push(asset.path.clone()),
+                    MediaKind::Video => {
+                        keys.push(clip_texture_key(&clip.id));
+                        if let Some(thumb) = &asset.thumbnail_path {
+                            keys.push(thumb.clone());
+                        }
+                    }
+                    MediaKind::Audio => return None,
+                }
+                keys.iter()
+                    .find_map(|k| ui.texture_size(k).map(|s| (k.clone(), s)))?
+            };
+            // Effekt-Kette: Job für den nächsten Frame anmelden; Ergebnis
+            // zeichnen, sobald der Renderer es liefert.
+            if effects::has_active_video_effects(&clip.effects) {
+                let resolved = effects::resolve_video_effects(&clip.effects, media_t);
+                if !resolved.is_empty() {
+                    let out_key = fx_output_key(&clip.id);
+                    ui.effect_requests.push(EffectJob {
+                        out_key: out_key.clone(),
+                        source_key: tex_key.clone(),
+                        effects: resolved,
+                    });
+                    if ui.fx_output_size(&out_key).is_some() {
+                        tex_key = out_key;
                     }
                 }
-                MediaKind::Audio => return None,
             }
-            let (tex_key, (nw, nh)) = keys
-                .iter()
-                .find_map(|k| ui.texture_size(k).map(|s| (k.clone(), s)))?;
-            let q = compose::layer_quad(canvas.w as f64, canvas.h as f64, nw as f64, nh as f64, &fx);
-            Some(ResolvedLayer {
+            let mut q =
+                compose::layer_quad(canvas.w as f64, canvas.h as f64, nw as f64, nh as f64, &fx);
+            // Erweiterter Titel-Raster (Abspann): Quad vertikal strecken —
+            // identisch zum CPU-Export-Pfad.
+            q.h *= extend_k;
+            // Übergangs-Auswirkung (Schieben/Zoom) — identische Mathematik
+            // wie im Export, bezogen auf die Canvas-Maße.
+            compose::apply_transition_to_quad(&mut q, &t_fx, canvas.w as f64, canvas.h as f64);
+            // Wipe-Maske in Canvas-Pixel umrechnen (gleiche Rundung wie CPU).
+            let mask = t_fx.mask.map(|m| {
+                let (x0, y0, x1, y1) =
+                    compose::mask_to_pixels(&m, canvas.w as usize, canvas.h as usize);
+                Rect::new(
+                    canvas.x + x0 as f32,
+                    canvas.y + y0 as f32,
+                    (x1.saturating_sub(x0)) as f32,
+                    (y1.saturating_sub(y0)) as f32,
+                )
+            });
+            Some(StageLayer::Clip(ResolvedLayer {
                 clip_id: clip.id.clone(),
                 tex_key,
                 quad: LayerQuad {
@@ -525,10 +657,104 @@ fn resolve_program_layers(
                     cy: q.cy + canvas.y as f64,
                     ..q
                 },
-                alpha: (fx.opacity * 255.0).round().clamp(0.0, 255.0) as u8,
-            })
+                alpha: (opacity * 255.0).round().clamp(0.0, 255.0) as u8,
+                grade: crate::core::grade::precompute(&clip.grade),
+                mask,
+                extend_k,
+                is_title: clip.is_title(),
+            }))
         })
         .collect()
+}
+
+/// Nur die Clip-Layer (Gizmo/Farbpipette arbeiten auf Clips).
+fn clip_layers(layers: &[StageLayer]) -> Vec<ResolvedLayer> {
+    layers
+        .iter()
+        .filter_map(|l| match l {
+            StageLayer::Clip(c) => Some(c.clone()),
+            StageLayer::Solid { .. } => None,
+        })
+        .collect()
+}
+
+/// Aktive Farbpipette: Crosshair + Hinweis über der Bühne; Klick bildet den
+/// Punkt invers über das Layer-Quad auf den Decode-MiniFrame des Ziel-Clips
+/// ab (Quellfarbe VOR Effekten/Grade — genau richtig fürs Keying) und
+/// schreibt R/G/B in die Zielparameter. Esc/Rechtsklick bricht ab.
+fn handle_color_pick(
+    ui: &mut Ui,
+    app: &mut AppState,
+    stage: Rect,
+    layers: &[ResolvedLayer],
+    t: f64,
+) {
+    let Some(req) = app.app.color_pick.clone() else { return };
+    // Abbruch per Esc oder Rechtsklick.
+    let esc = ui
+        .input
+        .keys
+        .iter()
+        .any(|k| k.key == raylib::consts::KeyboardKey::KEY_ESCAPE);
+    if esc || ui.input.right_pressed {
+        app.app.color_pick = None;
+        return;
+    }
+    if ui.mouse_in(stage) {
+        ui.want_cursor(MouseCursor::MOUSE_CURSOR_CROSSHAIR);
+    }
+    // Hinweisbanner oben in der Bühne.
+    let banner = Rect::new(stage.x + (stage.w - 320.0) / 2.0, stage.y + 8.0, 320.0, 24.0);
+    ui.fill_rounded(banner, theme::RADIUS_SM, theme::with_alpha(theme::SURFACE_3, 230));
+    ui.text_centered(
+        "Farbe aufnehmen: in das Bild klicken (Esc bricht ab)",
+        banner,
+        theme::TEXT_1,
+        FontKind::Sans12,
+    );
+
+    if !(ui.input.left_pressed && ui.mouse_in(stage)) {
+        return;
+    }
+    // Ziel-Layer + inverse Quad-Abbildung (wie der CPU-Compositor).
+    let picked = layers.iter().find(|l| l.clip_id == req.clip_id).and_then(|layer| {
+        let q = &layer.quad;
+        let (sin_r, cos_r) = (-q.rot_deg.to_radians()).sin_cos();
+        let dx = ui.input.mouse.x as f64 - q.cx;
+        let dy = ui.input.mouse.y as f64 - q.cy;
+        let lx = dx * cos_r - dy * sin_r;
+        let ly = dx * sin_r + dy * cos_r;
+        let u = lx / q.w + 0.5;
+        let v = ly / q.h + 0.5;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        let mini = app.monitor.preview_frames.get(&req.clip_id)?;
+        let px = ((u * mini.w as f64) as usize).min(mini.w - 1);
+        let py = ((v * mini.h as f64) as usize).min(mini.h - 1);
+        let i = (py * mini.w + px) * 4;
+        Some([mini.rgba[i], mini.rgba[i + 1], mini.rgba[i + 2]])
+    });
+    if let Some(rgb) = picked {
+        let media_t = app
+            .timeline
+            .clip(&req.clip_id)
+            .map(|c| compose::clip_media_time(c, t))
+            .unwrap_or(0.0);
+        app.timeline.begin_fx_edit();
+        for (ch, value) in rgb.iter().enumerate() {
+            app.timeline.kf_set_value_live(
+                &req.clip_id,
+                &crate::core::animation::ParamRef::Effect {
+                    fx_id: req.fx_id.clone(),
+                    index: req.p_idx + ch,
+                },
+                media_t,
+                *value as f64,
+            );
+        }
+    }
+    app.app.color_pick = None;
 }
 
 impl Panel for ProgramMonitorPanel {
@@ -538,12 +764,17 @@ impl Panel for ProgramMonitorPanel {
         let t = app.timeline.playhead_sec;
 
         // Bühnen-Geometrie (identisch zu render_monitor) + Programm-Canvas:
-        // Seitenverhältnis aus der vorgeschlagenen Sequenzauflösung.
+        // Seitenverhältnis aus den Sequenz-Einstellungen.
         let mut stage = rect;
         let _ = stage.cut_bottom(TRANSPORT_H);
         let _ = stage.cut_bottom(SCRUBBER_H);
-        let (aw, ah) = crate::core::export::suggested_resolution(&app.timeline, &app.media);
-        let canvas = stage.fit_contain(aw as f32, ah as f32);
+        let seq = app.timeline.settings;
+        let canvas = stage.fit_contain(seq.width as f32, seq.height as f32);
+        // Canvas-Auflösung an die Titel-Engine melden (Raster in Anzeigegröße).
+        app.monitor.program_canvas = (
+            canvas.w.round().max(1.0) as u32,
+            canvas.h.round().max(1.0) as u32,
+        );
 
         let layers = resolve_program_layers(ui, app, canvas, t);
 
@@ -551,7 +782,8 @@ impl Panel for ProgramMonitorPanel {
             monitor: "program",
             time: app.timeline.playhead_sec,
             duration,
-            fps: SEQUENCE_FPS,
+            fps: seq.rate.fps(),
+            seq: Some(seq),
             playing: app.playback.program_playing,
             has_media: has_clips,
             in_point: app.timeline.in_point,
@@ -571,8 +803,58 @@ impl Panel for ProgramMonitorPanel {
         let scale = app.monitor.program_scale;
         let action = render_monitor(ui, &chrome, &mut self.scrub_active, scale, rect);
 
-        // Direkte Manipulation des ausgewählten Clips (über den Layern).
-        self.gizmo.update(ui, app, stage, canvas, &layers);
+        // Sichere Ränder (Action-/Title-Safe) über dem Programmbild.
+        if app.monitor.safe_margins && has_clips {
+            ui.push_clip(stage);
+            draw_safe_margins(ui, canvas);
+            ui.pop_clip();
+        }
+
+        // ---- Farbpipette (Chroma-Key): Klick liest die Quellfarbe ----
+        let clip_only = clip_layers(&layers);
+        if app.app.color_pick.is_some() {
+            self.title_editor.stop(ui);
+            handle_color_pick(ui, app, stage, &clip_only, t);
+        } else if self.title_editor.update(ui, app, stage, canvas, &clip_only) {
+            // Texteingabe direkt im Monitor — Gizmo pausiert.
+        } else {
+            // Direkte Manipulation des ausgewählten Clips (über den Layern).
+            self.gizmo.update(ui, app, stage, canvas, &clip_only);
+        }
+
+        // Safe-Margins-Umschalter in der Transportleiste (links neben dem
+        // Timecode-Feld — nur der Programmmonitor hat ihn).
+        let transport = Rect::new(rect.x, rect.bottom() - TRANSPORT_H, rect.w, TRANSPORT_H);
+        let btn = Rect::new(
+            rect.x + 12.0 + 96.0,
+            transport.y + (TRANSPORT_H - 28.0) / 2.0,
+            28.0,
+            28.0,
+        );
+        let btn_id = ui.id("program.safeMargins");
+        let it = ui.interact(btn_id, btn);
+        if app.monitor.safe_margins || it.hovered {
+            ui.fill_rounded(btn, theme::RADIUS_SM, theme::SURFACE_3);
+        }
+        ui.icon(
+            "focus",
+            btn,
+            16.0,
+            if app.monitor.safe_margins {
+                theme::ACCENT
+            } else if it.hovered {
+                theme::TEXT_1
+            } else {
+                theme::TEXT_2
+            },
+        );
+        if it.hovered {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+            ui.tooltip(btn_id, btn, "Sichere Ränder (Action-/Title-Safe)");
+        }
+        if it.clicked {
+            app.monitor.safe_margins = !app.monitor.safe_margins;
+        }
 
         match action {
             MonitorAction::None => {}

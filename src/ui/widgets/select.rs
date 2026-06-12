@@ -15,6 +15,8 @@ pub struct SelectPopup {
     pub result: Option<usize>,
     /// Frame, in dem das Popup geöffnet wurde (Klick nicht sofort als „außerhalb“ werten).
     pub just_opened: bool,
+    /// Scroll-Offset für lange Listen (z. B. Schriftfamilien).
+    pub scroll: f32,
 }
 
 /// Pro Frame offenes Select-Popup (höchstens eines).
@@ -89,6 +91,7 @@ fn select_with_host(
             selected,
             result: None,
             just_opened: true,
+            scroll: -1.0, // < 0: beim Öffnen zur Auswahl scrollen
         });
     }
     None
@@ -109,22 +112,39 @@ fn render_popup_with_host(ui: &mut Ui, host: &mut SelectHost) {
 
     let row_h = 28.0;
     let w = popup.anchor.w.max(120.0);
-    let h = popup.options.len() as f32 * row_h + 8.0;
+    let content_h = popup.options.len() as f32 * row_h + 8.0;
+    // Lange Listen (z. B. Schriftfamilien): Höhe begrenzen + Mausrad-Scroll.
+    let max_h = (ui.screen.h - 16.0).max(row_h + 8.0);
+    let h = content_h.min(max_h);
     let mut x = popup.anchor.x;
     let mut y = popup.anchor.bottom() + 2.0;
     if y + h > ui.screen.bottom() - 4.0 {
-        y = popup.anchor.y - 2.0 - h;
+        y = (popup.anchor.y - 2.0 - h).max(8.0);
     }
     x = x.min(ui.screen.right() - w - 4.0).max(4.0);
     let rect = Rect::new(x, y, w, h);
+
+    let max_scroll = (content_h - h).max(0.0);
+    if popup.scroll < 0.0 {
+        // Beim Öffnen die aktuelle Auswahl ins Sichtfeld rücken.
+        popup.scroll = (popup.selected as f32 * row_h - h / 2.0 + row_h).clamp(0.0, max_scroll);
+    }
+    if rect.contains(ui.input.mouse) {
+        popup.scroll = (popup.scroll - ui.input.wheel.y * row_h * 2.0).clamp(0.0, max_scroll);
+    }
 
     drop_shadow(ui, rect, theme::RADIUS_MD);
     ui.fill_rounded(rect, theme::RADIUS_MD, theme::SURFACE_2);
     ui.stroke_rounded(rect, theme::RADIUS_MD, 1.0, theme::LINE);
 
-    let mut row = Rect::new(rect.x, rect.y + 4.0, rect.w, row_h);
+    ui.push_clip(rect.inset_xy(0.0, 2.0));
+    let mut row = Rect::new(rect.x, rect.y + 4.0 - popup.scroll, rect.w, row_h);
     let mut clicked: Option<usize> = None;
     for (i, option) in popup.options.iter().enumerate() {
+        if row.bottom() < rect.y || row.y > rect.bottom() {
+            row = row.offset(0.0, row_h);
+            continue;
+        }
         let hovered = ui.mouse_in(row);
         if hovered {
             ui.fill(row, theme::SURFACE_3);
@@ -141,6 +161,18 @@ fn render_popup_with_host(ui: &mut Ui, host: &mut SelectHost) {
         inner.cut_left(4.0);
         ui.text_left(option, inner, theme::TEXT_1, FontKind::Sans12);
         row = row.offset(0.0, row_h);
+    }
+    ui.pop_clip();
+    // Scroll-Indikator (schmaler Thumb am rechten Rand).
+    if max_scroll > 0.0 {
+        let track_h = rect.h - 8.0;
+        let thumb_h = (track_h * (h / content_h)).max(24.0);
+        let thumb_y = rect.y + 4.0 + (track_h - thumb_h) * (popup.scroll / max_scroll);
+        ui.fill_rounded(
+            Rect::new(rect.right() - 5.0, thumb_y, 3.0, thumb_h),
+            theme::RADIUS_XS,
+            theme::SURFACE_4,
+        );
     }
 
     if let Some(i) = clicked {

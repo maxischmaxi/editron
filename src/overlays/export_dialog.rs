@@ -15,7 +15,6 @@ use crate::core::export::{
     SAMPLE_RATES,
 };
 use crate::core::timecode::format_duration;
-use crate::core::timeline::SEQUENCE_FPS;
 use crate::services::Services;
 use crate::state::AppState;
 use crate::stores::DialogId;
@@ -202,8 +201,8 @@ impl ExportDialog {
 
     fn apply_preset(&mut self, idx: usize, state: &AppState) {
         let Some(preset) = PRESETS.get(idx) else { return };
-        let source = export::suggested_resolution(&state.timeline, &state.media);
-        let mut settings = (preset.build)(source, SEQUENCE_FPS);
+        let seq = state.timeline.settings;
+        let mut settings = (preset.build)((seq.width, seq.height), seq.rate.fps());
         // Zielpfad behalten, nur die Endung dem Container anpassen.
         settings.output = match self.settings.as_ref() {
             Some(old) if !old.output.is_empty() => {
@@ -212,6 +211,12 @@ impl ExportDialog {
             _ => default_output_path_raw(settings.container.ext),
         };
         settings.use_in_out = self.settings.as_ref().map(|s| s.use_in_out).unwrap_or(false);
+        // Untertitel-Wahl über Preset-Wechsel hinweg behalten.
+        settings.subtitles = self
+            .settings
+            .as_ref()
+            .map(|s| s.subtitles)
+            .unwrap_or_default();
         self.preset_idx = Some(idx);
         self.settings = Some(settings);
         self.sync_inputs_from_settings(state);
@@ -222,15 +227,15 @@ impl ExportDialog {
     fn sync_inputs_from_settings(&mut self, state: &AppState) {
         let Some(s) = &self.settings else { return };
         if let Some(v) = &s.video {
-            let source = export::suggested_resolution(&state.timeline, &state.media);
-            self.resolution_choice = if (v.width, v.height) == source {
+            let seq = state.timeline.settings;
+            self.resolution_choice = if (v.width, v.height) == (seq.width, seq.height) {
                 0
             } else if let Some(i) = RESOLUTIONS.iter().position(|(_, w, h)| (*w, *h) == (v.width, v.height)) {
                 1 + i
             } else {
                 1 + RESOLUTIONS.len()
             };
-            self.fps_choice = if (v.fps - SEQUENCE_FPS).abs() < 0.001 {
+            self.fps_choice = if (v.fps - seq.rate.fps()).abs() < 0.001 {
                 0
             } else if let Some(i) = FRAMERATES.iter().position(|(_, f)| (f - v.fps).abs() < 0.001) {
                 1 + i
@@ -288,15 +293,23 @@ impl ExportDialog {
         let enc_len = state.app.encoders.as_ref().map(|e| e.len()).unwrap_or(0);
         let revs = (state.timeline.revision, state.media.revision);
         if self.dirty || enc_len != self.encoders_seen || revs != self.revs_seen {
-            // „Wie Quelle“ folgt der Timeline — wichtig, wenn ein asynchroner
-            // Import die erste Quellauflösung erst nach dem Öffnen liefert.
+            // „Wie Sequenz“ folgt den Sequenz-Einstellungen — wichtig, wenn
+            // sich die Sequenz ändert (Settings-Dialog/Media-Match), während
+            // der Export-Dialog bereits Settings hält.
             if revs != self.revs_seen && self.resolution_choice == 0 {
-                let source = export::suggested_resolution(&state.timeline, &state.media);
+                let seq = state.timeline.settings;
                 if let Some(v) = self.settings.as_mut().and_then(|s| s.video.as_mut()) {
-                    (v.width, v.height) = source;
+                    (v.width, v.height) = (seq.width, seq.height);
                 }
-                self.width_input.set_text(source.0.to_string());
-                self.height_input.set_text(source.1.to_string());
+                self.width_input.set_text(seq.width.to_string());
+                self.height_input.set_text(seq.height.to_string());
+            }
+            if revs != self.revs_seen && self.fps_choice == 0 {
+                let fps = state.timeline.settings.rate.fps();
+                if let Some(v) = self.settings.as_mut().and_then(|s| s.video.as_mut()) {
+                    v.fps = fps;
+                }
+                self.fps_input.set_text(format_fps(fps));
             }
             self.encoders_seen = enc_len;
             self.revs_seen = revs;
@@ -462,12 +475,13 @@ impl ExportDialog {
             s.container = c;
             // Codecs auf erlaubte Werte des Containers clampen.
             if c.video {
-                let v_fps = s.video.as_ref().map(|v| v.fps).unwrap_or(SEQUENCE_FPS);
+                let seq = state.timeline.settings;
+                let v_fps = s.video.as_ref().map(|v| v.fps).unwrap_or_else(|| seq.rate.fps());
                 let (vw, vh) = s
                     .video
                     .as_ref()
                     .map(|v| (v.width, v.height))
-                    .unwrap_or_else(|| export::suggested_resolution(&state.timeline, &state.media));
+                    .unwrap_or((seq.width, seq.height));
                 let keep = s
                     .video
                     .as_ref()
@@ -519,8 +533,13 @@ impl ExportDialog {
                 if s.video.is_some() {
                     s.video = None;
                 } else {
-                    let (w, h) = export::suggested_resolution(&state.timeline, &state.media);
-                    s.video = Some(make_video(s.container.video_codecs[0], w, h, SEQUENCE_FPS));
+                    let seq = state.timeline.settings;
+                    s.video = Some(make_video(
+                        s.container.video_codecs[0],
+                        seq.width,
+                        seq.height,
+                        seq.rate.fps(),
+                    ));
                     needs_full_sync = true;
                 }
                 changed = true;
@@ -571,8 +590,9 @@ impl ExportDialog {
 
             // ---- Auflösung ----
             let r = labeled_row(ui, body, "Auflösung");
-            let source = export::suggested_resolution(&state.timeline, &state.media);
-            let source_label = format!("Wie Quelle — {}×{}", source.0, source.1);
+            let seq = state.timeline.settings;
+            let source = (seq.width, seq.height);
+            let source_label = format!("Wie Sequenz — {}×{}", source.0, source.1);
             let mut res_labels: Vec<String> = vec![source_label];
             res_labels.extend(RESOLUTIONS.iter().map(|(l, _, _)| l.to_string()));
             res_labels.push("Benutzerdefiniert …".into());
@@ -613,7 +633,8 @@ impl ExportDialog {
 
             // ---- Framerate ----
             let r = labeled_row(ui, body, "Framerate");
-            let seq_label = format!("Wie Sequenz — {} fps", format_fps(SEQUENCE_FPS));
+            let seq_fps = state.timeline.settings.rate.fps();
+            let seq_label = format!("Wie Sequenz — {} fps", state.timeline.settings.rate.label());
             let mut fps_labels: Vec<String> = vec![seq_label];
             fps_labels.extend(FRAMERATES.iter().map(|(l, _)| format!("{l} fps")));
             fps_labels.push("Benutzerdefiniert …".into());
@@ -622,7 +643,7 @@ impl ExportDialog {
                 self.fps_choice = i;
                 if let Some(v) = &mut s.video {
                     if i == 0 {
-                        v.fps = SEQUENCE_FPS;
+                        v.fps = seq_fps;
                     } else if i <= FRAMERATES.len() {
                         v.fps = FRAMERATES[i - 1].1;
                     }
@@ -835,6 +856,39 @@ impl ExportDialog {
                     audio.channels = if i == 0 { 1 } else { 2 };
                 }
                 changed = true;
+            }
+        }
+
+        // ================= Untertitel =================
+        // Nur anbieten, wenn die Sequenz Untertitel-Spuren hat — die
+        // Optionen hängen am Container (Einbetten braucht Subtitle-Streams).
+        let has_subtitle_tracks = state
+            .timeline
+            .tracks
+            .iter()
+            .any(|t| t.kind == crate::core::timeline::TrackKind::Subtitle);
+        if has_subtitle_tracks {
+            section(ui, body, "Untertitel");
+            let r = labeled_row(ui, body, "Untertitel");
+            let labels: Vec<String> = export::SubtitleMode::ALL
+                .iter()
+                .map(|m| {
+                    if *m == export::SubtitleMode::Embed && s.container.subtitle_codec.is_none() {
+                        format!("{} — Container ungeeignet", m.label())
+                    } else {
+                        m.label().to_string()
+                    }
+                })
+                .collect();
+            let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+            let current = export::SubtitleMode::ALL
+                .iter()
+                .position(|m| *m == s.subtitles)
+                .unwrap_or(0);
+            if let Some(i) = select(ui, "export.subtitles", r, &refs, current) {
+                s.subtitles = export::SubtitleMode::ALL[i];
+                changed = true;
+                keeps_preset = true;
             }
         }
 
@@ -1058,7 +1112,7 @@ impl ExportDialog {
                 group_thousands(self.frames_total)
             ));
             if self.render_fps > 0.0 {
-                let target_fps = s.video.as_ref().map(|v| v.fps).unwrap_or(SEQUENCE_FPS);
+                let target_fps = s.video.as_ref().map(|v| v.fps).unwrap_or(25.0);
                 text.push_str(&format!(
                     "   ·   {:.0} fps ({}× Echtzeit)",
                     self.render_fps,

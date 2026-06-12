@@ -4,12 +4,17 @@
 //! Kontextmenüs. Alle Editier-Operationen laufen über den TimelineStore
 //! (mit Undo); während einer Drag-Geste rendert das Panel eine Vorschau.
 
-use crate::core::timecode::{format_duration, format_timecode};
+use crate::core::timecode::{format_duration, format_sequence_timecode};
 use crate::core::timeline::{
-    expand_links, plan_asset_placements, sequence_end, track_name, trim_range, PlannedPlacement,
-    TimelineClip, TimelineTrack, TrackFlag, TrackKind, TrimEdge, MIN_CLIP_DURATION, SEQUENCE_FPS,
-    SelectMode,
+    apply_trim, expand_links, plan_asset_placements, sequence_end, track_name, trim_range,
+    PlannedPlacement, TimelineClip, TimelineTrack, TrackFlag, TrackKind, TrimEdge,
+    MIN_CLIP_DURATION, SelectMode,
 };
+use crate::core::transitions::{
+    self, Transition, TransitionAlignment, TransitionDirection, TransitionKind,
+    DEFAULT_TRANSITION_DURATION,
+};
+use crate::ui::widgets::text_input::TextInputState;
 use crate::overlays::context_menu::{CustomAction, MenuEntry, MenuItem};
 use crate::panels::Panel;
 use crate::services::Services;
@@ -28,6 +33,7 @@ const HEADER_H: f32 = 36.0; // h-9
 const RULER_H: f32 = 28.0; // h-7
 const VIDEO_H: f32 = 48.0; // h-12
 const AUDIO_H: f32 = 40.0; // h-10
+const SUBTITLE_H: f32 = 28.0; // h-7 — kompakte Untertitel-Spuren
 /// Einrast-Radius in Pixeln (zoomunabhängig).
 const SNAP_PX: f64 = 8.0;
 /// Kantenzone der Clips für Trim-Erkennung in Pixeln.
@@ -70,6 +76,12 @@ enum TlDrag {
         origin_x: f32,
         delta_sec: f64,
         snap_time: Option<f64>,
+    },
+    /// Übergangs-Dauer per Kanten-Drag trimmen (Vorschau, Commit beim Drop).
+    TransTrim {
+        id: String,
+        edge: TrimEdge,
+        preview: f64,
     },
     Roll {
         left_id: String,
@@ -122,6 +134,8 @@ pub struct TimelinePanel {
     sb_drag_h: Option<f32>,
     /// Drop-Vorschau im aktuellen Frame (Platzierungen + Snap-Linie).
     drop_preview: Option<(Vec<PlannedPlacement>, Option<f64>)>,
+    /// Offene Dauer-Eingabe eines Übergangs (Doppelklick/Kontextmenü).
+    trans_editor: Option<(String, TextInputState)>,
 }
 
 impl Default for TimelinePanel {
@@ -137,6 +151,7 @@ impl Default for TimelinePanel {
             sb_drag_v: None,
             sb_drag_h: None,
             drop_preview: None,
+            trans_editor: None,
         }
     }
 }
@@ -145,6 +160,7 @@ fn track_height(track: &TimelineTrack) -> f32 {
     match track.kind {
         TrackKind::Video => VIDEO_H,
         TrackKind::Audio => AUDIO_H,
+        TrackKind::Subtitle => SUBTITLE_H,
     }
 }
 
@@ -176,19 +192,6 @@ fn clip_under_mouse(
             })
             .map(|c| (c.clone(), track.clone(), *lane))
     })
-}
-
-fn apply_trim_preview(clip: &TimelineClip, edge: TrimEdge, delta: f64) -> TimelineClip {
-    let mut c = clip.clone();
-    match edge {
-        TrimEdge::Start => {
-            c.start += delta;
-            c.src_in += delta;
-            c.duration -= delta;
-        }
-        TrimEdge::End => c.duration += delta,
-    }
-    c
 }
 
 impl TimelinePanel {
@@ -252,6 +255,12 @@ impl TimelinePanel {
                     .iter()
                     .filter(|t| t.kind == TrackKind::Audio)
                     .collect();
+                let s_lanes: Vec<&TimelineTrack> = app
+                    .timeline
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == TrackKind::Subtitle)
+                    .collect();
                 let mut out: Vec<TimelineClip> = Vec::with_capacity(clips.len() + 4);
                 let mut moved: Vec<TimelineClip> = Vec::new();
                 for c in clips {
@@ -264,6 +273,7 @@ impl TimelinePanel {
                         let lanes = match c.kind {
                             TrackKind::Video => &v_lanes,
                             TrackKind::Audio => &a_lanes,
+                            TrackKind::Subtitle => &s_lanes,
                         };
                         if let Some(idx) = lanes.iter().position(|t| t.id == c.track_id) {
                             let ni = (idx as i32 + lane_offset)
@@ -296,7 +306,7 @@ impl TimelinePanel {
                     .iter()
                     .map(|c| {
                         if ids.contains(&c.id) {
-                            apply_trim_preview(c, *edge, *delta_sec)
+                            apply_trim(c, *edge, *delta_sec)
                         } else {
                             c.clone()
                         }
@@ -312,9 +322,9 @@ impl TimelinePanel {
                 .iter()
                 .map(|c| {
                     if c.id == *left_id {
-                        apply_trim_preview(c, TrimEdge::End, *delta_sec)
+                        apply_trim(c, TrimEdge::End, *delta_sec)
                     } else if c.id == *right_id {
-                        apply_trim_preview(c, TrimEdge::Start, *delta_sec)
+                        apply_trim(c, TrimEdge::Start, *delta_sec)
                     } else {
                         c.clone()
                     }
@@ -329,7 +339,7 @@ impl TimelinePanel {
                     .map(|c| {
                         if ids.contains(&c.id) && c.src_duration.is_finite() {
                             let mut m = c.clone();
-                            m.src_in = c.src_in + delta_sec;
+                            m.src_in = c.src_in + delta_sec * c.eff_speed();
                             m
                         } else {
                             c.clone()
@@ -364,6 +374,11 @@ impl Panel for TimelinePanel {
         ui.fill(rect, theme::SURFACE_1);
         let mut area = rect;
 
+        // Dauer-Eingabe aus dem Kontextmenü übernehmen.
+        if let Some(id) = app.app.edit_transition_duration.take() {
+            self.open_trans_editor(ui, app, &id);
+        }
+
         // ---------------- Werkzeugleiste (vertikal, w-9, border-r) ----------
         let toolbar = area.cut_left(TOOLBAR_W);
         ui.vline(toolbar.right() - 1.0, toolbar.y, toolbar.h, theme::LINE);
@@ -387,7 +402,7 @@ impl Panel for TimelinePanel {
         let header = area.cut_top(HEADER_H);
         ui.hline(header.x, header.bottom() - 1.0, header.w, theme::LINE);
         let header_inner = header.inset_xy(12.0, 0.0);
-        let tc = format_timecode(app.timeline.playhead_sec, SEQUENCE_FPS);
+        let tc = format_sequence_timecode(app.timeline.playhead_sec, &app.timeline.settings);
         ui.text_left(&tc, header_inner, theme::ACCENT, FontKind::Sans16); // font-mono text-base
         // rechts: Magnet | Divider | ZoomOut ZoomIn Fit
         let mut hx = header_inner.right();
@@ -593,6 +608,48 @@ impl Panel for TimelinePanel {
             row_y += h;
         }
 
+        // ---------------- Übergangs-Bänder über den Clips --------------------
+        // (id, Band-Rect, gesperrt) — auch Treffer-Liste für die Interaktion.
+        let mut trans_rects: Vec<(String, Rect, bool)> = Vec::new();
+        {
+            let selected_trs = app.timeline.selected_transition_ids.clone();
+            let trs: Vec<Transition> = app.timeline.transitions.clone();
+            for tr in &trs {
+                let Some(track_id) = app.timeline.transition_track_id(tr) else {
+                    continue;
+                };
+                let Some((track, lane)) = lane_rects.iter().find(|(t, _)| t.id == track_id) else {
+                    continue;
+                };
+                let Some((mut w0, mut w1)) = app.timeline.transition_window(tr) else {
+                    continue;
+                };
+                // Laufende Trim-Geste: Band mit Vorschau-Dauer zeichnen.
+                if let Some(TlDrag::TransTrim { id, preview, .. }) = &self.drag {
+                    if id == &tr.id {
+                        let (from, to) = transitions::resolve_clips(&app.timeline.clips, tr);
+                        if let Some(w) = transitions::window(from, to, tr.alignment, *preview) {
+                            (w0, w1) = w;
+                        }
+                    }
+                }
+                let band = Rect::new(
+                    time_x(w0),
+                    lane.y + 2.0,
+                    (((w1 - w0) * zoom) as f32).max(6.0),
+                    lane.h - 4.0,
+                );
+                draw_transition_band(
+                    ui,
+                    tr,
+                    band,
+                    selected_trs.contains(&tr.id),
+                    track.locked,
+                );
+                trans_rects.push((tr.id.clone(), band, track.locked));
+            }
+        }
+
         // Drop-Vorschau in bestehenden Spuren + neue Spurzeilen
         if let Some((placements, _)) = &self.drop_preview {
             for p in placements {
@@ -671,6 +728,7 @@ impl Panel for TimelinePanel {
         // ---------------- Interaktion: Klicks auf Clips/Spuren ---------------
         if self.drag.is_none()
             && self.ruler_drag.is_none()
+            && self.trans_editor.is_none()
             && ui.mouse_in(viewport)
             && mouse.y >= viewport.y + RULER_H - scroll_y
         {
@@ -679,6 +737,7 @@ impl Panel for TimelinePanel {
                 app,
                 &preview,
                 &lane_rects,
+                &trans_rects,
                 pointer_time,
                 lane_y,
                 &track_at_y,
@@ -766,6 +825,89 @@ impl Panel for TimelinePanel {
             }
         }
 
+        // ---------------- Effekt-Drop aus dem Effekte-Panel -------------------
+        // Zielclip unter der Maus highlighten; Drop wendet den Effekt an
+        // (Audio-Effekte landen über das A/V-Routing ggf. beim Partner).
+        let effect_drag = match ui.drag_over(viewport) {
+            Some(crate::ui::DragPayload::Effect(kind)) => Some(*kind),
+            _ => None,
+        };
+        if let Some(kind) = effect_drag {
+            if mouse.x >= viewport.x + TRACK_HEADER_W {
+                let t = pointer_time(mouse.x);
+                if let Some((clip, track, _)) =
+                    clip_under_mouse(&preview, &lane_rects, mouse.y, t, zoom)
+                {
+                    if !track.locked && app.timeline.effect_target_clip(&clip.id, kind).is_some()
+                    {
+                        if let Some((_, lane)) =
+                            lane_rects.iter().find(|(tr, _)| tr.id == clip.track_id)
+                        {
+                            let x0 = time_x(clip.start);
+                            let x1 = time_x(clip.end());
+                            let r = Rect::new(x0, lane.y + 1.0, (x1 - x0).max(3.0), lane.h - 2.0);
+                            ui.fill(r, theme::with_alpha(theme::ACCENT, 30));
+                            ui.stroke(r, 2.0, theme::ACCENT);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(crate::ui::DragPayload::Effect(kind)) = ui.accept_drop(viewport) {
+            let t = pointer_time(mouse.x);
+            if let Some((clip, track, _)) =
+                clip_under_mouse(&preview, &lane_rects, mouse.y, t, zoom)
+            {
+                if !track.locked {
+                    if let Some(target) = app.timeline.effects_add(&clip.id, kind) {
+                        // Zielclip auswählen — Effekteinstellungen zeigen ihn an.
+                        app.timeline.selected_clip_ids = vec![target];
+                    }
+                }
+            }
+        }
+
+        // ---------------- Übergangs-Drop aus dem Effekte-Panel ----------------
+        // Ziel ist die der Maus nächste Schnittkante des Clips darunter; die
+        // Vorschau zeigt das Übergangsfenster (oder rot, wenn kein Material).
+        let trans_drag = match ui.drag_over(viewport) {
+            Some(crate::ui::DragPayload::Transition(kind)) => Some(*kind),
+            _ => None,
+        };
+        if let Some(kind) = trans_drag {
+            if mouse.x >= viewport.x + TRACK_HEADER_W {
+                let t = pointer_time(mouse.x);
+                if let Some((clip, track, edge)) = transition_drop_target(
+                    &app.timeline.clips,
+                    &lane_rects,
+                    mouse.y,
+                    t,
+                    zoom,
+                    kind,
+                ) {
+                    if let Some((_, lane)) = lane_rects.iter().find(|(tr, _)| tr.id == track.id) {
+                        draw_transition_drop_preview(
+                            ui, app, &clip, edge, kind, *lane, time_x,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(crate::ui::DragPayload::Transition(kind)) = ui.accept_drop(viewport) {
+            let t = pointer_time(mouse.x);
+            if let Some((clip, _, edge)) =
+                transition_drop_target(&app.timeline.clips, &lane_rects, mouse.y, t, zoom, kind)
+            {
+                if let Err(err) =
+                    app.timeline
+                        .add_transition(kind, &clip.id, edge, DEFAULT_TRANSITION_DURATION)
+                {
+                    let now = ui.time;
+                    app.app.set_status_message(Some(err), now);
+                }
+            }
+        }
+
         // Playhead (w-px accent + Dreieck) über Lineal + Spuren
         let ph_x = time_x(app.timeline.playhead_sec);
         if ph_x >= viewport.x + TRACK_HEADER_W - 4.0 {
@@ -781,6 +923,9 @@ impl Panel for TimelinePanel {
                 theme::ACCENT,
             );
         }
+
+        // ---------------- Dauer-Eingabe eines Übergangs -----------------------
+        self.render_trans_editor(ui, app, &trans_rects, viewport);
 
         ui.pop_clip();
 
@@ -838,6 +983,18 @@ impl TimelinePanel {
                 theme::with_alpha(theme::DANGER, 204),
                 theme::with_alpha(theme::DANGER, 38),
             )
+        } else if clip.is_title() {
+            // Titel/Grafik: violett (Premiere-Konvention).
+            (
+                theme::with_alpha(theme::GRAPHIC, 178),
+                theme::with_alpha(theme::GRAPHIC, 33),
+            )
+        } else if clip.is_subtitle() {
+            // Untertitel: gelb (Premiere-Konvention für Captions).
+            (
+                theme::with_alpha(theme::WARNING, 178),
+                theme::with_alpha(theme::WARNING, 33),
+            )
         } else if is_audio {
             (
                 theme::with_alpha(theme::SUCCESS, 153),
@@ -859,17 +1016,24 @@ impl TimelinePanel {
                         let total = if clip.src_duration.is_finite() && clip.src_duration > 0.0 {
                             clip.src_duration
                         } else {
-                            clip.duration
+                            clip.media_span().max(clip.duration)
                         };
-                        let from = (clip.src_in / total) * peaks.len() as f64;
-                        let span = ((clip.duration / total) * peaks.len() as f64).max(1.0);
+                        // Sichtbare Medienspanne = duration × speed; rückwärts
+                        // läuft die Wellenform gespiegelt vom Medien-Out.
+                        let span = ((clip.media_span() / total) * peaks.len() as f64).max(1.0);
+                        let from = if clip.reverse {
+                            (clip.media_out() / total) * peaks.len() as f64
+                        } else {
+                            (clip.src_in / total) * peaks.len() as f64
+                        };
                         let h = rect.h;
                         let w = rect.w as i32;
-                        let step = (1.0 / rect.w.max(1.0) * span as f32).max(0.0);
+                        let dir: f32 = if clip.reverse { -1.0 } else { 1.0 };
+                        let step = (1.0 / rect.w.max(1.0) * span as f32).max(0.0) * dir;
                         let mut idx_f = from as f32;
                         let color = theme::with_alpha(theme::SUCCESS, 128_u8.min(alpha));
                         for x in 0..w {
-                            let idx = (idx_f as usize).min(peaks.len() - 1);
+                            let idx = (idx_f.max(0.0) as usize).min(peaks.len() - 1);
                             let v = peaks[idx];
                             let bar_h = (v * (h - 2.0)).max(1.0);
                             ui.fill(
@@ -907,8 +1071,34 @@ impl TimelinePanel {
             }
         }
 
-        // Titelzeile: Offline-/Link-Icon + Name + Dauer (oben ausgerichtet)
-        let mut inner = Rect::new(rect.x + 6.0, rect.y + 2.0, rect.w - 12.0, 16.0);
+        // Titelzeile: Offline-/Link-Icon + Name + Dauer (oben ausgerichtet;
+        // bei den kompakten Untertitel-Spuren vertikal zentriert)
+        let row_y = if clip.is_subtitle() {
+            rect.y + (rect.h - 16.0) / 2.0
+        } else {
+            rect.y + 2.0
+        };
+        let mut inner = Rect::new(rect.x + 6.0, row_y, rect.w - 12.0, 16.0);
+        if clip.is_title() {
+            let ic = inner.cut_left(12.0);
+            ui.icon(
+                "type",
+                Rect::new(ic.x, ic.y + 2.0, 12.0, 12.0),
+                12.0,
+                theme::with_alpha(theme::GRAPHIC, alpha),
+            );
+            inner.cut_left(4.0);
+        }
+        if clip.is_subtitle() {
+            let ic = inner.cut_left(12.0);
+            ui.icon(
+                "captions",
+                Rect::new(ic.x, ic.y + 2.0, 12.0, 12.0),
+                12.0,
+                theme::with_alpha(theme::WARNING, alpha),
+            );
+            inner.cut_left(4.0);
+        }
         if offline {
             let ic = inner.cut_left(12.0);
             ui.icon(
@@ -930,7 +1120,7 @@ impl TimelinePanel {
             inner.cut_left(4.0);
         }
         // Keyframe-Badge: Clip trägt animierte Parameter (Raute = 0°-Poly).
-        if clip.fx.any_animated() {
+        if clip.fx.any_animated() || clip.effects.iter().any(|e| e.any_animated()) {
             let ic = inner.cut_left(10.0);
             ui.d.draw_poly(
                 crate::ui::geom::v2(ic.x + 5.0, ic.y + 8.0),
@@ -941,8 +1131,35 @@ impl TimelinePanel {
             );
             inner.cut_left(4.0);
         }
+        // Effekt-Badge: Clip trägt aktive Effekte (Blitz).
+        if clip.effects.iter().any(|e| e.enabled) {
+            let ic = inner.cut_left(12.0);
+            ui.icon(
+                "zap",
+                Rect::new(ic.x, ic.y + 2.0, 12.0, 12.0),
+                12.0,
+                theme::with_alpha(theme::ACCENT, alpha),
+            );
+            inner.cut_left(4.0);
+        }
+        // Geschwindigkeits-Badge („50 %“, „−100 %“, „Standbild“).
+        if let Some(speed) = clip.speed_label() {
+            let bw = ui.font(FontKind::Mono11).width(&speed) + 8.0;
+            if inner.w > bw + 48.0 {
+                let cell = inner.cut_left(bw);
+                let chip = Rect::new(cell.x, cell.y + 1.0, bw, 14.0);
+                ui.fill_rounded(chip, 3.0, theme::with_alpha(theme::SURFACE_0, 150_u8.min(alpha)));
+                ui.text_centered(
+                    &speed,
+                    chip,
+                    theme::with_alpha(theme::TEXT_1, alpha),
+                    FontKind::Mono11,
+                );
+                inner.cut_left(4.0);
+            }
+        }
         let dur_label = format_duration(clip.duration);
-        if rect.w > 88.0 {
+        if rect.w > 88.0 && !clip.is_subtitle() {
             let dw = ui.font(FontKind::Mono12).width(&dur_label);
             let cell = inner.cut_right(dw);
             ui.text_left(
@@ -1000,15 +1217,42 @@ impl TimelinePanel {
         let name = track_name(track, &app.timeline.tracks);
         let mut inner = head.inset_xy(8.0, 0.0);
 
-        // Buttons rechts (size-3.5-Icons): Mute, Solo, Lock
-        let buttons: [(&str, bool, raylib::color::Color, raylib::color::Color); 3] = [
-            ("volume-2", track.muted, theme::WARNING, theme::with_alpha(theme::WARNING, 51)),
-            ("headphones", track.solo, theme::SUCCESS, theme::with_alpha(theme::SUCCESS, 51)),
-            ("lock", track.locked, theme::ACCENT, theme::ACCENT_SOFT),
-        ];
-        let flags = [TrackFlag::Muted, TrackFlag::Solo, TrackFlag::Locked];
+        // Buttons rechts (size-3.5-Icons): Mute/Solo/Lock — Untertitel-
+        // Spuren haben statt Mute/Solo einen Sichtbarkeits-Schalter (Auge);
+        // `muted` dient dort als „ausgeblendet“.
+        let buttons: Vec<(&str, bool, TrackFlag, raylib::color::Color, raylib::color::Color)> =
+            if track.kind == TrackKind::Subtitle {
+                vec![
+                    (
+                        if track.muted { "eye-off" } else { "eye" },
+                        track.muted,
+                        TrackFlag::Muted,
+                        theme::WARNING,
+                        theme::with_alpha(theme::WARNING, 51),
+                    ),
+                    ("lock", track.locked, TrackFlag::Locked, theme::ACCENT, theme::ACCENT_SOFT),
+                ]
+            } else {
+                vec![
+                    (
+                        "volume-2",
+                        track.muted,
+                        TrackFlag::Muted,
+                        theme::WARNING,
+                        theme::with_alpha(theme::WARNING, 51),
+                    ),
+                    (
+                        "headphones",
+                        track.solo,
+                        TrackFlag::Solo,
+                        theme::SUCCESS,
+                        theme::with_alpha(theme::SUCCESS, 51),
+                    ),
+                    ("lock", track.locked, TrackFlag::Locked, theme::ACCENT, theme::ACCENT_SOFT),
+                ]
+            };
         let mut bx = inner.right();
-        for (i, (icon, active, fg, bg)) in buttons.iter().enumerate().rev() {
+        for (i, (icon, active, flag, fg, bg)) in buttons.iter().enumerate().rev() {
             bx -= 16.0;
             let btn = Rect::new(bx, head.y + (head.h - 16.0) / 2.0, 16.0, 16.0);
             let id = ui.id(("tl.track.flag", track.id.as_str(), i));
@@ -1028,7 +1272,7 @@ impl TimelinePanel {
                 ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
             }
             if it.clicked {
-                app.timeline.toggle_track_flag(&track.id, flags[i]);
+                app.timeline.toggle_track_flag(&track.id, *flag);
             }
             bx -= 4.0;
         }
@@ -1052,6 +1296,7 @@ impl TimelinePanel {
         app: &mut AppState,
         preview: &[TimelineClip],
         lane_rects: &[(TimelineTrack, Rect)],
+        trans_rects: &[(String, Rect, bool)],
         pointer_time: impl Fn(f32) -> f64,
         lane_y: impl Fn(f32) -> f32,
         track_at_y: &impl Fn(f32) -> Option<TimelineTrack>,
@@ -1068,6 +1313,72 @@ impl TimelinePanel {
         let zoom = app.timeline.zoom_px_per_sec;
         let hit_clip =
             clip_under_mouse(preview, lane_rects, mouse.y, pointer_time(mouse.x), zoom);
+
+        // ---------------- Übergangs-Band unter der Maus ----------------
+        // Bänder liegen ÜBER den Clips und fangen Auswahl-Interaktionen ab.
+        let hit_trans = trans_rects
+            .iter()
+            .find(|(_, r, _)| ui.mouse_in(*r))
+            .cloned();
+        if let Some((trans_id, band, locked)) = &hit_trans {
+            if !*locked && tool == "select" {
+                let local_x = mouse.x - band.x;
+                if band.w > EDGE_PX * 3.0 && (local_x <= EDGE_PX || local_x >= band.w - EDGE_PX) {
+                    ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_EW);
+                } else {
+                    ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                }
+            }
+            if ui.input.right_pressed {
+                app.timeline.select_transition(trans_id);
+                if let Some(tr) = app.timeline.transition(trans_id).cloned() {
+                    let items = transition_context_menu(app, &tr);
+                    app.context_menu.show(mouse.x, mouse.y, items);
+                }
+                return;
+            }
+            if ui.input.left_pressed && tool == "select" {
+                app.app.focused_panel = "timeline".into();
+                if *locked {
+                    return;
+                }
+                if ui.input.double_click {
+                    self.open_trans_editor(ui, app, trans_id);
+                    return;
+                }
+                // Kantenzonen: Dauer trimmen; sonst auswählen.
+                let local_x = mouse.x - band.x;
+                let edge = if band.w > EDGE_PX * 3.0 {
+                    if local_x <= EDGE_PX {
+                        Some(TrimEdge::Start)
+                    } else if local_x >= band.w - EDGE_PX {
+                        Some(TrimEdge::End)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                app.timeline.select_transition(trans_id);
+                if let Some(edge) = edge {
+                    let preview = app
+                        .timeline
+                        .transition(trans_id)
+                        .map(|t| t.duration)
+                        .unwrap_or(DEFAULT_TRANSITION_DURATION);
+                    self.drag = Some(TlDrag::TransTrim {
+                        id: trans_id.clone(),
+                        edge,
+                        preview,
+                    });
+                }
+                return;
+            }
+            if ui.input.left_pressed && tool == "razor" {
+                // Kein Schnitt durch einen Übergang (Premiere-Verhalten).
+                return;
+            }
+        }
 
         // ---------------- Rechtsklick-Menüs ----------------
         if ui.input.right_pressed && ui.mouse_in(viewport) {
@@ -1354,10 +1665,17 @@ impl TimelinePanel {
                         .iter()
                         .filter(|t| t.kind == TrackKind::Audio)
                         .collect();
+                    let s_lanes: Vec<&TimelineTrack> = app
+                        .timeline
+                        .tracks
+                        .iter()
+                        .filter(|t| t.kind == TrackKind::Subtitle)
+                        .collect();
                     for c in &moving {
                         let lanes = match c.kind {
                             TrackKind::Video => &v_lanes,
                             TrackKind::Audio => &a_lanes,
+                            TrackKind::Subtitle => &s_lanes,
                         };
                         if let Some(idx) = lanes.iter().position(|t| t.id == c.track_id) {
                             lo = lo.max(-(idx as i32));
@@ -1415,6 +1733,41 @@ impl TimelinePanel {
                     *snap_time = st;
                 }
             }
+            TlDrag::TransTrim { id, edge, preview } => {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_EW);
+                if let Some(tr) = app.timeline.transition(id).cloned() {
+                    let (from, to) = transitions::resolve_clips(&app.timeline.clips, &tr);
+                    let t = pointer_time(mouse.x);
+                    // Gewünschte Dauer aus der gezogenen Kante ableiten —
+                    // welche Kante beweglich ist, hängt von Seite/Ausrichtung ab.
+                    let desired: Option<f64> = match (from, to) {
+                        (Some(f), Some(_)) => {
+                            let cut = f.end();
+                            match (tr.alignment, *edge) {
+                                (TransitionAlignment::Center, _) => Some(2.0 * (t - cut).abs()),
+                                (TransitionAlignment::StartAtCut, TrimEdge::End) => Some(t - cut),
+                                (TransitionAlignment::EndAtCut, TrimEdge::Start) => Some(cut - t),
+                                _ => None, // Kante liegt fest am Schnitt
+                            }
+                        }
+                        // Ausblenden: Fenster endet am Clipende — linke Kante zieht.
+                        (Some(f), None) => match edge {
+                            TrimEdge::Start => Some(f.end() - t),
+                            TrimEdge::End => None,
+                        },
+                        // Einblenden: Fenster beginnt am Clipanfang — rechte Kante.
+                        (None, Some(c)) => match edge {
+                            TrimEdge::End => Some(t - c.start),
+                            TrimEdge::Start => None,
+                        },
+                        (None, None) => None,
+                    };
+                    if let Some(desired) = desired {
+                        let max = app.timeline.transition_max_duration(&tr);
+                        *preview = desired.clamp(MIN_CLIP_DURATION, max.max(MIN_CLIP_DURATION));
+                    }
+                }
+            }
             TlDrag::Roll {
                 left_id,
                 right_id,
@@ -1447,7 +1800,11 @@ impl TimelinePanel {
                     .collect();
                 let mut delta = ((mouse.x - *origin_x) / zoom as f32) as f64;
                 for c in &targets {
-                    delta = delta.clamp(-c.src_in, c.src_duration - c.src_in - c.duration);
+                    let s = c.eff_speed();
+                    delta = delta.clamp(
+                        -c.src_in / s,
+                        (c.src_duration - c.media_out()).max(0.0) / s,
+                    );
                 }
                 *delta_sec = if targets.is_empty() { 0.0 } else { delta };
             }
@@ -1550,6 +1907,9 @@ impl TimelinePanel {
                         app.timeline.trim_clip(&clip_id, edge, delta_sec);
                     }
                 }
+            }
+            TlDrag::TransTrim { id, preview, .. } => {
+                app.timeline.set_transition_duration(&id, preview);
             }
             TlDrag::Roll {
                 left_id,
@@ -1787,6 +2147,265 @@ impl TimelinePanel {
             .insert_assets(&assets, &ids, t, track.as_ref().map(|t| t.id.as_str()));
         self.drop_preview = None;
     }
+
+    // ------------------------------------------- Übergangs-Dauer-Eingabe
+
+    /// Dauer-Eingabe für einen Übergang öffnen (Doppelklick/Kontextmenü).
+    fn open_trans_editor(&mut self, ui: &mut Ui, app: &AppState, id: &str) {
+        let Some(tr) = app.timeline.transition(id) else { return };
+        let mut input = TextInputState::default();
+        input.set_text(format!("{:.2}", tr.duration).replace('.', ","));
+        // Auswahl komplett, damit Tippen den Wert ersetzt.
+        input.sel_start = 0;
+        self.trans_editor = Some((id.to_string(), input));
+        // Tastaturfokus direkt auf das Feld (gleiche ID wie in render).
+        ui.persist.keyboard_focus = ui.id(("tl.transdur", id));
+    }
+
+    /// Kleine Eingabebox nahe dem Übergangs-Band zeichnen und auswerten.
+    fn render_trans_editor(
+        &mut self,
+        ui: &mut Ui,
+        app: &mut AppState,
+        trans_rects: &[(String, Rect, bool)],
+        viewport: Rect,
+    ) {
+        let Some((id, mut input)) = self.trans_editor.take() else { return };
+        if app.timeline.transition(&id).is_none() {
+            return; // Übergang weg (Undo etc.) → Editor schließen
+        }
+        // Esc bricht ab.
+        if ui
+            .input
+            .keys
+            .iter()
+            .any(|k| k.key == raylib::consts::KeyboardKey::KEY_ESCAPE)
+        {
+            return;
+        }
+        let anchor = trans_rects
+            .iter()
+            .find(|(tid, _, _)| tid == &id)
+            .map(|(_, r, _)| *r)
+            .unwrap_or_else(|| viewport.center_box(0.0, 0.0));
+        let (w, h) = (216.0, 64.0);
+        let x = (anchor.x + anchor.w / 2.0 - w / 2.0)
+            .clamp(viewport.x + 4.0, viewport.right() - w - 4.0);
+        let y = (anchor.bottom() + 6.0).min(viewport.bottom() - h - 4.0);
+        let rect = Rect::new(x, y, w, h);
+        ui.fill_rounded(rect, theme::RADIUS_MD, theme::SURFACE_2);
+        ui.stroke_rounded(rect, theme::RADIUS_MD, 1.0, theme::LINE_STRONG);
+        let inner = rect.inset_xy(10.0, 0.0);
+        let label_row = Rect::new(inner.x, rect.y + 6.0, inner.w, 16.0);
+        ui.text_left(
+            "Übergangsdauer (Sekunden)",
+            label_row,
+            theme::TEXT_2,
+            FontKind::Sans12,
+        );
+        let field = Rect::new(inner.x, rect.y + 28.0, inner.w, 24.0);
+        let result = input.show(ui, ("tl.transdur", id.as_str()), field, "z. B. 1,0");
+        if result.submitted {
+            if let Ok(v) = input.text.trim().replace(',', ".").parse::<f64>() {
+                app.timeline.set_transition_duration(&id, v);
+            }
+            return; // Editor schließen
+        }
+        // Klick außerhalb der Box schließt ohne Übernahme.
+        if ui.input.left_pressed && !rect.contains(ui.input.mouse) {
+            return;
+        }
+        self.trans_editor = Some((id, input));
+    }
+}
+
+// ------------------------------------------------------ Übergangs-Helfer
+
+/// Übergangs-Band über dem Schnitt zeichnen (Premiere-Optik: Fläche mit
+/// Diagonale + Label).
+fn draw_transition_band(ui: &mut Ui, tr: &Transition, band: Rect, selected: bool, locked: bool) {
+    let alpha = if locked { 128 } else { 255 };
+    ui.push_clip(band);
+    // Abdunkeln + Akzentfläche, damit das Band über Clips/Wellenform lesbar ist.
+    ui.fill_rounded(band, theme::RADIUS_SM, theme::with_alpha(theme::SURFACE_0, 150));
+    ui.fill_rounded(band, theme::RADIUS_SM, theme::with_alpha(theme::ACCENT, 46));
+    // Diagonale von unten-links nach oben-rechts (Blendverlauf-Symbol).
+    ui.d.draw_line_ex(
+        v2(band.x, band.bottom() - 1.0),
+        v2(band.right(), band.y + 1.0),
+        1.0,
+        theme::with_alpha(theme::ACCENT, 140_u8.min(alpha)),
+    );
+    if band.w > 56.0 {
+        let label = ui
+            .font(FontKind::Sans12)
+            .ellipsize(tr.kind.label(), band.w - 12.0);
+        ui.text_centered(&label, band, theme::with_alpha(theme::TEXT_1, alpha), FontKind::Sans12);
+    }
+    ui.pop_clip();
+    ui.stroke_rounded(band, theme::RADIUS_SM, 1.0, theme::with_alpha(theme::ACCENT, alpha));
+    if selected {
+        ui.stroke_rounded(band.inset(-1.0), theme::RADIUS_SM, 2.0, theme::TEXT_1);
+    }
+}
+
+/// Ziel-Kante eines Übergangs-Drops: Clip unter der Maus + die der Maus
+/// nächste Schnittkante; None bei gesperrter Spur oder falscher Spurart.
+fn transition_drop_target(
+    clips: &[TimelineClip],
+    lane_rects: &[(TimelineTrack, Rect)],
+    mouse_y: f32,
+    t: f64,
+    zoom: f64,
+    kind: TransitionKind,
+) -> Option<(TimelineClip, TimelineTrack, TrimEdge)> {
+    let (clip, track, _) = clip_under_mouse(clips, lane_rects, mouse_y, t, zoom)?;
+    if track.locked
+        || track.kind == TrackKind::Subtitle
+        || kind.is_audio() != (track.kind == TrackKind::Audio)
+    {
+        return None;
+    }
+    let edge = if (t - clip.start) <= (clip.end() - t) {
+        TrimEdge::Start
+    } else {
+        TrimEdge::End
+    };
+    Some((clip, track, edge))
+}
+
+/// Drop-Vorschau: Übergangsfenster an der Zielkante (rot, wenn die Kante
+/// kein Material für einen Übergang hergibt).
+fn draw_transition_drop_preview(
+    ui: &mut Ui,
+    app: &AppState,
+    clip: &TimelineClip,
+    edge: TrimEdge,
+    _kind: TransitionKind,
+    lane: Rect,
+    time_x: impl Fn(f64) -> f32,
+) {
+    let clips = &app.timeline.clips;
+    let neighbor = match edge {
+        TrimEdge::Start => clips
+            .iter()
+            .find(|c| c.track_id == clip.track_id && (c.end() - clip.start).abs() < EPS),
+        TrimEdge::End => clips
+            .iter()
+            .find(|c| c.track_id == clip.track_id && (c.start - clip.end()).abs() < EPS),
+    };
+    let (from, to) = match edge {
+        TrimEdge::Start => (neighbor, Some(clip)),
+        TrimEdge::End => (Some(clip), neighbor),
+    };
+    let cut = match edge {
+        TrimEdge::Start => clip.start,
+        TrimEdge::End => clip.end(),
+    };
+    let max = transitions::max_duration(from, to, TransitionAlignment::Center);
+    if max < MIN_CLIP_DURATION {
+        // Kein Material an dieser Kante: rote Markierung.
+        let x = time_x(cut);
+        ui.fill(Rect::new(x - 1.0, lane.y + 2.0, 3.0, lane.h - 4.0), theme::DANGER);
+        return;
+    }
+    let dur = DEFAULT_TRANSITION_DURATION.min(max).max(MIN_CLIP_DURATION);
+    let Some((w0, w1)) = transitions::window(from, to, TransitionAlignment::Center, dur) else {
+        return;
+    };
+    let x0 = time_x(w0);
+    let x1 = time_x(w1);
+    let rect = Rect::new(x0, lane.y + 2.0, (x1 - x0).max(6.0), lane.h - 4.0);
+    ui.fill_rounded(rect, theme::RADIUS_SM, theme::with_alpha(theme::ACCENT, 64));
+    ui.stroke_rounded(rect, theme::RADIUS_SM, 1.0, theme::ACCENT);
+    // Schnittkante hervorheben.
+    ui.fill(Rect::new(time_x(cut), lane.y + 2.0, 1.0, lane.h - 4.0), theme::ACCENT);
+}
+
+/// Kontextmenü eines Übergangs: Dauer, Ausrichtung, Richtung, Ersetzen,
+/// Entfernen.
+fn transition_context_menu(_app: &AppState, tr: &Transition) -> Vec<MenuEntry> {
+    let dur_label = format!("Dauer ändern… ({:.2} s)", tr.duration).replace('.', ",");
+    let mut items: Vec<MenuEntry> = vec![MenuEntry::Item(
+        MenuItem::custom(
+            &dur_label,
+            CustomAction::TransitionEditDuration { id: tr.id.clone() },
+        )
+        .with_icon("timer"),
+    )];
+    if tr.is_two_sided() {
+        items.push(MenuEntry::Submenu {
+            label: "Ausrichtung".into(),
+            icon: Some("arrow-left-right"),
+            items: TransitionAlignment::ALL
+                .iter()
+                .map(|a| {
+                    MenuEntry::Item(
+                        MenuItem::custom(
+                            a.label(),
+                            CustomAction::TransitionAlign {
+                                id: tr.id.clone(),
+                                alignment: *a,
+                            },
+                        )
+                        .with_checked(tr.alignment == *a),
+                    )
+                })
+                .collect(),
+        });
+    }
+    if tr.kind.directional() {
+        items.push(MenuEntry::Submenu {
+            label: "Richtung".into(),
+            icon: Some("move"),
+            items: TransitionDirection::ALL
+                .iter()
+                .map(|d| {
+                    MenuEntry::Item(
+                        MenuItem::custom(
+                            d.label(),
+                            CustomAction::TransitionDirection {
+                                id: tr.id.clone(),
+                                direction: *d,
+                            },
+                        )
+                        .with_checked(tr.direction == *d),
+                    )
+                })
+                .collect(),
+        });
+    }
+    let replacements: Vec<MenuEntry> = TransitionKind::ALL
+        .iter()
+        .filter(|k| k.is_audio() == tr.kind.is_audio() && **k != tr.kind)
+        .map(|k| {
+            MenuEntry::Item(
+                MenuItem::custom(
+                    k.label(),
+                    CustomAction::TransitionReplace {
+                        id: tr.id.clone(),
+                        kind: *k,
+                    },
+                )
+                .with_icon(k.icon()),
+            )
+        })
+        .collect();
+    items.push(MenuEntry::Submenu {
+        label: "Ersetzen durch".into(),
+        icon: Some("repeat"),
+        items: replacements,
+    });
+    items.push(MenuEntry::Separator);
+    items.push(MenuEntry::Item(
+        MenuItem::custom(
+            "Übergang entfernen",
+            CustomAction::TransitionRemove { id: tr.id.clone() },
+        )
+        .with_icon("trash-2")
+        .with_danger(),
+    ));
+    items
 }
 
 // ---------------------------------------------------------- Kontextmenüs
@@ -1815,6 +2434,9 @@ fn clip_context_menu(app: &AppState, clip: &TimelineClip, t: f64) -> Vec<MenuEnt
         ),
         MenuEntry::Item(MenuItem::command("timeline.splitAtPlayhead")),
         MenuEntry::Separator,
+        MenuEntry::Item(MenuItem::command("clip.speedDuration").with_icon("gauge")),
+        MenuEntry::Item(MenuItem::command("clip.freezeFrame").with_icon("pause")),
+        MenuEntry::Separator,
         MenuEntry::Item(MenuItem::command("timeline.copy").with_icon("copy")),
         MenuEntry::Item(MenuItem::command("timeline.cut")),
         MenuEntry::Item(MenuItem::command("timeline.paste").with_icon("clipboard-paste")),
@@ -1836,6 +2458,15 @@ fn clip_context_menu(app: &AppState, clip: &TimelineClip, t: f64) -> Vec<MenuEnt
                 .with_icon("sliders-horizontal"),
         ),
         MenuEntry::Item(MenuItem::command("clip.resetMotion").with_icon("rotate-ccw")),
+        MenuEntry::Separator,
+        MenuEntry::Item(MenuItem::command("clip.copyAttributes").with_icon("copy")),
+        MenuEntry::Item(MenuItem::command("clip.pasteAttributes").with_icon("clipboard-paste")),
+        MenuEntry::Item(MenuItem::command("clip.toggleEffects").with_icon("zap")),
+        MenuEntry::Item(
+            MenuItem::command("clip.removeAllEffects")
+                .with_icon("trash-2")
+                .with_disabled(!selected.iter().any(|c| !c.effects.is_empty())),
+        ),
         MenuEntry::Separator,
         MenuEntry::Item(
             MenuItem::custom(
@@ -1931,8 +2562,20 @@ fn lane_context_menu(app: &AppState, track: Option<&TimelineTrack>, t: f64) -> V
 }
 
 fn track_header_menu(track: &TimelineTrack, name: &str) -> Vec<MenuEntry> {
-    vec![
-        MenuEntry::Item(
+    let mut items: Vec<MenuEntry> = Vec::new();
+    if track.kind == TrackKind::Subtitle {
+        items.push(MenuEntry::Item(
+            MenuItem::custom(
+                "Ausblenden",
+                CustomAction::TimelineToggleTrackFlag {
+                    track_id: track.id.clone(),
+                    flag: TrackFlag::Muted,
+                },
+            )
+            .with_checked(track.muted),
+        ));
+    } else {
+        items.push(MenuEntry::Item(
             MenuItem::custom(
                 "Stummschalten",
                 CustomAction::TimelineToggleTrackFlag {
@@ -1941,8 +2584,8 @@ fn track_header_menu(track: &TimelineTrack, name: &str) -> Vec<MenuEntry> {
                 },
             )
             .with_checked(track.muted),
-        ),
-        MenuEntry::Item(
+        ));
+        items.push(MenuEntry::Item(
             MenuItem::custom(
                 "Solo",
                 CustomAction::TimelineToggleTrackFlag {
@@ -1951,31 +2594,39 @@ fn track_header_menu(track: &TimelineTrack, name: &str) -> Vec<MenuEntry> {
                 },
             )
             .with_checked(track.solo),
-        ),
-        MenuEntry::Item(
-            MenuItem::custom(
-                "Sperren",
-                CustomAction::TimelineToggleTrackFlag {
-                    track_id: track.id.clone(),
-                    flag: TrackFlag::Locked,
-                },
-            )
-            .with_checked(track.locked),
-        ),
-        MenuEntry::Separator,
-        MenuEntry::Item(MenuItem::command("timeline.addVideoTrack").with_icon("plus")),
-        MenuEntry::Item(MenuItem::command("timeline.addAudioTrack").with_icon("plus")),
-        MenuEntry::Item(
-            MenuItem::custom(
-                &format!("Spur {name} entfernen"),
-                CustomAction::TimelineRemoveTrack {
-                    track_id: track.id.clone(),
-                },
-            )
-            .with_icon("trash-2")
-            .with_danger(),
-        ),
-    ]
+        ));
+    }
+    items.push(MenuEntry::Item(
+        MenuItem::custom(
+            "Sperren",
+            CustomAction::TimelineToggleTrackFlag {
+                track_id: track.id.clone(),
+                flag: TrackFlag::Locked,
+            },
+        )
+        .with_checked(track.locked),
+    ));
+    items.push(MenuEntry::Separator);
+    items.push(MenuEntry::Item(
+        MenuItem::command("timeline.addVideoTrack").with_icon("plus"),
+    ));
+    items.push(MenuEntry::Item(
+        MenuItem::command("timeline.addAudioTrack").with_icon("plus"),
+    ));
+    items.push(MenuEntry::Item(
+        MenuItem::command("subtitle.addTrack").with_icon("plus"),
+    ));
+    items.push(MenuEntry::Item(
+        MenuItem::custom(
+            &format!("Spur {name} entfernen"),
+            CustomAction::TimelineRemoveTrack {
+                track_id: track.id.clone(),
+            },
+        )
+        .with_icon("trash-2")
+        .with_danger(),
+    ));
+    items
 }
 
 fn ruler_context_menu(t: f64, has_loop: bool) -> Vec<MenuEntry> {

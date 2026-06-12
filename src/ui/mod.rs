@@ -5,7 +5,9 @@
 //! State, die `update(ui, app, rect)` implementieren — Rendering und
 //! Interaktion in einem Pass.
 
+pub mod fx_shader;
 pub mod geom;
+pub mod grade_shader;
 pub mod icons;
 pub mod icons_data;
 pub mod input;
@@ -29,13 +31,19 @@ use textures::TextureCache;
 
 pub type WidgetId = u64;
 
-/// In-App-Drag&Drop-Payload (Assets aus dem Medien-Browser, Dock-Tabs).
+/// In-App-Drag&Drop-Payload (Assets aus dem Medien-Browser, Dock-Tabs,
+/// Effekte aus dem Effekte-Panel).
 #[derive(Clone, Debug, PartialEq)]
 pub enum DragPayload {
     /// Asset-IDs aus dem Medien-Browser (MIME "editron/assets").
     Assets(Vec<String>),
     /// Dock-Tab wird gezogen.
     Tab { panel: String },
+    /// Effekt aus dem Effekte-Panel (Ziel: Timeline-Clip oder
+    /// Effekteinstellungen).
+    Effect(crate::core::effects::EffectKind),
+    /// Übergang aus dem Effekte-Panel (Ziel: Schnittkante in der Timeline).
+    Transition(crate::core::transitions::TransitionKind),
 }
 
 pub struct DragState {
@@ -87,6 +95,16 @@ pub struct Ui<'f, 'rl> {
     pub time: f64,
     pub frame_time: f32,
     pub screen: Rect,
+    /// Farbkorrektur-Shader für den Programmmonitor (None ⇒ ungegradete
+    /// Vorschau, z. B. wenn die Kompilierung fehlschlug). Wird in main()
+    /// nach `Ui::new` gesetzt.
+    pub grade_shader: Option<&'f mut grade_shader::GradeShader>,
+    /// Effekt-Renderer (Lesezugriff auf die `fx://`-Ergebnis-Texturen);
+    /// wird in main() nach `Ui::new` gesetzt.
+    pub fx_outputs: Option<&'f fx_shader::EffectChainRenderer>,
+    /// Effekt-Jobs für den nächsten Frame (Pendant zu `texture_requests`;
+    /// der Mainloop verarbeitet sie zwischen den Frames).
+    pub effect_requests: Vec<fx_shader::EffectJob>,
     clip_stack: Vec<Rect>,
     cursor: MouseCursor,
     tooltip: Option<TooltipRequest>,
@@ -121,6 +139,9 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             time,
             frame_time,
             screen,
+            grade_shader: None,
+            fx_outputs: None,
+            effect_requests: Vec::new(),
             clip_stack: Vec::new(),
             cursor: MouseCursor::MOUSE_CURSOR_DEFAULT,
             tooltip: None,
@@ -559,6 +580,65 @@ impl<'f, 'rl> Ui<'f, 'rl> {
         }
     }
 
+    /// Wie [`Ui::draw_texture_quad`], aber mit Farbkorrektur über den
+    /// Grade-Shader. `grade` = Identität (oder Shader nicht verfügbar)
+    /// zeichnet ungegradet. `fx://`-Schlüssel werden aus dem Effekt-Renderer
+    /// aufgelöst (vertikal kompensiert — RenderTexture-Inhalte sind
+    /// gespiegelt gespeichert).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_texture_quad_graded(
+        &mut self,
+        key: &str,
+        cx: f32,
+        cy: f32,
+        w: f32,
+        h: f32,
+        rot_deg: f32,
+        alpha: u8,
+        grade: &crate::core::grade::GradeParams,
+    ) -> bool {
+        use raylib::prelude::RaylibShaderModeExt;
+        struct RawTex(ffi::Texture2D);
+        impl AsRef<ffi::Texture2D> for RawTex {
+            fn as_ref(&self) -> &ffi::Texture2D {
+                &self.0
+            }
+        }
+        let (tex, src) = if key.starts_with("fx://") {
+            let Some(out) = self.fx_outputs.and_then(|r| r.output(key)) else {
+                return false;
+            };
+            let (tw, th) = (out.tex.width as f32, out.tex.height as f32);
+            let src_h = if out.flipped { -th } else { th };
+            (RawTex(out.tex), Rect::new(0.0, 0.0, tw, src_h))
+        } else {
+            match self.textures.get(key) {
+                Some(tex) => {
+                    let src = Rect::new(0.0, 0.0, tex.width as f32, tex.height as f32);
+                    (RawTex(*tex.as_ref()), src)
+                }
+                None => {
+                    self.texture_requests.push(key.to_string());
+                    return false;
+                }
+            }
+        };
+        let dst = Rect::new(cx, cy, w, h);
+        let origin = v2(w / 2.0, h / 2.0);
+        let tint = Color::new(255, 255, 255, alpha);
+        match self.grade_shader.as_mut().filter(|_| !grade.is_identity()) {
+            Some(gs) => {
+                gs.apply(grade);
+                let mut mode = self.d.begin_shader_mode(&mut gs.shader);
+                mode.draw_texture_pro(tex, src, dst, origin, rot_deg, tint);
+            }
+            None => {
+                self.d.draw_texture_pro(tex, src, dst, origin, rot_deg, tint);
+            }
+        }
+        true
+    }
+
     /// Natürliche Größe einer gecachten Texture (None ⇒ angefordert).
     pub fn texture_size(&mut self, key: &str) -> Option<(f32, f32)> {
         match self.textures.get(key) {
@@ -568,6 +648,13 @@ impl<'f, 'rl> Ui<'f, 'rl> {
                 None
             }
         }
+    }
+
+    /// Größe eines Effekt-Ergebnisses (`fx://…`); None ⇒ noch nicht
+    /// gerendert (Aufrufer fällt auf die Roh-Texture zurück).
+    pub fn fx_output_size(&self, key: &str) -> Option<(f32, f32)> {
+        let out = self.fx_outputs?.output(key)?;
+        Some((out.tex.width as f32, out.tex.height as f32))
     }
 
     /// Bild als object-contain (Monitore): eingepasst, Seitenverhältnis bleibt.

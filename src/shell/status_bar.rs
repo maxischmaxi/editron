@@ -23,6 +23,7 @@ pub fn render(ui: &mut Ui, app: &AppState, rect: Rect) {
     let inner = rect.inset_xy(12.0, 0.0);
 
     // ---- Rechts zuerst vermessen, damit links korrekt truncated ----
+    let seq_label = app.timeline.settings.describe();
     let asset_count = app.media.assets.len();
     let assets_label = if asset_count == 1 {
         "1 Medium".to_string()
@@ -74,6 +75,18 @@ pub fn render(ui: &mut Ui, app: &AppState, rect: Rect) {
         Rect::new(x, inner.y, w, inner.h),
         theme::TEXT_3,
         font,
+    );
+    // Sequenz-Format (Auflösung · Framerate · DF) wie in Resolve/Premiere.
+    x -= 8.0 + 1.0;
+    divider(ui, x, rect);
+    x -= 8.0;
+    let w = ui.font(FontKind::Mono12).width(&seq_label);
+    x -= w;
+    ui.text_left(
+        &seq_label,
+        Rect::new(x, inner.y, w, inner.h),
+        theme::TEXT_3,
+        FontKind::Mono12,
     );
 
     let right_edge = x - 16.0;

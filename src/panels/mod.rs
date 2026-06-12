@@ -10,7 +10,9 @@ pub mod info;
 pub mod media_browser;
 pub mod monitor;
 pub mod scopes;
+pub mod subtitles;
 pub mod timeline;
+pub mod title_editor;
 pub mod transform_gizmo;
 
 use crate::services::Services;
@@ -21,7 +23,7 @@ use crate::ui::{FontKind, Ui};
 use std::collections::HashMap;
 
 /// (id, deutscher Titel, Lucide-Icon).
-pub const PANEL_DEFS: [(&str, &str, &str); 12] = [
+pub const PANEL_DEFS: [(&str, &str, &str); 13] = [
     ("media", "Medien", "folder-open"),
     ("source", "Quelle", "film"),
     ("program", "Programm", "play"),
@@ -32,6 +34,7 @@ pub const PANEL_DEFS: [(&str, &str, &str); 12] = [
     ("color", "Farbe", "palette"),
     ("scopes", "Scopes", "activity"),
     ("graphics", "Grafiken", "type"),
+    ("subtitles", "Untertitel", "captions"),
     ("info", "Info", "info"),
     ("history", "Verlauf", "history"),
 ];
@@ -108,6 +111,10 @@ impl PanelHost {
         instances.insert(
             "graphics".into(),
             Box::new(graphics::GraphicsPanel::default()),
+        );
+        instances.insert(
+            "subtitles".into(),
+            Box::new(subtitles::SubtitlesPanel::default()),
         );
         instances.insert(
             "effectControls".into(),

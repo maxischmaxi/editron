@@ -2,6 +2,7 @@
 
 pub mod scroll;
 pub mod select;
+pub mod text_area;
 pub mod text_input;
 
 use super::geom::Rect;
