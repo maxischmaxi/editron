@@ -527,6 +527,49 @@ impl<'f, 'rl> Ui<'f, 'rl> {
         }
     }
 
+    /// Texture als transformierten Layer zeichnen: zentriert auf (cx, cy),
+    /// Zielgröße (w, h), Rotation in Grad um den Mittelpunkt, Alpha 0–255.
+    /// Liefert false (und fordert die Texture an), wenn sie noch fehlt.
+    pub fn draw_texture_quad(
+        &mut self,
+        key: &str,
+        cx: f32,
+        cy: f32,
+        w: f32,
+        h: f32,
+        rot_deg: f32,
+        alpha: u8,
+    ) -> bool {
+        match self.textures.get(key) {
+            Some(tex) => {
+                self.d.draw_texture_pro(
+                    tex,
+                    Rect::new(0.0, 0.0, tex.width as f32, tex.height as f32),
+                    Rect::new(cx, cy, w, h),
+                    v2(w / 2.0, h / 2.0),
+                    rot_deg,
+                    Color::new(255, 255, 255, alpha),
+                );
+                true
+            }
+            None => {
+                self.texture_requests.push(key.to_string());
+                false
+            }
+        }
+    }
+
+    /// Natürliche Größe einer gecachten Texture (None ⇒ angefordert).
+    pub fn texture_size(&mut self, key: &str) -> Option<(f32, f32)> {
+        match self.textures.get(key) {
+            Some(tex) => Some((tex.width as f32, tex.height as f32)),
+            None => {
+                self.texture_requests.push(key.to_string());
+                None
+            }
+        }
+    }
+
     /// Bild als object-contain (Monitore): eingepasst, Seitenverhältnis bleibt.
     pub fn draw_texture_contain(&mut self, path: &str, rect: Rect) {
         match self.textures.get(path) {

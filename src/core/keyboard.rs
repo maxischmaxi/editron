@@ -312,6 +312,8 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::when("timeline.stepForward5", "Shift+ArrowRight", "panel == 'timeline'"),
         Keybinding::when("timeline.prevEdit", "ArrowUp", "panel == 'timeline'"),
         Keybinding::when("timeline.nextEdit", "ArrowDown", "panel == 'timeline'"),
+        Keybinding::when("clip.prevKeyframe", "Shift+ArrowUp", "panel == 'timeline'"),
+        Keybinding::when("clip.nextKeyframe", "Shift+ArrowDown", "panel == 'timeline'"),
     ]
 }
 

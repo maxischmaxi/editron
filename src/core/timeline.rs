@@ -1,6 +1,7 @@
 //! Sequenz-Modell + Store: Tracks/Clips mit verknüpften A/V-Paaren,
 //! Snapshot-History (Undo/Redo) und allen Editier-Operationen.
 
+use crate::core::animation::{ClipFx, Interp, Keyframe, ParamId};
 use crate::core::types::{new_id, MediaAsset, MediaKind};
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,9 @@ pub struct TimelineClip {
     /// Clip-Verstärkung in dB (zusätzlich zum Spur-Fader); ≤ −60 gilt als −∞.
     #[serde(default)]
     pub gain_db: f64,
+    /// Animierbare Parameter (Bewegung, Deckkraft, Lautstärke) mit Keyframes.
+    #[serde(default, skip_serializing_if = "ClipFx::is_default")]
+    pub fx: ClipFx,
 }
 
 fn default_enabled() -> bool {
@@ -860,6 +864,7 @@ impl TimelineStore {
                 link_id,
                 enabled: true,
                 gain_db: 0.0,
+                fx: ClipFx::default(),
             });
         }
 
@@ -1525,6 +1530,165 @@ impl TimelineStore {
         self.clips.extend(pasted);
     }
 
+    // ------------------------------------------------- Effekte / Keyframes
+    // Alle fx_*-Methoden mit Undo-Snapshot; *_live-Varianten schreiben ohne
+    // Snapshot (für Drag-Gesten — der Aufrufer legt zu Gestenbeginn einmal
+    // `begin_fx_edit()` an, wie beim Mixer).
+
+    pub fn clip(&self, id: &str) -> Option<&TimelineClip> {
+        self.clips.iter().find(|c| c.id == id)
+    }
+
+    fn fx_clip_mut(&mut self, id: &str) -> Option<&mut TimelineClip> {
+        let locked = locked_track_ids(&self.tracks);
+        self.clips
+            .iter_mut()
+            .find(|c| c.id == id && !locked.contains(&c.track_id))
+    }
+
+    /// Beginn einer fx-Geste (Wert-Scrubbing, Monitor-Drag, Keyframe-Drag):
+    /// legt einmalig einen Undo-Snapshot an.
+    pub fn begin_fx_edit(&mut self) {
+        self.push_history();
+    }
+
+    /// Wert anwenden (ohne Snapshot): animierter Parameter ⇒ Keyframe an
+    /// der Medienzeit, sonst statischer Wert.
+    pub fn fx_set_value_live(&mut self, id: &str, param: ParamId, media_t: f64, value: f64) {
+        if let Some(clip) = self.fx_clip_mut(id) {
+            let (lo, hi) = param.range();
+            clip.fx.param_mut(param).set_at(media_t, value.clamp(lo, hi));
+        }
+    }
+
+    /// Stopwatch umschalten: an ⇒ erster Keyframe am Playhead; aus ⇒ Kurve
+    /// verwerfen, aktuellen Wert einfrieren.
+    pub fn fx_toggle_animated(&mut self, id: &str, param: ParamId, media_t: f64) {
+        if self.fx_clip_mut(id).is_none() {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        let p = clip.fx.param_mut(param);
+        if p.is_animated() {
+            p.clear_animation(media_t);
+        } else {
+            p.enable_animation(media_t);
+        }
+    }
+
+    /// Keyframe am Playhead setzen bzw. entfernen (Raute-Button).
+    pub fn fx_toggle_keyframe(&mut self, id: &str, param: ParamId, media_t: f64) {
+        let Some(clip) = self.clip(id) else { return };
+        let p = clip.fx.param(param);
+        let value = p.eval(media_t);
+        let exists = p.key_index_at(media_t).is_some();
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        let p = clip.fx.param_mut(param);
+        if exists {
+            p.remove_key_at(media_t);
+        } else {
+            p.upsert_key(media_t, value);
+        }
+    }
+
+    /// Keyframes zu gegebenen Medienzeiten entfernen (Keyframe-Editor).
+    pub fn fx_remove_keyframes(&mut self, id: &str, keys: &[(ParamId, f64)]) {
+        if keys.is_empty() || self.fx_clip_mut(id).is_none() {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        for (param, t) in keys {
+            clip.fx.param_mut(*param).remove_key_at(*t);
+        }
+    }
+
+    /// Kurve eines Parameters ersetzen (ohne Snapshot — Keyframe-Drag).
+    pub fn fx_replace_keys_live(&mut self, id: &str, param: ParamId, keys: Vec<Keyframe>) {
+        if let Some(clip) = self.fx_clip_mut(id) {
+            clip.fx.param_mut(param).replace_keys(keys);
+        }
+    }
+
+    /// Interpolation der Keyframes (Parameter, Medienzeit) setzen.
+    pub fn fx_set_interp(&mut self, id: &str, keys: &[(ParamId, f64)], interp: Interp) {
+        if keys.is_empty() || self.fx_clip_mut(id).is_none() {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        for (param, t) in keys {
+            let p = clip.fx.param_mut(*param);
+            if let Some(i) = p.key_index_at(*t) {
+                p.keyframes[i].interp = interp;
+            }
+        }
+    }
+
+    pub fn fx_set_uniform_scale(&mut self, id: &str, uniform: bool) {
+        let Some(clip) = self.clip(id) else { return };
+        if clip.fx.uniform_scale == uniform {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        if !uniform {
+            // Y übernimmt beim Entkoppeln die aktuelle X-Kurve.
+            clip.fx.scale_y = clip.fx.scale_x.clone();
+        }
+        clip.fx.uniform_scale = uniform;
+    }
+
+    /// Bewegung (Position/Skalierung/Rotation) der Clips zurücksetzen.
+    pub fn fx_reset_motion(&mut self, ids: &[String]) {
+        let locked = locked_track_ids(&self.tracks);
+        let affected: Vec<String> = self
+            .clips
+            .iter()
+            .filter(|c| {
+                ids.contains(&c.id) && !locked.contains(&c.track_id) && {
+                    let d = ClipFx::default();
+                    c.fx.pos_x != d.pos_x
+                        || c.fx.pos_y != d.pos_y
+                        || c.fx.scale_x != d.scale_x
+                        || c.fx.scale_y != d.scale_y
+                        || c.fx.rotation != d.rotation
+                        || !c.fx.uniform_scale
+                }
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        if affected.is_empty() {
+            return;
+        }
+        self.push_history();
+        for c in &mut self.clips {
+            if affected.contains(&c.id) {
+                let d = ClipFx::default();
+                c.fx.pos_x = d.pos_x;
+                c.fx.pos_y = d.pos_y;
+                c.fx.scale_x = d.scale_x;
+                c.fx.scale_y = d.scale_y;
+                c.fx.rotation = d.rotation;
+                c.fx.uniform_scale = true;
+            }
+        }
+    }
+
+    /// Einzelnen Parameter auf den Standardwert zurücksetzen.
+    pub fn fx_reset_param(&mut self, id: &str, param: ParamId) {
+        let Some(clip) = self.clip(id) else { return };
+        let p = clip.fx.param(param);
+        if !p.is_animated() && p.value == param.default_value() {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        *clip.fx.param_mut(param) = crate::core::animation::AnimatedParam::fixed(param.default_value());
+    }
+
     // ------------------------------------------------------------- Verlauf
 
     pub fn undo(&mut self) {
@@ -1574,6 +1738,7 @@ mod tests {
             link_id: None,
             enabled: true,
             gain_db: 0.0,
+            fx: ClipFx::default(),
         }
     }
 

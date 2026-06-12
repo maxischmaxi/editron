@@ -1,16 +1,21 @@
 //! Sequenz-Export: Container-/Codec-Katalog, Settings + Render-Presets,
 //! Validierung, Renderplan und der Render-Worker.
 //!
-//! Der Plan reproduziert exakt die Wiedergabe-Semantik des Players
-//! (`core/player.rs`): oberster aktiver Video-Clip gewinnt (Track-Reihenfolge,
-//! Mute/Solo, `enabled`), Audio = Summe aller hörbaren Clips mit
-//! Spur-Gain/Pan, Clip-Gain und Master-Fader. Der Worker rendert in zwei
-//! Phasen — Audio-Mixdown in eine temporäre f32-WAV, dann Video segmentweise
-//! über ffmpeg-Decoder (rawvideo/rgba) in einen ffmpeg-Encoder-Prozess — und
-//! finalisiert atomar (`<ziel>.part` → rename). Abbruch über ein geteiltes
-//! Flag; jeder Fehler wird als Event gemeldet, nie gepanict (zusätzlich
-//! `catch_unwind` als letzte Verteidigungslinie).
+//! Der Plan reproduziert exakt die Wiedergabe-Semantik des Players und des
+//! Programmmonitors: alle sichtbaren Video-Layer werden mit ihren animierten
+//! Transformationen (Position/Skalierung/Rotation/Deckkraft, Keyframes in
+//! Medienzeit) von unten nach oben komponiert; Audio = Summe aller hörbaren
+//! Clips mit Spur-Gain/Pan, Clip-Gain inkl. Lautstärke-Keyframes und
+//! Master-Fader. Der Worker rendert in zwei Phasen — Audio-Mixdown in eine
+//! temporäre f32-WAV, dann Video segmentweise: untransformierte Einzel-Layer
+//! laufen direkt durch eine ffmpeg-Pipe (Schnellpfad), alles andere durch
+//! den CPU-Compositor (`core/compose.rs`) mit einem Decoder je Layer
+//! (transparent gepolsterte rawvideo/rgba-Frames). Finalisiert wird atomar
+//! (`<ziel>.part` → rename). Abbruch über ein geteiltes Flag; jeder Fehler
+//! wird als Event gemeldet, nie gepanict (`catch_unwind` als letzte Linie).
 
+use crate::core::animation::{AnimatedParam, ClipFx};
+use crate::core::compose;
 use crate::core::timeline::{sequence_end, TimelineStore, TrackKind};
 use crate::core::types::MediaKind;
 use crate::services::ServiceEvent;
@@ -18,7 +23,7 @@ use crate::stores::MediaStore;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -544,22 +549,30 @@ pub fn suggested_resolution(timeline: &TimelineStore, media: &MediaStore) -> (u3
 
 // ============================================================== Renderplan
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum SegmentSource {
-    /// Lücke — Schwarzbild.
-    Black,
-    Media {
-        path: String,
-        /// Medienzeit des ersten Segment-Frames (bei Bildern irrelevant).
-        src_in: f64,
-        image: bool,
-    },
+/// Ein Video-Layer eines Segments (Zeichenreihenfolge: unten → oben).
+#[derive(Clone, Debug)]
+pub struct VideoLayerPlan {
+    pub clip_id: String,
+    pub path: String,
+    pub image: bool,
+    /// Medienzeit des ersten Segment-Frames.
+    pub src_in: f64,
+    /// Animierbare Parameter (Keyframes in Medienzeit).
+    pub fx: ClipFx,
+}
+
+impl VideoLayerPlan {
+    /// Schnellpfad-Kriterium: keinerlei visuelle Transformation.
+    pub fn is_identity(&self) -> bool {
+        self.fx.is_visual_identity()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct VideoSegment {
     pub frames: u64,
-    pub source: SegmentSource,
+    /// Leer = Schwarzbild (Lücke).
+    pub layers: Vec<VideoLayerPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -572,6 +585,8 @@ pub struct AudioClipPlan {
     /// Wirksamer Faktor je Seite: Master × Spur × Clip × Balance.
     pub gain_l: f32,
     pub gain_r: f32,
+    /// Lautstärke-Kurve des Clips (dB, Keyframes in Medienzeit).
+    pub volume: AnimatedParam,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -589,9 +604,7 @@ pub struct RenderPlan {
 impl RenderPlan {
     /// Mindestens ein echtes Video-Segment (kein reines Schwarzbild)?
     pub fn has_video_media(&self) -> bool {
-        self.segments
-            .iter()
-            .any(|s| matches!(s.source, SegmentSource::Media { .. }))
+        self.segments.iter().any(|s| !s.layers.is_empty())
     }
 }
 
@@ -684,6 +697,7 @@ pub fn build_render_plan(
                     src_in: clip.src_in + (clip_start - clip.start),
                     gain_l: gain * pan_l,
                     gain_r: gain * pan_r,
+                    volume: clip.fx.volume_db.clone(),
                 });
             }
         }
@@ -695,7 +709,8 @@ pub fn build_render_plan(
 }
 
 /// Video-Segmente: Zeitachse in Ziel-Frames quantisieren, an jeder
-/// Clip-Grenze schneiden, pro Abschnitt gewinnt der oberste sichtbare Clip.
+/// Clip-Grenze schneiden; je Abschnitt der komplette Layer-Stapel
+/// (unten → oben) — der Renderer komponiert wie der Programmmonitor.
 fn plan_video_segments(
     timeline: &TimelineStore,
     media: &MediaStore,
@@ -705,19 +720,24 @@ fn plan_video_segments(
     solo_any: bool,
 ) -> Vec<VideoSegment> {
     struct Candidate {
-        track_order: usize,
+        /// 0 = unterste sichtbare Videospur (Zeichenreihenfolge).
+        draw_order: usize,
         f0: u64,
         f1: u64,
+        clip_id: String,
         clip_start: f64,
         src_in: f64,
         path: String,
         image: bool,
+        fx: ClipFx,
     }
 
     let mut candidates: Vec<Candidate> = Vec::new();
+    // Spur-Index 0 ist die OBERSTE Videospur → rückwärts = Zeichenreihenfolge.
     let video_tracks: Vec<&str> = timeline
         .tracks
         .iter()
+        .rev()
         .filter(|t| t.kind == TrackKind::Video && !t.muted && (!solo_any || t.solo))
         .map(|t| t.id.as_str())
         .collect();
@@ -742,13 +762,15 @@ fn plan_video_segments(
             continue;
         }
         candidates.push(Candidate {
-            track_order: order,
+            draw_order: order,
             f0,
             f1,
+            clip_id: clip.id.clone(),
             clip_start: clip.start,
             src_in: clip.src_in,
             path: asset.path.clone(),
             image,
+            fx: clip.fx.clone(),
         });
     }
 
@@ -767,48 +789,43 @@ fn plan_video_segments(
         if b <= a {
             continue;
         }
-        let top = candidates
+        let mut active: Vec<&Candidate> = candidates
             .iter()
             .filter(|c| c.f0 <= a && c.f1 >= b)
-            .min_by_key(|c| c.track_order);
-        let source = match top {
-            Some(c) => SegmentSource::Media {
+            .collect();
+        active.sort_by_key(|c| c.draw_order);
+        let layers: Vec<VideoLayerPlan> = active
+            .iter()
+            .map(|c| VideoLayerPlan {
+                clip_id: c.clip_id.clone(),
                 path: c.path.clone(),
+                image: c.image,
                 // Medienzeit des Segmentbeginns aus der Sequenzzeit ableiten.
                 src_in: (c.src_in + (range_start + a as f64 / fps - c.clip_start)).max(0.0),
-                image: c.image,
-            },
-            None => SegmentSource::Black,
-        };
-        // Fortsetzungen derselben Quelle verschmelzen (spart Decoder-Starts):
-        // bei Medien nur, wenn die Medienzeit nahtlos weiterläuft.
+                fx: c.fx.clone(),
+            })
+            .collect();
+        // Fortsetzungen desselben Layer-Stapels verschmelzen (spart
+        // Decoder-Starts): gleiche Clips in gleicher Reihenfolge, und die
+        // Medienzeit jedes Video-Layers läuft nahtlos weiter.
         let frames = b - a;
         if let Some(last) = segments.last_mut() {
-            let merge = match (&last.source, &source) {
-                (SegmentSource::Black, SegmentSource::Black) => true,
-                (
-                    SegmentSource::Media {
-                        path: p1,
-                        src_in: s1,
-                        image: i1,
-                    },
-                    SegmentSource::Media {
-                        path: p2,
-                        src_in: s2,
-                        image: i2,
-                    },
-                ) => {
-                    let continues = (s1 + last.frames as f64 / fps - s2).abs() < 0.5 / fps;
-                    p1 == p2 && i1 == i2 && (*i2 || continues)
-                }
-                _ => false,
-            };
+            let merge = last.layers.len() == layers.len()
+                && last
+                    .layers
+                    .iter()
+                    .zip(layers.iter())
+                    .all(|(l1, l2)| {
+                        let continues =
+                            (l1.src_in + last.frames as f64 / fps - l2.src_in).abs() < 0.5 / fps;
+                        l1.clip_id == l2.clip_id && (l2.image || continues)
+                    });
             if merge {
                 last.frames += frames;
                 continue;
             }
         }
-        segments.push(VideoSegment { frames, source });
+        segments.push(VideoSegment { frames, layers });
     }
     segments
 }
@@ -1486,6 +1503,10 @@ fn mix_audio_to_wav(
         // Pro Seite wirksamer Faktor; Mono mittelt beide Seiten.
         let gains: [f32; 2] = [clip.gain_l, clip.gain_r];
         let mono_gain = (clip.gain_l + clip.gain_r) * 0.5;
+        // Lautstärke-Kurve (dB-Keyframes): blockweise ausgewertet —
+        // 256 Frames ≈ 5 ms bei 48 kHz, glatt genug für Fades.
+        let has_envelope = clip.volume.is_animated() || clip.volume.value != 0.0;
+        const ENV_BLOCK: usize = 256;
 
         const CHUNK_FRAMES: usize = 32768;
         let mut decoded = vec![0u8; CHUNK_FRAMES * ch * 4];
@@ -1518,18 +1539,34 @@ fn mix_audio_to_wav(
             let block = &mut existing[..got_frames * ch * 4];
             file.seek(SeekFrom::Start(byte_pos)).map_err(|e| e.to_string())?;
             file.read_exact(block).map_err(|e| format!("Mix-Lesen: {e}"))?;
-            for i in 0..got_frames * ch {
-                let gain = if ch == 2 { gains[i % 2] } else { mono_gain };
-                let off = i * 4;
-                let old = f32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
-                let add = f32::from_le_bytes([
-                    decoded[off],
-                    decoded[off + 1],
-                    decoded[off + 2],
-                    decoded[off + 3],
-                ]);
-                let sum = old + add * gain;
-                block[off..off + 4].copy_from_slice(&sum.to_le_bytes());
+            let mut fi = 0usize;
+            while fi < got_frames {
+                let n = ENV_BLOCK.min(got_frames - fi);
+                let env = if has_envelope {
+                    let media_t = clip.src_in + (frames_done + fi as u64) as f64 / rate as f64;
+                    db_to_linear(clip.volume.eval(media_t))
+                } else {
+                    1.0
+                };
+                for i in fi * ch..(fi + n) * ch {
+                    let gain = env * if ch == 2 { gains[i % 2] } else { mono_gain };
+                    let off = i * 4;
+                    let old = f32::from_le_bytes([
+                        block[off],
+                        block[off + 1],
+                        block[off + 2],
+                        block[off + 3],
+                    ]);
+                    let add = f32::from_le_bytes([
+                        decoded[off],
+                        decoded[off + 1],
+                        decoded[off + 2],
+                        decoded[off + 3],
+                    ]);
+                    let sum = old + add * gain;
+                    block[off..off + 4].copy_from_slice(&sum.to_le_bytes());
+                }
+                fi += n;
             }
             file.seek(SeekFrom::Start(byte_pos)).map_err(|e| e.to_string())?;
             file.write_all(block).map_err(|e| format!("Mix-Schreiben: {e}"))?;
@@ -1671,80 +1708,96 @@ fn render_video(
     // ---- Segmente sequenziell durchpumpen ----
     let mut write_err: Option<String> = None;
     'segments: for segment in &plan.segments {
-        match &segment.source {
-            SegmentSource::Black => {
-                for _ in 0..segment.frames {
-                    if cancel.load(Ordering::Relaxed) {
-                        break 'segments;
-                    }
-                    if let Err(e) = enc_in.write_all(&black) {
-                        write_err = Some(e.to_string());
-                        break 'segments;
-                    }
-                    progress.advance(1);
+        // Lücke → Schwarzbild.
+        if segment.layers.is_empty() {
+            for _ in 0..segment.frames {
+                if cancel.load(Ordering::Relaxed) {
+                    break 'segments;
                 }
+                if let Err(e) = enc_in.write_all(&black) {
+                    write_err = Some(e.to_string());
+                    break 'segments;
+                }
+                progress.advance(1);
             }
-            SegmentSource::Media { path, src_in, image } => {
-                let mut cmd = Command::new(crate::services::ffmpeg_bin());
-                cmd.args(["-v", "error"]);
-                if *image {
-                    cmd.args(["-loop", "1", "-framerate", &fps]);
-                } else {
-                    cmd.args(["-ss", &format!("{src_in:.4}")]);
-                }
-                cmd.args(["-i", path]).args(["-an", "-sn"]);
-                let filter = format!(
-                    "fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease:flags=bicubic,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
-                    w = video.width,
-                    h = video.height
-                );
-                cmd.args(["-vf", &filter])
-                    .args(["-frames:v", &segment.frames.to_string()])
-                    .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
-                    .arg("pipe:1")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null());
-                let (dec_id, _, stdout, _) = children.spawn(&mut cmd)?;
-                let mut dec_out = stdout.ok_or("Decoder-stdout nicht verfügbar")?;
+            continue;
+        }
 
-                let mut frame = vec![0u8; frame_size];
-                let mut last_frame: Option<Vec<u8>> = None;
-                let mut decoder_dead = false;
-                for _ in 0..segment.frames {
-                    if cancel.load(Ordering::Relaxed) {
-                        children.kill(dec_id);
-                        break 'segments;
-                    }
-                    let buf: &[u8] = if decoder_dead {
-                        last_frame.as_deref().unwrap_or(&black)
-                    } else {
-                        let mut filled = 0;
-                        while filled < frame_size {
-                            match dec_out.read(&mut frame[filled..]) {
-                                Ok(0) => break,
-                                Ok(n) => filled += n,
-                                Err(_) => break,
-                            }
-                        }
-                        if filled == frame_size {
-                            last_frame = Some(frame.clone());
-                            &frame
-                        } else {
-                            // Decoder liefert weniger als geplant (Quelle kürzer,
-                            // defekte Datei): letzten Frame halten statt abbrechen.
-                            decoder_dead = true;
-                            last_frame.as_deref().unwrap_or(&black)
-                        }
-                    };
-                    if let Err(e) = enc_in.write_all(buf) {
-                        write_err = Some(e.to_string());
-                        children.kill(dec_id);
-                        break 'segments;
-                    }
-                    progress.advance(1);
+        // Schnellpfad: ein Layer ohne Transformation — ffmpeg skaliert/pad't
+        // direkt in die Encoder-Pipe (kein CPU-Compositing nötig).
+        if segment.layers.len() == 1 && segment.layers[0].is_identity() {
+            let layer = &segment.layers[0];
+            let mut cmd = Command::new(crate::services::ffmpeg_bin());
+            cmd.args(["-v", "error"]);
+            if layer.image {
+                cmd.args(["-loop", "1", "-framerate", &fps]);
+            } else {
+                cmd.args(["-ss", &format!("{:.4}", layer.src_in)]);
+            }
+            cmd.args(["-i", &layer.path]).args(["-an", "-sn"]);
+            let filter = format!(
+                "fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease:flags=bicubic,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
+                w = video.width,
+                h = video.height
+            );
+            cmd.args(["-vf", &filter])
+                .args(["-frames:v", &segment.frames.to_string()])
+                .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
+                .arg("pipe:1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let (dec_id, _, stdout, _) = children.spawn(&mut cmd)?;
+            let mut dec_out = stdout.ok_or("Decoder-stdout nicht verfügbar")?;
+
+            let mut frame = vec![0u8; frame_size];
+            let mut last_frame: Option<Vec<u8>> = None;
+            let mut decoder_dead = false;
+            for _ in 0..segment.frames {
+                if cancel.load(Ordering::Relaxed) {
+                    children.kill(dec_id);
+                    break 'segments;
                 }
-                children.kill(dec_id);
+                let buf: &[u8] = if decoder_dead {
+                    last_frame.as_deref().unwrap_or(&black)
+                } else {
+                    let mut filled = 0;
+                    while filled < frame_size {
+                        match dec_out.read(&mut frame[filled..]) {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            Err(_) => break,
+                        }
+                    }
+                    if filled == frame_size {
+                        last_frame = Some(frame.clone());
+                        &frame
+                    } else {
+                        // Decoder liefert weniger als geplant (Quelle kürzer,
+                        // defekte Datei): letzten Frame halten statt abbrechen.
+                        decoder_dead = true;
+                        last_frame.as_deref().unwrap_or(&black)
+                    }
+                };
+                if let Err(e) = enc_in.write_all(buf) {
+                    write_err = Some(e.to_string());
+                    children.kill(dec_id);
+                    break 'segments;
+                }
+                progress.advance(1);
+            }
+            children.kill(dec_id);
+            continue;
+        }
+
+        // Compositing-Pfad: ein Decoder je Layer, CPU mischt jeden Frame.
+        match render_segment_composited(segment, video, &fps, &mut enc_in, cancel, children, progress)
+        {
+            Ok(()) => {}
+            Err(CompErr::Cancelled) => break 'segments,
+            Err(CompErr::Failed(e)) => {
+                write_err = Some(e);
+                break 'segments;
             }
         }
     }
@@ -1766,6 +1819,182 @@ fn render_video(
         };
         return Err(format!("Video-Encoder fehlgeschlagen: {detail}"));
     }
+    Ok(())
+}
+
+enum CompErr {
+    Cancelled,
+    Failed(String),
+}
+
+/// Ein Layer-Decoder im Compositing-Pfad: liefert transparent gepolsterte
+/// RGBA-Frames in Decode-Auflösung (das volle Zielframe repräsentierend).
+struct LayerStream {
+    dec_id: u64,
+    out: ChildStdout,
+    /// Letzter vollständiger Frame (initial transparent — unsichtbar).
+    frame: Vec<u8>,
+    scratch: Vec<u8>,
+    dead: bool,
+    w: usize,
+    h: usize,
+    src_in: f64,
+    fx: ClipFx,
+}
+
+impl LayerStream {
+    /// Nächsten Frame einlesen; bei EOF/Kurz-Read bleibt der letzte stehen.
+    fn advance(&mut self) {
+        if self.dead {
+            return;
+        }
+        let size = self.w * self.h * 4;
+        let mut filled = 0;
+        while filled < size {
+            match self.out.read(&mut self.scratch[filled..size]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => break,
+            }
+        }
+        if filled == size {
+            std::mem::swap(&mut self.frame, &mut self.scratch);
+        } else {
+            self.dead = true;
+        }
+    }
+}
+
+/// Segment mit Transformationen rendern: je Layer ein ffmpeg-Decoder
+/// (Decode-Auflösung wächst mit der maximalen Skalierung im Segment, damit
+/// Zooms scharf bleiben), pro Frame werden die animierten Parameter
+/// ausgewertet und die Layer per CPU-Compositor auf das Canvas gemischt.
+fn render_segment_composited(
+    segment: &VideoSegment,
+    video: &VideoSettings,
+    fps_arg: &str,
+    enc_in: &mut std::process::ChildStdin,
+    cancel: &AtomicBool,
+    children: &mut ChildRegistry,
+    progress: &mut Progress,
+) -> Result<(), CompErr> {
+    let (tw, th) = (video.width as usize, video.height as usize);
+    let fps = video.fps;
+    let seg_dur = segment.frames as f64 / fps;
+
+    let mut layers: Vec<LayerStream> = Vec::new();
+    let kill_layers = |children: &ChildRegistry, layers: &[LayerStream]| {
+        for l in layers {
+            children.kill(l.dec_id);
+        }
+    };
+
+    for plan_layer in &segment.layers {
+        // Decode-Auflösung: Zielgröße × max. Skalierung (gedeckelt) — mehr
+        // als die Quelle hergibt, skaliert ffmpeg ohnehin nicht hoch (Schärfe
+        // gewinnt nur, solange Quellpixel vorhanden sind).
+        let max_s = compose::max_scale_in_window(
+            &plan_layer.fx,
+            plan_layer.src_in,
+            plan_layer.src_in + seg_dur,
+        )
+        .clamp(1.0, 2.0);
+        let dw = ((((tw as f64 * max_s) / 2.0).round() as usize) * 2).clamp(2, 4096);
+        let dh = ((((th as f64 * max_s) / 2.0).round() as usize) * 2).clamp(2, 4096);
+
+        let mut cmd = Command::new(crate::services::ffmpeg_bin());
+        cmd.args(["-v", "error"]);
+        if plan_layer.image {
+            cmd.args(["-loop", "1", "-framerate", fps_arg]);
+        } else {
+            cmd.args(["-ss", &format!("{:.4}", plan_layer.src_in)]);
+        }
+        // Contain-Fit + TRANSPARENTES Padding: der Puffer repräsentiert das
+        // volle Frame, Alpha (z. B. PNG) bleibt erhalten.
+        let filter = format!(
+            "fps={fps_arg},scale={dw}:{dh}:force_original_aspect_ratio=decrease:flags=bicubic,format=rgba,pad={dw}:{dh}:(ow-iw)/2:(oh-ih)/2:color=black@0.0"
+        );
+        cmd.args(["-i", &plan_layer.path])
+            .args(["-an", "-sn"])
+            .args(["-vf", &filter])
+            .args(["-frames:v", &segment.frames.to_string()])
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
+            .arg("pipe:1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (dec_id, _, stdout, _) = match children.spawn(&mut cmd) {
+            Ok(v) => v,
+            Err(e) => {
+                kill_layers(children, &layers);
+                return Err(CompErr::Failed(e));
+            }
+        };
+        let Some(out) = stdout else {
+            kill_layers(children, &layers);
+            return Err(CompErr::Failed("Decoder-stdout nicht verfügbar".into()));
+        };
+        layers.push(LayerStream {
+            dec_id,
+            out,
+            frame: vec![0u8; dw * dh * 4],
+            scratch: vec![0u8; dw * dh * 4],
+            dead: false,
+            w: dw,
+            h: dh,
+            src_in: plan_layer.src_in,
+            fx: plan_layer.fx.clone(),
+        });
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
+    let mut canvas = vec![0u8; tw * th * 4];
+
+    for f in 0..segment.frames {
+        if cancel.load(Ordering::Relaxed) {
+            kill_layers(children, &layers);
+            return Err(CompErr::Cancelled);
+        }
+        for layer in &mut layers {
+            layer.advance();
+        }
+        // Canvas opak schwarz zurücksetzen.
+        for px in canvas.chunks_exact_mut(4) {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+            px[3] = 255;
+        }
+        let t_off = f as f64 / fps;
+        let frames: Vec<compose::CpuLayerFrame> = layers
+            .iter()
+            .filter_map(|l| {
+                let fx = compose::eval_fx(&l.fx, l.src_in + t_off);
+                if fx.opacity <= 0.0 {
+                    return None;
+                }
+                Some(compose::CpuLayerFrame {
+                    data: &l.frame,
+                    w: l.w,
+                    h: l.h,
+                    // Der Layer-Puffer repräsentiert das volle Frame →
+                    // natürliche Größe = Framegröße (Fit-Faktor 1).
+                    quad: compose::layer_quad(tw as f64, th as f64, tw as f64, th as f64, &fx),
+                    opacity: fx.opacity,
+                })
+            })
+            .collect();
+        compose::composite_frame(&mut canvas, tw, th, &frames, threads);
+        if let Err(e) = enc_in.write_all(&canvas) {
+            kill_layers(children, &layers);
+            return Err(CompErr::Failed(e.to_string()));
+        }
+        progress.advance(1);
+    }
+    kill_layers(children, &layers);
     Ok(())
 }
 
@@ -1859,6 +2088,7 @@ mod tests {
             link_id: None,
             enabled: true,
             gain_db: 0.0,
+            fx: Default::default(),
         }
     }
 
@@ -1923,9 +2153,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_splits_gaps_and_overlaps_top_track_wins() {
-        // V2 (oben): Clip 2..4 — V1 (unten): Clip 0..10. Lücke gibt es nicht;
-        // 2..4 muss von V2 kommen, davor/danach V1, src_in läuft weiter.
+    fn plan_splits_overlaps_into_layer_stacks() {
+        // V2 (oben): Clip 2..4 — V1 (unten): Clip 0..10. 2..4 trägt BEIDE
+        // Layer (A unten, B oben), davor/danach nur A; src_in läuft weiter.
         let (tl, media) = state_with(
             vec![track("v2", TrackKind::Video), track("v1", TrackKind::Video)],
             vec![
@@ -1940,17 +2170,20 @@ mod tests {
         assert_eq!(plan.segments[0].frames, 50);
         assert_eq!(plan.segments[1].frames, 50);
         assert_eq!(plan.segments[2].frames, 150);
-        match &plan.segments[1].source {
-            SegmentSource::Media { path, .. } => assert_eq!(path, "/b.mp4"),
-            other => panic!("Segment 1 sollte B sein: {other:?}"),
-        }
-        match &plan.segments[2].source {
-            SegmentSource::Media { path, src_in, .. } => {
-                assert_eq!(path, "/a.mp4");
-                assert!((src_in - 4.0).abs() < 1e-6, "src_in muss weiterlaufen: {src_in}");
-            }
-            other => panic!("Segment 2 sollte A sein: {other:?}"),
-        }
+        assert_eq!(plan.segments[0].layers.len(), 1);
+        // Überlappung: unten A, oben B (Zeichenreihenfolge).
+        let mid = &plan.segments[1].layers;
+        assert_eq!(mid.len(), 2, "Überlappung muss beide Layer tragen");
+        assert_eq!(mid[0].path, "/a.mp4");
+        assert_eq!(mid[1].path, "/b.mp4");
+        let tail = &plan.segments[2].layers;
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].path, "/a.mp4");
+        assert!(
+            (tail[0].src_in - 4.0).abs() < 1e-6,
+            "src_in muss weiterlaufen: {}",
+            tail[0].src_in
+        );
     }
 
     #[test]
@@ -1964,7 +2197,7 @@ mod tests {
         );
         let plan = build_render_plan(&tl, &media, &test_settings());
         assert_eq!(plan.segments.len(), 2); // Schwarz 0..2, dann Clip
-        assert_eq!(plan.segments[0].source, SegmentSource::Black);
+        assert!(plan.segments[0].layers.is_empty());
         assert_eq!(plan.segments[0].frames, 50);
 
         tl.tracks[0].muted = true;
@@ -2303,6 +2536,182 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Einen Frame des Exports als RGB24 dekodieren (Pixel-Verifikation).
+    fn decode_frame_rgb(path: &std::path::Path, at: f64, w: usize, h: usize) -> Vec<u8> {
+        let out = Command::new(crate::services::ffmpeg_bin())
+            .args(["-v", "error", "-ss", &format!("{at:.3}")])
+            .args(["-i", &path.to_string_lossy()])
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+            .output()
+            .expect("ffmpeg decode");
+        assert_eq!(out.stdout.len(), w * h * 3, "Framegröße");
+        out.stdout
+    }
+
+    fn rgb_at(frame: &[u8], w: usize, x: usize, y: usize) -> [u8; 3] {
+        let i = (y * w + x) * 3;
+        [frame[i], frame[i + 1], frame[i + 2]]
+    }
+
+    /// End-to-End mit Keyframes: ein rotes Bild wandert per Position-X-
+    /// Animation von links nach rechts; der Export muss das Compositing
+    /// (Skalierung 50 %, animierte Position) pixelgenau wiedergeben.
+    #[test]
+    fn end_to_end_export_renders_animated_transform() {
+        let dir = std::env::temp_dir().join(format!("editron-export-anim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_image = dir.join("rot.png");
+        let out = dir.join("anim.mp4");
+        let gen = Command::new(crate::services::ffmpeg_bin())
+            .args(["-y", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "color=red:size=320x240", "-frames:v", "1"])
+            .arg(&src_image)
+            .status()
+            .unwrap();
+        assert!(gen.success());
+
+        let mut image_asset = video_asset("IMG", &src_image.to_string_lossy());
+        image_asset.kind = MediaKind::Image;
+        image_asset.info.video.clear();
+        image_asset.info.audio.clear();
+        let mut c = clip("img", "v1", TrackKind::Video, "IMG", 0.0, 2.0);
+        c.src_duration = f64::INFINITY;
+        // Skalierung fest 50 %, Position X animiert −25 % → +25 % (linear).
+        c.fx.scale_x.value = 50.0;
+        c.fx.pos_x.upsert_key(0.0, -25.0);
+        c.fx.pos_x.upsert_key(2.0, 25.0);
+        let (tl, media) = state_with(vec![track("v1", TrackKind::Video)], vec![c], vec![image_asset]);
+
+        let mut settings = test_settings();
+        settings.audio = None;
+        settings.output = out.to_string_lossy().into_owned();
+        if let Some(v) = settings.video.as_mut() {
+            v.width = 640;
+            v.height = 360;
+            v.speed = 0;
+            v.quality = VideoQuality::Crf(16);
+        }
+        let plan = build_render_plan(&tl, &media, &settings);
+        assert_eq!(plan.segments.len(), 1);
+        assert!(!plan.segments[0].layers[0].is_identity(), "muss Compositing-Pfad nehmen");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        run_export_worker(
+            "anim-job".into(),
+            plan,
+            settings,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let mut ok = false;
+        let mut error = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServiceEvent::SequenceExportDone { ok: o, error: e, .. } = ev {
+                ok = o;
+                error = e;
+            }
+        }
+        assert!(ok, "Export fehlgeschlagen: {error:?}");
+
+        // Bildgeometrie: 320×240 in 640×360 contain → Basis 480×360; bei
+        // 50 % → 240×180, Mittelpunkt cx = 320 + pos_x % · 640.
+        // t≈0,1 s: pos_x ≈ −22,5 % → cx ≈ 176; t≈1,9 s: ≈ +22,5 % → cx ≈ 464.
+        let (w, h) = (640usize, 360usize);
+        let early = decode_frame_rgb(&out, 0.1, w, h);
+        let p = rgb_at(&early, w, 176, 180);
+        assert!(p[0] > 150 && p[1] < 100 && p[2] < 100, "links muss rot sein: {p:?}");
+        let p = rgb_at(&early, w, 560, 180);
+        assert!(p[0] < 60 && p[1] < 60 && p[2] < 60, "rechts muss schwarz sein: {p:?}");
+
+        let late = decode_frame_rgb(&out, 1.9, w, h);
+        let p = rgb_at(&late, w, 464, 180);
+        assert!(p[0] > 150 && p[1] < 100 && p[2] < 100, "rechts muss rot sein: {p:?}");
+        let p = rgb_at(&late, w, 80, 180);
+        assert!(p[0] < 60 && p[1] < 60 && p[2] < 60, "links muss schwarz sein: {p:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lautstärke-Keyframes (0 dB → −60 dB) müssen den Mix hörbar ausblenden.
+    #[test]
+    fn audio_mix_applies_volume_envelope() {
+        let dir = std::env::temp_dir().join(format!("editron-export-vol-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("ton.wav");
+        let gen = Command::new(crate::services::ffmpeg_bin())
+            .args(["-y", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2"])
+            .args(["-c:a", "pcm_s16le"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(gen.success());
+
+        let mut volume = AnimatedParam::fixed(0.0);
+        volume.upsert_key(0.0, 0.0);
+        volume.upsert_key(2.0, -60.0);
+        let plan = RenderPlan {
+            duration: 2.0,
+            audio: vec![AudioClipPlan {
+                path: src.to_string_lossy().into_owned(),
+                start_in_mix: 0.0,
+                duration: 2.0,
+                src_in: 0.0,
+                gain_l: 1.0,
+                gain_r: 1.0,
+                volume,
+            }],
+            ..Default::default()
+        };
+        let audio = default_audio("pcm32f", None);
+        let wav = dir.join("mix.wav");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut progress = Progress::new(&tx, "vol-job");
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ChildRegistry::new(children);
+        mix_audio_to_wav(
+            &plan,
+            &audio,
+            &wav,
+            &AtomicBool::new(false),
+            &mut registry,
+            &mut progress,
+        )
+        .expect("mix");
+
+        // f32-Samples direkt aus der Zwischendatei lesen (Header 58 Bytes).
+        let bytes = std::fs::read(&wav).unwrap();
+        let data = &bytes[58..];
+        let rms = |range: std::ops::Range<usize>| -> f32 {
+            let mut sum = 0f64;
+            let mut n = 0usize;
+            for i in range {
+                let off = i * 4;
+                let v = f32::from_le_bytes([
+                    data[off],
+                    data[off + 1],
+                    data[off + 2],
+                    data[off + 3],
+                ]);
+                sum += (v as f64) * (v as f64);
+                n += 1;
+            }
+            ((sum / n as f64).sqrt()) as f32
+        };
+        let total = data.len() / 4;
+        let head = rms(0..total / 10);
+        let tail = rms(total - total / 10..total);
+        // lavfi-sine liegt bei ≈ −21 dB RMS (plus Upmix-Dämpfung) — wichtig
+        // ist das Verhältnis: das Ende muss praktisch ausgeblendet sein.
+        assert!(head > 0.02, "Anfang muss hörbar sein: {head}");
+        assert!(tail < head * 0.05, "Ende muss ausgeblendet sein: {head} → {tail}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Abbruch räumt auf: kein Ziel, keine .part-Datei, Cancelled-Event.
     #[test]
     fn export_cancel_cleans_up() {
@@ -2368,6 +2777,6 @@ mod tests {
         // A (0..10) bleibt EIN Segment, Lücke (10..12) schwarz, dann B.
         assert_eq!(plan.segments.len(), 3, "{:?}", plan.segments);
         assert_eq!(plan.segments[0].frames, 250);
-        assert_eq!(plan.segments[1].source, SegmentSource::Black);
+        assert!(plan.segments[1].layers.is_empty());
     }
 }

@@ -11,6 +11,7 @@ pub mod media_browser;
 pub mod monitor;
 pub mod scopes;
 pub mod timeline;
+pub mod transform_gizmo;
 
 use crate::services::Services;
 use crate::state::AppState;

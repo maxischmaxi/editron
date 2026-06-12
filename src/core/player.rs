@@ -1,13 +1,15 @@
 //! Wiedergabe-Engine (SequencePlayer-Pendant): dekodiert Video über
 //! ffmpeg-Pipes (rawvideo/rgba) in Texturen und Audio (f32le/48 kHz) über
-//! einen eigenen Mixdown in einen einzelnen raylib-AudioStream. Der
-//! Programmmonitor zeigt den obersten aktiven Video-Clip am Playhead, Ton
-//! kommt aus den aktiven Audio-Clips (Spur-Gain/Pan, Clip-Gain und
+//! einen eigenen Mixdown in einen einzelnen raylib-AudioStream. Für den
+//! Programmmonitor läuft EIN Decoder je sichtbarem Video-Clip am Playhead
+//! (Texturen unter "player://clip/<id>" — der Monitor komponiert die Layer
+//! mit ihren animierten Transformationen); Ton kommt aus den aktiven
+//! Audio-Clips (Spur-Gain/Pan, Clip-Gain inkl. Lautstärke-Keyframes und
 //! Master-Fader werden beim Mischen angewendet, Spitzenpegel landen in
 //! `state.audio` für die Mixer-Meter); der Quellmonitor spielt das geladene
-//! Asset. Frames landen im TextureCache unter "player://program" bzw.
-//! "player://source".
+//! Asset unter "player://source".
 
+use crate::core::compose;
 use crate::core::timeline::TrackKind;
 use crate::state::AppState;
 use crate::ui::textures::TextureCache;
@@ -18,8 +20,12 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 
-pub const PROGRAM_KEY: &str = "player://program";
 pub const SOURCE_KEY: &str = "player://source";
+
+/// Texture-Schlüssel eines Programm-Layers (Decoder je Clip).
+pub fn clip_texture_key(clip_id: &str) -> String {
+    format!("player://clip/{clip_id}")
+}
 
 const MAX_DECODE_WIDTH: f64 = 1920.0;
 /// Toleranz, ab der ein laufender Decoder neu positioniert wird (Sekunden).
@@ -355,7 +361,8 @@ struct VideoTarget {
 
 pub struct PlayerEngine {
     master: Option<MasterStream>,
-    program_video: Option<VideoSession>,
+    /// Ein Decoder je sichtbarem Programm-Layer (Schlüssel = Clip-ID).
+    program_videos: std::collections::HashMap<String, Option<VideoSession>>,
     source_video: Option<VideoSession>,
     audio_decoders: Vec<AudioDecoder>,
     /// Wiederverwendeter Mix-Block (interleaved L/R).
@@ -381,7 +388,7 @@ impl PlayerEngine {
         }
         PlayerEngine {
             master: audio.map(MasterStream::new),
-            program_video: None,
+            program_videos: Default::default(),
             source_video: None,
             audio_decoders: Vec::new(),
             mix_buf: Vec::new(),
@@ -402,17 +409,30 @@ impl PlayerEngine {
         textures: &mut TextureCache,
         now: f64,
     ) {
-        // ---- Programmmonitor: oberster aktiver Video-Clip am Playhead ----
-        let program_target = program_video_target(state);
-        Self::drive_video(
-            rl,
-            thread,
-            &mut self.program_video,
-            textures,
-            PROGRAM_KEY,
-            program_target,
-            now,
-        );
+        // ---- Programmmonitor: ein Decoder je sichtbarem Video-Layer ----
+        let program_targets = program_video_targets(state);
+        // Nicht mehr sichtbare Layer beenden und ihre Texturen freigeben.
+        let wanted: std::collections::HashSet<&str> =
+            program_targets.iter().map(|(id, _)| id.as_str()).collect();
+        self.program_videos.retain(|clip_id, _| {
+            let keep = wanted.contains(clip_id.as_str());
+            if !keep {
+                textures.remove(&clip_texture_key(clip_id));
+            }
+            keep
+        });
+        for (clip_id, target) in program_targets {
+            let session = self.program_videos.entry(clip_id.clone()).or_default();
+            Self::drive_video(
+                rl,
+                thread,
+                session,
+                textures,
+                &clip_texture_key(&clip_id),
+                Some(target),
+                now,
+            );
+        }
 
         // ---- Quellmonitor ----
         let source_target = source_video_target(state);
@@ -561,12 +581,16 @@ impl PlayerEngine {
                         if asset.offline {
                             continue;
                         }
-                        let gain = track_gain * db_to_linear(clip.gain_db);
+                        let media_time = compose::clip_media_time(clip, t);
+                        // Clip-Gain + animierte Lautstärke (Keyframes) — wird
+                        // pro Tick neu ausgewertet, Fades laufen also live.
+                        let gain = track_gain
+                            * db_to_linear(clip.gain_db + clip.fx.volume_db.eval(media_time));
                         wants.push(Want {
                             clip_id: clip.id.clone(),
                             track_id: Some(track.id.clone()),
                             path: asset.path.clone(),
-                            media_time: clip.src_in + (t - clip.start),
+                            media_time,
                             gain_l: gain * pan_l,
                             gain_r: gain * pan_r,
                         });
@@ -712,36 +736,33 @@ impl PlayerEngine {
     }
 }
 
-fn program_video_target(state: &AppState) -> Option<VideoTarget> {
+/// Decoder-Ziele für alle sichtbaren Video-Layer am Playhead (Bilder zeigt
+/// der Monitor direkt aus dem TextureCache — kein Decoder nötig).
+fn program_video_targets(state: &AppState) -> Vec<(String, VideoTarget)> {
     let t = state.timeline.playhead_sec;
-    let solo_any = state.timeline.tracks.iter().any(|tr| tr.solo);
-    let clip = state
-        .timeline
-        .tracks
-        .iter()
-        .filter(|tr| tr.kind == TrackKind::Video && !tr.muted && (!solo_any || tr.solo))
-        .find_map(|tr| {
-            state
-                .timeline
-                .clips
-                .iter()
-                .find(|c| c.track_id == tr.id && c.enabled && t >= c.start && t < c.end())
-        })?;
-    let asset = state.media.asset(&clip.asset_id)?;
-    let video = asset.info.video.first()?;
-    if asset.kind == crate::core::types::MediaKind::Image {
-        return None; // Bilder zeigt der Monitor direkt
-    }
-    Some(VideoTarget {
-        path: asset.path.clone(),
-        media_time: clip.src_in + (t - clip.start),
-        src_w: video.width.max(2),
-        src_h: video.height.max(2),
-        fps: video.fps,
-        playing: state.playback.program_playing,
-        rate: state.playback.program_rate,
-        scale: state.monitor.program_scale,
-    })
+    compose::visible_video_clips(&state.timeline, t)
+        .into_iter()
+        .filter_map(|clip| {
+            let asset = state.media.asset(&clip.asset_id)?;
+            if asset.offline || asset.kind != crate::core::types::MediaKind::Video {
+                return None;
+            }
+            let video = asset.info.video.first()?;
+            Some((
+                clip.id.clone(),
+                VideoTarget {
+                    path: asset.path.clone(),
+                    media_time: compose::clip_media_time(clip, t),
+                    src_w: video.width.max(2),
+                    src_h: video.height.max(2),
+                    fps: video.fps,
+                    playing: state.playback.program_playing,
+                    rate: state.playback.program_rate,
+                    scale: state.monitor.program_scale,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn source_video_target(state: &AppState) -> Option<VideoTarget> {

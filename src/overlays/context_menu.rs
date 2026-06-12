@@ -20,6 +20,14 @@ pub enum CustomAction {
     TimelineSetOutAt { t: f64 },
     TimelineClearInOut,
     MediaShowInBrowser { asset_id: String },
+    /// Interpolation ausgewählter Keyframes setzen: (Clip, Parameter, Medienzeit).
+    FxSetInterp {
+        keys: Vec<(String, crate::core::animation::ParamId, f64)>,
+        interp: crate::core::animation::Interp,
+    },
+    FxRemoveKeyframes {
+        keys: Vec<(String, crate::core::animation::ParamId, f64)>,
+    },
 }
 
 #[derive(Clone)]

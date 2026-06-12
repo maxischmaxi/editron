@@ -1,12 +1,19 @@
-//! Quell- und Programmmonitor: schwarze Bühne (object-contain), Scrubber
-//! (h-2, Playhead + In/Out-Bereich), Transportleiste (h-12) mit Timecode,
-//! Transport-Buttons, In/Out/Loop und Wiedergabeauflösung.
+//! Quell- und Programmmonitor: schwarze Bühne, Scrubber (h-2, Playhead +
+//! In/Out-Bereich), Transportleiste (h-12) mit Timecode, Transport-Buttons,
+//! In/Out/Loop und Wiedergabeauflösung. Der Quellmonitor zeigt das geladene
+//! Asset (object-contain), der Programmmonitor komponiert alle sichtbaren
+//! Video-Layer mit ihren animierten Transformationen (Position, Skalierung,
+//! Rotation, Deckkraft) auf ein Programm-Canvas und bietet darüber das
+//! Transform-Gizmo für die direkte Manipulation des ausgewählten Clips.
 //! Bis die Decode-Engine den ersten Frame liefert, zeigt die Bühne das
 //! Asset-Thumbnail (Video) bzw. Bild/Music-Icon.
 
+use crate::core::compose::{self, LayerQuad};
+use crate::core::player::clip_texture_key;
 use crate::core::timeline::{sequence_end, SEQUENCE_FPS};
 use crate::core::timecode::format_timecode;
 use crate::core::types::{MediaAsset, MediaKind};
+use crate::panels::transform_gizmo::TransformGizmo;
 use crate::panels::Panel;
 use crate::services::Services;
 use crate::state::AppState;
@@ -18,6 +25,29 @@ use crate::ui::{FontKind, Ui};
 use raylib::consts::MouseCursor;
 
 const MIN_MARK_GAP: f64 = 0.02;
+/// Höhen der Monitor-Chrome-Zonen (auch für die Bühnen-Geometrie im Panel).
+const TRANSPORT_H: f32 = 48.0;
+const SCRUBBER_H: f32 = 8.0;
+
+/// Aufgelöster Programm-Layer: Texture + Transform-Quad in Bühnenkoordinaten.
+pub struct ResolvedLayer {
+    pub clip_id: String,
+    pub tex_key: String,
+    pub quad: LayerQuad,
+    pub alpha: u8,
+}
+
+/// Bühnen-Inhalt eines Monitors.
+enum StageContent<'a> {
+    Empty,
+    /// Quellmonitor: ein Asset, object-contain.
+    Asset(&'a MediaAsset),
+    /// Programmmonitor: komponierte Layer auf dem Programm-Canvas.
+    Program {
+        canvas: Rect,
+        layers: &'a [ResolvedLayer],
+    },
+}
 
 /// Gemeinsame UI beider Monitore.
 struct MonitorChrome<'a> {
@@ -31,8 +61,7 @@ struct MonitorChrome<'a> {
     out_point: Option<f64>,
     loop_button: Option<bool>,
     empty_hint: &'a str,
-    /// Asset für die Bühnen-Darstellung (None beim Programmmonitor ohne Clip).
-    stage_asset: Option<MediaAsset>,
+    stage: StageContent<'a>,
 }
 
 enum MonitorAction {
@@ -61,24 +90,19 @@ fn render_monitor(
     let mut area = rect;
 
     // ---- Transportleiste unten (h-12) ----
-    let transport = area.cut_bottom(48.0);
+    let transport = area.cut_bottom(TRANSPORT_H);
     // ---- Scrubber (h-2) ----
-    let scrubber = area.cut_bottom(8.0);
+    let scrubber = area.cut_bottom(SCRUBBER_H);
     // ---- Bühne (flex-1, schwarz) ----
     let stage = area;
     ui.fill(stage, theme::BLACK);
 
-    let player_key = if chrome.monitor == "program" {
-        crate::core::player::PROGRAM_KEY
-    } else {
-        crate::core::player::SOURCE_KEY
-    };
-    match &chrome.stage_asset {
-        None => {
+    match &chrome.stage {
+        StageContent::Empty => {
             let hint = stage.center_box(288.0, 60.0);
             draw_hint(ui, chrome.empty_hint, hint);
         }
-        Some(asset) => match asset.kind {
+        StageContent::Asset(asset) => match asset.kind {
             MediaKind::Audio => {
                 ui.icon("music", stage, 64.0, theme::TEXT_3);
             }
@@ -89,9 +113,9 @@ fn render_monitor(
             }
             MediaKind::Video => {
                 ui.push_clip(stage);
-                if ui.textures.get(player_key).is_some() {
+                if ui.textures.get(crate::core::player::SOURCE_KEY).is_some() {
                     // Live-Frame aus der Decode-Engine
-                    ui.draw_texture_contain(player_key, stage);
+                    ui.draw_texture_contain(crate::core::player::SOURCE_KEY, stage);
                 } else if let Some(thumb) = &asset.thumbnail_path {
                     // Fallback, bis der erste Frame dekodiert ist
                     ui.draw_texture_contain(thumb, stage);
@@ -99,6 +123,24 @@ fn render_monitor(
                 ui.pop_clip();
             }
         },
+        StageContent::Program { canvas, layers } => {
+            // Layer von unten nach oben auf das Canvas komponieren; alles
+            // außerhalb des Programm-Frames wird beschnitten (wie im Export).
+            ui.push_clip(*canvas);
+            for layer in layers.iter() {
+                let q = &layer.quad;
+                ui.draw_texture_quad(
+                    &layer.tex_key,
+                    q.cx as f32,
+                    q.cy as f32,
+                    q.w as f32,
+                    q.h as f32,
+                    q.rot_deg as f32,
+                    layer.alpha,
+                );
+            }
+            ui.pop_clip();
+        }
     }
 
     // ---- Scrubber ----
@@ -375,7 +417,10 @@ impl Panel for SourceMonitorPanel {
             out_point: app.playback.source.out_mark,
             loop_button: Some(app.playback.source.looping),
             empty_hint: "Doppelklick im Medien-Browser lädt einen Clip in den Quellmonitor.",
-            stage_asset: asset,
+            stage: match &asset {
+                Some(a) => StageContent::Asset(a),
+                None => StageContent::Empty,
+            },
         };
         let scale = app.monitor.source_scale;
         let action = render_monitor(ui, &chrome, &mut self.scrub_active, scale, rect);
@@ -433,36 +478,74 @@ impl Panel for SourceMonitorPanel {
 #[derive(Default)]
 pub struct ProgramMonitorPanel {
     scrub_active: bool,
+    gizmo: TransformGizmo,
+}
+
+/// Sichtbare Layer am Playhead in Zeichenreihenfolge auflösen: Texture-Key
+/// (Bild = Datei, Video = Live-Frame, Fallback Thumbnail), Transform-Quad in
+/// Bühnenkoordinaten und Deckkraft. Layer ohne geladene Texture liefern noch
+/// kein Quad (Anforderung läuft über den TextureCache).
+fn resolve_program_layers(
+    ui: &mut Ui,
+    app: &AppState,
+    canvas: Rect,
+    t: f64,
+) -> Vec<ResolvedLayer> {
+    compose::visible_video_clips(&app.timeline, t)
+        .into_iter()
+        .filter_map(|clip| {
+            let asset = app.media.asset(&clip.asset_id)?;
+            if asset.offline {
+                return None;
+            }
+            let fx = compose::eval_fx(&clip.fx, compose::clip_media_time(clip, t));
+            if fx.opacity <= 0.0 {
+                return None;
+            }
+            let mut keys: Vec<String> = Vec::new();
+            match asset.kind {
+                MediaKind::Image => keys.push(asset.path.clone()),
+                MediaKind::Video => {
+                    keys.push(clip_texture_key(&clip.id));
+                    if let Some(thumb) = &asset.thumbnail_path {
+                        keys.push(thumb.clone());
+                    }
+                }
+                MediaKind::Audio => return None,
+            }
+            let (tex_key, (nw, nh)) = keys
+                .iter()
+                .find_map(|k| ui.texture_size(k).map(|s| (k.clone(), s)))?;
+            let q = compose::layer_quad(canvas.w as f64, canvas.h as f64, nw as f64, nh as f64, &fx);
+            Some(ResolvedLayer {
+                clip_id: clip.id.clone(),
+                tex_key,
+                quad: LayerQuad {
+                    cx: q.cx + canvas.x as f64,
+                    cy: q.cy + canvas.y as f64,
+                    ..q
+                },
+                alpha: (fx.opacity * 255.0).round().clamp(0.0, 255.0) as u8,
+            })
+        })
+        .collect()
 }
 
 impl Panel for ProgramMonitorPanel {
     fn update(&mut self, ui: &mut Ui, app: &mut AppState, _services: &Services, rect: Rect) {
         let duration = sequence_end(&app.timeline.clips);
         let has_clips = !app.timeline.clips.is_empty();
-
-        // Sichtbarer Clip: oberster aktiver Video-Clip unter dem Playhead
-        // (mute/solo der Spuren greifen). Bis zur Decode-Engine: Thumbnail.
         let t = app.timeline.playhead_sec;
-        let solo_any = app.timeline.tracks.iter().any(|tr| tr.solo);
-        let stage_asset = app
-            .timeline
-            .tracks
-            .iter()
-            .filter(|tr| {
-                tr.kind == crate::core::timeline::TrackKind::Video
-                    && !tr.muted
-                    && (!solo_any || tr.solo)
-            })
-            .find_map(|tr| {
-                app.timeline
-                    .clips
-                    .iter()
-                    .find(|c| {
-                        c.track_id == tr.id && c.enabled && t >= c.start && t < c.end()
-                    })
-                    .and_then(|c| app.media.asset(&c.asset_id))
-            })
-            .cloned();
+
+        // Bühnen-Geometrie (identisch zu render_monitor) + Programm-Canvas:
+        // Seitenverhältnis aus der vorgeschlagenen Sequenzauflösung.
+        let mut stage = rect;
+        let _ = stage.cut_bottom(TRANSPORT_H);
+        let _ = stage.cut_bottom(SCRUBBER_H);
+        let (aw, ah) = crate::core::export::suggested_resolution(&app.timeline, &app.media);
+        let canvas = stage.fit_contain(aw as f32, ah as f32);
+
+        let layers = resolve_program_layers(ui, app, canvas, t);
 
         let chrome = MonitorChrome {
             monitor: "program",
@@ -476,10 +559,20 @@ impl Panel for ProgramMonitorPanel {
             loop_button: None,
             empty_hint:
                 "Keine Clips in der Sequenz — Medien aus dem Medien-Browser in die Timeline ziehen.",
-            stage_asset: if has_clips { stage_asset } else { None },
+            stage: if has_clips {
+                StageContent::Program {
+                    canvas,
+                    layers: &layers,
+                }
+            } else {
+                StageContent::Empty
+            },
         };
         let scale = app.monitor.program_scale;
         let action = render_monitor(ui, &chrome, &mut self.scrub_active, scale, rect);
+
+        // Direkte Manipulation des ausgewählten Clips (über den Layern).
+        self.gizmo.update(ui, app, stage, canvas, &layers);
 
         match action {
             MonitorAction::None => {}

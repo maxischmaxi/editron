@@ -144,23 +144,67 @@ Zeichen-Handle, Input, Fonts, Icons, Texture-Cache und Interaktions-State:
   den Bereichskanten verschiebt In/Out, Kontextmenü und `I`/`O`/`Mod+Shift+X`
   setzen bzw. löschen die Punkte.
 
+## Animation (Keyframes)
+
+- **Modell** in `src/core/animation.rs`: `ClipFx` hängt an jedem
+  `TimelineClip` (`#[serde(default)]`, wird nur bei Abweichung vom Standard
+  serialisiert) und bündelt die animierbaren Parameter — Position X/Y,
+  Skalierung X/Y (mit „Seitenverhältnis beibehalten“), Rotation, Deckkraft,
+  Lautstärke. Jeder Parameter ist ein `AnimatedParam`: statischer Wert oder
+  Keyframe-Kurve (`Vec<Keyframe>`, sortiert) mit Interpolation pro Segment
+  (Linear, Halten, Ease In/Out/InOut). **Keyframe-Zeiten sind Medienzeit**
+  (Sekunden in der Quelle): Clips verschieben ändert nichts, Kopf-Trimmen
+  verschiebt die Animation relativ zum Clipanfang (Premiere-Semantik).
+- **Einheiten sind auflösungsunabhängig** (Position in % der Framemaße als
+  Offset vom Zentrum, Skalierung in % der Contain-Fit-Größe), damit Vorschau
+  und Export bei jeder Auflösung identisch aussehen. Die gemeinsame Mathematik
+  (sichtbare Layer am Playhead, `eval_fx`, Transform-Quad, CPU-Compositor)
+  liegt in `src/core/compose.rs`.
+- **Alle fx-Edits laufen über den `TimelineStore`** (`fx_*`-Methoden) und sind
+  undo-fähig; Drag-Gesten legen über `begin_fx_edit()` genau einen Snapshot an
+  und schreiben dann live (`fx_set_value_live`, `fx_replace_keys_live`).
+  Ist die Stopwatch eines Parameters an, schreiben Wertänderungen Keyframes am
+  Playhead, sonst den statischen Wert.
+- **UI:** Das Panel **Effekteinstellungen** (`src/panels/effect_controls.rs`)
+  ist der Keyframe-Editor — links Parameter-Zeilen (Stopwatch, Wert-Scrubbing
+  mit Doppelklick-Eingabe, ◀ ◆ ▶ Keyframe-Navigation, Abschnitts-Reset),
+  rechts je Parameter eine Keyframe-Spur über die Clipdauer mit Playhead-
+  Lineal: Keyframes ziehen (auch Mehrfachauswahl), Strg/Shift-Klick,
+  Box-Auswahl, Doppelklick legt Keyframes an, Entf löscht, Rechtsklick öffnet
+  das Interpolations-Menü. Im **Programmmonitor** manipuliert das
+  Transform-Gizmo (`src/panels/transform_gizmo.rs`) den ausgewählten Clip
+  direkt: Ziehen verschiebt (Shift rastet die Achse), 8 Handles skalieren
+  (Ecken proportional, Kanten je Achse — entkoppelt die Skalierung
+  automatisch, Shift verzerrt), der Griff über der Oberkante rotiert
+  (Shift: 15°-Raster); Klick auf einen Layer wählt dessen Clip. Clips mit
+  Keyframes tragen in der Timeline eine Rauten-Badge;
+  `clip.prevKeyframe`/`clip.nextKeyframe` (Shift+↑/↓) springen den Playhead,
+  `clip.resetMotion` setzt die Bewegung zurück.
+
 ## Wiedergabe (Monitore)
 
 - **Programmmonitor = Sequenz-Wiedergabe.** `src/core/playback.rs` führt die
   Master-Clock (Playhead läuft pro Frame um `dt × rate` weiter, Loop über die
-  Sequenz-In/Out-Punkte); `src/core/player.rs` dekodiert den obersten aktiven
-  Video-Clip am Playhead über eine ffmpeg-Pipe (`rawvideo/rgba`, feste
-  Framerate) in eine Texture (`player://program` im TextureCache) — Frames
-  werden gedroppt, wenn der Decoder hinterherhinkt, und die Session wird bei
-  Seeks/Clip-Wechseln neu aufgesetzt. Ton kommt aus den aktiven Audio-Clips
-  über einen eigenen Mixdown: je Clip ein ffmpeg-`f32le`-Decoder, die Engine
-  summiert blockweise (Spur-Gain/Pan, Clip-Gain, Master-Fader, Mute/Solo) in
-  einen einzelnen raylib-AudioStream und misst dabei Spitzenpegel pro Spur und
-  Summe (`state.audio`, Anzeige im Audio-Mixer). Decoder werden bei Drift > 0,35 s
-  (Seek/Loop während der Wiedergabe) neu positioniert. Achtung, zwei
-  raylib-Fallen: `AudioStream::update` aus raylib-rs übergibt Bytes statt
-  Frames (deshalb direkter FFI-Aufruf in `MasterStream::write`), und raylib
-  hebt die Sub-Buffer-Größe still auf die Geräte-Periode an — der Mix-Block
+  Sequenz-In/Out-Punkte); `src/core/player.rs` startet **einen ffmpeg-Decoder
+  je sichtbarem Video-Clip** am Playhead (`rawvideo/rgba`, feste Framerate)
+  in je eine Texture (`player://clip/<id>` im TextureCache) — Frames werden
+  gedroppt, wenn ein Decoder hinterherhinkt, Sessions werden bei
+  Seeks/Clip-Wechseln neu aufgesetzt, nicht mehr sichtbare Layer geben ihre
+  Texture frei. Der Monitor (`src/panels/monitor.rs`) komponiert die Layer
+  von unten nach oben auf das Programm-Canvas (Seitenverhältnis aus
+  `suggested_resolution`): Transform-Quad per `compose::layer_quad`,
+  gezeichnet über `draw_texture_pro` mit Rotation und Deckkraft-Tint
+  (Standbilder direkt aus dem TextureCache, ohne Decoder). Ton kommt aus den
+  aktiven Audio-Clips über einen eigenen Mixdown: je Clip ein
+  ffmpeg-`f32le`-Decoder, die Engine summiert blockweise (Spur-Gain/Pan,
+  Clip-Gain inkl. Lautstärke-Keyframes — pro Tick ausgewertet —,
+  Master-Fader, Mute/Solo) in einen einzelnen raylib-AudioStream und misst
+  dabei Spitzenpegel pro Spur und Summe (`state.audio`, Anzeige im
+  Audio-Mixer). Decoder werden bei Drift > 0,35 s (Seek/Loop während der
+  Wiedergabe) neu positioniert. Achtung, zwei raylib-Fallen:
+  `AudioStream::update` aus raylib-rs übergibt Bytes statt Frames (deshalb
+  direkter FFI-Aufruf in `MasterStream::write`), und raylib hebt die
+  Sub-Buffer-Größe still auf die Geräte-Periode an — der Mix-Block
   (`AUDIO_CHUNK_FRAMES`, 4096) muss darüber liegen, sonst wird jeder Block mit
   Stille aufgefüllt und der Ton zerhackt.
 - **Quellmonitor = Einzel-Asset-Player:** explizit geladenes Asset (Doppelklick
@@ -226,9 +270,10 @@ kommen als `ServiceEvent` über einen Kanal in den UI-Thread:
 ## Sequenz-Export
 
 `src/core/export.rs` + `src/overlays/export_dialog.rs` — Export der Timeline
-in eine Datei, semantisch identisch zur Wiedergabe (oberster aktiver
-Video-Clip gewinnt; Audio-Summe mit Spur-Gain/Pan, Clip-Gain, Master-Fader,
-Mute/Solo, `enabled`):
+in eine Datei, semantisch identisch zur Wiedergabe (alle sichtbaren
+Video-Layer mit animierten Transformationen, unten → oben komponiert;
+Audio-Summe mit Spur-Gain/Pan, Clip-Gain inkl. Lautstärke-Keyframes,
+Master-Fader, Mute/Solo, `enabled`):
 
 - **Katalog:** Container (MP4, MOV, MKV, WebM, WAV, MP3, FLAC, M4A) ×
   Video-Codecs (H.264, H.265 — `hvc1`-Tag, ProRes mit Profilen, DNxHR mit
@@ -236,9 +281,11 @@ Mute/Solo, `enabled`):
   Opus — erzwingt 48 kHz, FLAC, PCM 16/24/32f). Render-Presets (YouTube,
   Vimeo, Master, ProRes/DNxHR, Audio-only) als Settings-Fabriken.
 - **Renderplan** (`build_render_plan`, pur + getestet): Zeitachse in
-  Ziel-Frames quantisiert, an Clip-Grenzen geschnitten, pro Abschnitt
-  gewinnt der oberste sichtbare Clip; Lücken werden Schwarzbild, Standbilder
-  rendern über `-loop 1`. Audio-Clips mit vorgerechneten Links/Rechts-Gains.
+  Ziel-Frames quantisiert, an Clip-Grenzen geschnitten; jeder Abschnitt trägt
+  seinen **Layer-Stapel** (`VideoLayerPlan` mit Pfad, Medienzeit und
+  `ClipFx`-Kurven, unten → oben). Lücken werden Schwarzbild, Standbilder
+  rendern über `-loop 1`. Audio-Clips mit vorgerechneten Links/Rechts-Gains
+  und der Lautstärke-Kurve des Clips.
 - **Validierung** (`validate`): FFmpeg/Encoder vorhanden, Timeline/Bereich
   nicht leer, Offline-Medien (Warnung), Auflösung gerade/in Grenzen,
   Zielordner existiert, Ziel ≠ Quelldatei (Fehler!), Überschreib-Warnung,
@@ -246,11 +293,19 @@ Mute/Solo, `enabled`):
 - **Worker** (`run_export_worker`, eigener Thread, `catch_unwind`):
   Phase A mischt Audio clipweise per ffmpeg-`f32le`-Decoder via
   Read-Modify-Write in eine temporäre Float-WAV (konstanter RAM, Stille via
-  `set_len`); Phase B dekodiert Video segmentweise (`rawvideo/rgba`,
-  `scale`+`pad`+`fps`, exakte Frame-Zahl, fehlende Frames wiederholen den
-  letzten) in einen ffmpeg-Encoder-Prozess (BT.709-Matrix + Tags, expliziter
-  Muxer). Geschrieben wird nach `<ziel>.part`, bei Erfolg atomar umbenannt;
-  Abbruch/Fehler räumen `.part` + WAV auf. Fortschritt als Events
+  `set_len`; Lautstärke-Keyframes als Hüllkurve in 256-Frame-Blöcken).
+  Phase B rendert Video segmentweise in einen ffmpeg-Encoder-Prozess
+  (BT.709-Matrix + Tags, expliziter Muxer): untransformierte Einzel-Layer
+  laufen als **Schnellpfad** direkt durch eine Decoder-Pipe
+  (`scale`+`pad`+`fps`, exakte Frame-Zahl, fehlende Frames wiederholen den
+  letzten); Stapel oder transformierte Layer gehen durch den
+  **CPU-Compositor** (`compose::composite_frame`): ein Decoder je Layer
+  liefert transparent gepolsterte RGBA-Frames (Decode-Auflösung wächst mit
+  der maximalen Skalierung im Segment, gedeckelt bei 2×/4096), pro Frame
+  werden die Kurven ausgewertet und per inverser Abbildung (Rotation/
+  Skalierung/Position, bilinear, Src-over) in Zeilenbändern parallel auf das
+  Canvas gemischt. Geschrieben wird nach `<ziel>.part`, bei Erfolg atomar
+  umbenannt; Abbruch/Fehler räumen `.part` + WAV auf. Fortschritt als Events
   (% über Phasen-Gewichte, Frame x/y, fps, ETA über geglättete Rate).
 - **Dialog:** modal (Overlay blockiert Hauptschicht auf allen OS), links
   Presets, rechts Einstellungen mit Live-Validierung und Größenschätzung;

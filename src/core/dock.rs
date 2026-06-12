@@ -193,7 +193,8 @@ impl DockManager {
                 }
             }
             "color" => self.three_column_layout("scopes", 0.26, "color", 0.28),
-            "effects" => self.three_column_layout("effects", 0.22, "effectControls", 0.28),
+            // Effekteinstellungen breit: rechts liegen die Keyframe-Spuren.
+            "effects" => self.three_column_layout("effects", 0.18, "effectControls", 0.40),
             "audio" => self.three_column_layout("audioMixer", 0.24, "info", 0.22),
             "graphics" => self.three_column_layout("media", 0.20, "graphics", 0.28),
             _ => {

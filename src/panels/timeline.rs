@@ -929,6 +929,18 @@ impl TimelinePanel {
             );
             inner.cut_left(4.0);
         }
+        // Keyframe-Badge: Clip trägt animierte Parameter (Raute = 0°-Poly).
+        if clip.fx.any_animated() {
+            let ic = inner.cut_left(10.0);
+            ui.d.draw_poly(
+                crate::ui::geom::v2(ic.x + 5.0, ic.y + 8.0),
+                4,
+                4.0,
+                0.0,
+                theme::with_alpha(theme::ACCENT, alpha),
+            );
+            inner.cut_left(4.0);
+        }
         let dur_label = format_duration(clip.duration);
         if rect.w > 88.0 {
             let dw = ui.font(FontKind::Mono12).width(&dur_label);
@@ -1817,6 +1829,13 @@ fn clip_context_menu(app: &AppState, clip: &TimelineClip, t: f64) -> Vec<MenuEnt
                 .with_icon("link-2")
                 .with_checked(any_linked),
         ),
+        MenuEntry::Separator,
+        MenuEntry::Item(
+            MenuItem::command("window.openPanel.effectControls")
+                .with_label("Effekteinstellungen öffnen")
+                .with_icon("sliders-horizontal"),
+        ),
+        MenuEntry::Item(MenuItem::command("clip.resetMotion").with_icon("rotate-ccw")),
         MenuEntry::Separator,
         MenuEntry::Item(
             MenuItem::custom(

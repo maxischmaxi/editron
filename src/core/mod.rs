@@ -1,4 +1,6 @@
+pub mod animation;
 pub mod commands;
+pub mod compose;
 pub mod dock;
 pub mod export;
 pub mod keyboard;

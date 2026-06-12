@@ -199,6 +199,43 @@ fn open_project_with_status(ctx: &mut CommandCtx, path: &std::path::Path) {
     }
 }
 
+/// Playhead zum nächsten/vorherigen Keyframe (alle Parameter der Auswahl).
+fn jump_to_keyframe(ctx: &mut CommandCtx, dir: i32) {
+    use crate::core::animation::ParamId;
+    let playhead = ctx.state.timeline.playhead_sec;
+    let mut best: Option<f64> = None;
+    for clip in ctx
+        .state
+        .timeline
+        .clips
+        .iter()
+        .filter(|c| ctx.state.timeline.selected_clip_ids.contains(&c.id))
+    {
+        for param in ParamId::ALL {
+            for k in &clip.fx.param(param).keyframes {
+                // Keyframe-Medienzeit → Sequenzzeit.
+                let t_seq = clip.start + (k.t - clip.src_in);
+                let candidate = if dir > 0 {
+                    t_seq > playhead + 1e-4
+                } else {
+                    t_seq < playhead - 1e-4
+                };
+                if !candidate {
+                    continue;
+                }
+                best = Some(match best {
+                    None => t_seq,
+                    Some(b) if dir > 0 => b.min(t_seq),
+                    Some(b) => b.max(t_seq),
+                });
+            }
+        }
+    }
+    if let Some(t) = best {
+        ctx.state.timeline.set_playhead(t.max(0.0));
+    }
+}
+
 pub fn build_registry() -> CommandRegistry {
     let mut commands: Vec<Command> = Vec::new();
 
@@ -788,6 +825,38 @@ pub fn build_registry() -> CommandRegistry {
         ),
         "timelineClipSelected",
     ));
+    // ------------------------------------------------ Clip: Effekte/Keyframes
+    commands.push(with_when(
+        cmd(
+            "clip.resetMotion",
+            "Bewegung zurücksetzen",
+            "Clip",
+            |ctx, _| {
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                ctx.state.timeline.fx_reset_motion(&ids);
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_repeat(with_when(
+        cmd(
+            "clip.prevKeyframe",
+            "Zum vorherigen Keyframe",
+            "Clip",
+            |ctx, _| jump_to_keyframe(ctx, -1),
+        ),
+        "timelineClipSelected",
+    )));
+    commands.push(with_repeat(with_when(
+        cmd(
+            "clip.nextKeyframe",
+            "Zum nächsten Keyframe",
+            "Clip",
+            |ctx, _| jump_to_keyframe(ctx, 1),
+        ),
+        "timelineClipSelected",
+    )));
+
     commands.push(cmd(
         "timeline.addVideoTrack",
         "Videospur hinzufügen",

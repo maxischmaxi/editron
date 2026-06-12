@@ -575,6 +575,31 @@ fn apply_custom_action(state: &mut AppState, action: overlays::context_menu::Cus
             state.media.select(vec![asset_id]);
             state.dock.open_panel("media");
         }
+        FxSetInterp { keys, interp } => {
+            for_each_clip_keys(keys, |clip_id, keys| {
+                state.timeline.fx_set_interp(clip_id, keys, interp)
+            });
+        }
+        FxRemoveKeyframes { keys } => {
+            for_each_clip_keys(keys, |clip_id, keys| {
+                state.timeline.fx_remove_keyframes(clip_id, keys)
+            });
+        }
+    }
+}
+
+/// Keyframe-Listen aus Menüaktionen nach Clip gruppieren.
+fn for_each_clip_keys(
+    keys: Vec<(String, crate::core::animation::ParamId, f64)>,
+    mut f: impl FnMut(&str, &[(crate::core::animation::ParamId, f64)]),
+) {
+    let mut by_clip: std::collections::HashMap<String, Vec<(crate::core::animation::ParamId, f64)>> =
+        Default::default();
+    for (clip_id, param, t) in keys {
+        by_clip.entry(clip_id).or_default().push((param, t));
+    }
+    for (clip_id, keys) in by_clip {
+        f(&clip_id, &keys);
     }
 }
 

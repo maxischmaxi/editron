@@ -458,6 +458,15 @@ mod tests {
             link_id: None,
             enabled: true,
             gain_db: -3.0,
+            fx: {
+                // Animierte Parameter müssen den Roundtrip überleben.
+                let mut fx = crate::core::animation::ClipFx::default();
+                fx.pos_x.upsert_key(0.5, -20.0);
+                fx.pos_x.upsert_key(4.5, 20.0);
+                fx.pos_x.keyframes[0].interp = crate::core::animation::Interp::EaseInOut;
+                fx.opacity.value = 80.0;
+                fx
+            },
         });
         // Standbild mit unendlicher Quelldauer (Infinity-Roundtrip).
         let track_id = state.timeline.tracks[1].id.clone();
@@ -474,6 +483,7 @@ mod tests {
             link_id: None,
             enabled: false,
             gain_db: 0.0,
+            fx: Default::default(),
         });
         state.timeline.playhead_sec = 3.25;
         state.timeline.in_point = Some(1.0);
@@ -506,6 +516,13 @@ mod tests {
         assert!(!file.timeline.clips[1].enabled);
         assert_eq!(file.timeline.master_gain_db, -4.5);
         assert_eq!(file.timeline.clips[0].gain_db, -3.0);
+        let fx = &file.timeline.clips[0].fx;
+        assert_eq!(fx.pos_x.keyframes.len(), 2);
+        assert_eq!(fx.pos_x.keyframes[0].interp, crate::core::animation::Interp::EaseInOut);
+        assert_eq!(fx.opacity.value, 80.0);
+        assert!(fx.pos_x.is_animated());
+        // Unveränderte Clips speichern kein fx-Feld (schlanke Datei).
+        assert!(file.timeline.clips[1].fx.is_default());
         assert_eq!(file.timeline.tracks[2].gain_db, 2.0);
         assert_eq!(file.timeline.tracks[2].pan, -0.5);
 
@@ -588,6 +605,7 @@ mod tests {
             link_id: None,
             enabled: true,
             gain_db: 0.0,
+            fx: Default::default(),
         };
         let mut orphan = good.clone();
         orphan.id = "orphan".into();
