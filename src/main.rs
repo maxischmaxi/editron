@@ -38,6 +38,7 @@ struct App {
     relink_dialog: overlays::relink_dialog::RelinkDialog,
     sequence_dialog: overlays::sequence_dialog::SequenceDialog,
     speed_dialog: overlays::speed_dialog::SpeedDialog,
+    marker_dialog: overlays::marker_dialog::MarkerDialog,
     player: crate::core::player::PlayerEngine,
     titles: crate::core::title_engine::TitleEngine,
 }
@@ -62,6 +63,7 @@ impl App {
             relink_dialog: Default::default(),
             sequence_dialog: Default::default(),
             speed_dialog: Default::default(),
+            marker_dialog: Default::default(),
             player: crate::core::player::PlayerEngine::new(),
             titles: Default::default(),
         }
@@ -175,6 +177,25 @@ impl App {
                     if !self.state.media.assets.iter().any(|a| a.path == asset.path) {
                         let asset_id = asset.id.clone();
                         self.state.media.add_asset(asset);
+                        // Testmodus: erstes Asset in den Quellmonitor laden
+                        // (EDITRON_TEST_SOURCE=1 oder "in,out" in Sekunden) —
+                        // zeigt die Insert/Overwrite-Buttons des Quellmonitors.
+                        if let Ok(spec) = std::env::var("EDITRON_TEST_SOURCE") {
+                            if self.state.playback.source_asset_id.is_none() {
+                                self.state.playback.source_asset_id = Some(asset_id.clone());
+                                self.state.playback.source = Default::default();
+                                self.state.playback.source.rate = 1.0;
+                                if let Some((a, b)) = spec.split_once(',') {
+                                    if let (Ok(a), Ok(b)) = (a.trim().parse(), b.trim().parse()) {
+                                        self.state.playback.source.in_mark = Some(a);
+                                        self.state.playback.source.out_mark = Some(b);
+                                        self.state.playback.source.position = a;
+                                    }
+                                }
+                                self.state.app.focused_panel = "source".into();
+                                self.state.dock.open_panel("source");
+                            }
+                        }
                         // Testmodus: importierte Medien ans Sequenzende einfügen.
                         if std::env::var("EDITRON_TEST_TIMELINE").is_ok() {
                             let at = crate::core::timeline::sequence_end(&self.state.timeline.clips);
@@ -352,6 +373,62 @@ impl App {
                                 self.state.timeline.import_subtitle_cues(&cues);
                                 self.state.timeline.set_playhead(dur / 2.0);
                                 self.state.dock.open_panel("subtitles");
+                            }
+                            // Marker für Smoke-Tests, z. B.
+                            // EDITRON_TEST_MARKER="2:Intro:red;8-10:Highlight:cyan":
+                            // setzt Sequenz-Marker (Zeit[:Name[:Farbe]];
+                            // Zeit als a-b ⇒ Bereichsmarker), parkt den
+                            // Playhead auf dem ersten und öffnet das Panel.
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_MARKER") {
+                                let mut first: Option<f64> = None;
+                                for entry in spec.split(';').filter(|s| !s.trim().is_empty()) {
+                                    let mut parts = entry.splitn(3, ':');
+                                    let time_tok = parts.next().unwrap_or("").trim();
+                                    let name = parts.next().unwrap_or("").trim().to_string();
+                                    let color = parts.next().and_then(|c| {
+                                        crate::core::marker::MarkerColor::from_key(c.trim())
+                                    });
+                                    let (start, dur) = match time_tok.split_once('-') {
+                                        Some((a, b)) => {
+                                            let a = a.trim().parse::<f64>().unwrap_or(0.0);
+                                            let b = b.trim().parse::<f64>().unwrap_or(a);
+                                            (a, (b - a).max(0.0))
+                                        }
+                                        None => (time_tok.parse::<f64>().unwrap_or(0.0), 0.0),
+                                    };
+                                    let id = self.state.timeline.add_marker_at(start);
+                                    self.state.timeline.marker_update(&id, |m| {
+                                        if !name.is_empty() {
+                                            m.name = name.clone();
+                                        }
+                                        if let Some(c) = color {
+                                            m.color = c;
+                                        }
+                                        if dur > 0.0 {
+                                            m.duration = dur;
+                                        }
+                                    });
+                                    first.get_or_insert(start);
+                                }
+                                if let Some(t) = first {
+                                    self.state.timeline.set_playhead(t);
+                                }
+                                self.state.dock.open_panel("markers");
+                                // EDITRON_TEST_DIALOG=marker öffnet den
+                                // Bearbeiten-Dialog auf dem ersten Marker.
+                                if std::env::var("EDITRON_TEST_DIALOG")
+                                    .is_ok_and(|d| d == "marker")
+                                {
+                                    if let Some(m) = self.state.timeline.markers.first() {
+                                        self.state.app.marker_editor =
+                                            Some(stores::MarkerEditTarget {
+                                                scope: core::marker::MarkerScope::Sequence,
+                                                marker_id: m.id.clone(),
+                                            });
+                                        self.state.app.open_dialog =
+                                            Some(stores::DialogId::Marker);
+                                    }
+                                }
                             }
                             // Geschwindigkeit/Dauer-Dialog erst nach dem
                             // (asynchronen) Import öffnen — er braucht den
@@ -777,6 +854,7 @@ fn main() {
             .render(&mut ui, &mut app.state, &app.services);
         app.sequence_dialog.render(&mut ui, &mut app.state);
         app.speed_dialog.render(&mut ui, &mut app.state);
+        app.marker_dialog.render(&mut ui, &mut app.state);
         render_select_popup(&mut ui);
 
         // Drag-Ghost (z. B. Assets aus dem Medien-Browser)
@@ -859,6 +937,9 @@ fn apply_custom_action(state: &mut AppState, action: overlays::context_menu::Cus
         TimelineToggleTrackFlag { track_id, flag } => {
             state.timeline.toggle_track_flag(&track_id, flag)
         }
+        TimelineToggleSourcePatch { track_id } => {
+            state.timeline.toggle_source_patch(&track_id)
+        }
         TimelineSetInAt { t } => state.timeline.set_in_point(Some(t)),
         TimelineSetOutAt { t } => state.timeline.set_out_point(Some(t)),
         TimelineClearInOut => state.timeline.clear_in_out(),
@@ -897,6 +978,22 @@ fn apply_custom_action(state: &mut AppState, action: overlays::context_menu::Cus
             state.timeline.effects_toggle_enabled(&clip_id, &fx_id)
         }
         EffectsReset { clip_id, fx_id } => state.timeline.effects_reset(&clip_id, &fx_id),
+        TrackEffectsAdd { track_id, kind } => {
+            state.timeline.track_effects_add(&track_id, kind);
+        }
+        TrackEffectsRemove { track_id, fx_id } => {
+            state.timeline.track_effects_remove(&track_id, &fx_id)
+        }
+        TrackEffectsToggle { track_id, fx_id } => {
+            state.timeline.track_effects_toggle_enabled(&track_id, &fx_id)
+        }
+        TrackEffectsReset { track_id, fx_id } => {
+            state.timeline.track_effects_reset(&track_id, &fx_id)
+        }
+        TrackEffectsMove { track_id, fx_id, delta } => {
+            state.timeline.track_effects_move(&track_id, &fx_id, delta)
+        }
+        TrackAutoClear { track_id, param } => state.timeline.track_auto_clear(&track_id, param),
         TransitionRemove { id } => state.timeline.remove_transitions(&[id]),
         TransitionReplace { id, kind } => state.timeline.set_transition_kind(&id, kind),
         TransitionAlign { id, alignment } => {
@@ -906,6 +1003,43 @@ fn apply_custom_action(state: &mut AppState, action: overlays::context_menu::Cus
             state.timeline.set_transition_direction(&id, direction)
         }
         TransitionEditDuration { id } => state.app.edit_transition_duration = Some(id),
+        MarkerEdit { scope, marker_id } => {
+            state.app.marker_editor = Some(stores::MarkerEditTarget { scope, marker_id });
+            state.app.open_dialog = Some(stores::DialogId::Marker);
+        }
+        MarkerDelete { scope, marker_id } => match scope {
+            core::marker::MarkerScope::Sequence => state.timeline.remove_marker(&marker_id),
+            core::marker::MarkerScope::Clip(cid) => {
+                state.timeline.remove_clip_marker(&cid, &marker_id)
+            }
+            core::marker::MarkerScope::Asset(aid) => {
+                state.media.remove_asset_marker(&aid, &marker_id)
+            }
+        },
+        MarkerSetColor { scope, marker_id, color } => match scope {
+            core::marker::MarkerScope::Sequence => {
+                state.timeline.marker_update(&marker_id, |m| m.color = color)
+            }
+            core::marker::MarkerScope::Clip(cid) => {
+                state.timeline.clip_marker_update(&cid, &marker_id, |m| m.color = color)
+            }
+            core::marker::MarkerScope::Asset(aid) => {
+                state.media.asset_marker_update(&aid, &marker_id, |m| m.color = color)
+            }
+        },
+        MarkerAddAt { t } => {
+            state.timeline.add_marker_at(t);
+        }
+        MarkerAddClipAt { clip_id, t } => {
+            // Hinzufügen + sofort den Bearbeiten-Dialog öffnen (Premiere).
+            if let Some(mid) = state.timeline.add_clip_marker_at_seq(&clip_id, t) {
+                state.app.marker_editor = Some(stores::MarkerEditTarget {
+                    scope: core::marker::MarkerScope::Clip(clip_id),
+                    marker_id: mid,
+                });
+                state.app.open_dialog = Some(stores::DialogId::Marker);
+            }
+        }
     }
 }
 

@@ -65,6 +65,12 @@ impl<'a> IconButton<'a> {
         self
     }
 
+    /// Rot beim Hover (destruktive Aktion wie „Löschen").
+    pub fn danger_hover(mut self, d: bool) -> Self {
+        self.danger_hover = d;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui, id_src: impl std::hash::Hash, rect: Rect) -> Interaction {
         let id = ui.id(id_src);
         let it = if self.disabled {

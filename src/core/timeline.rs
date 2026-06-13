@@ -4,6 +4,7 @@
 use crate::core::animation::{AnimatedParam, ClipFx, Interp, Keyframe, ParamId, ParamRef};
 use crate::core::effects::{EffectInstance, EffectKind};
 use crate::core::grade::ColorGrade;
+use crate::core::marker::Marker;
 use crate::core::sequence::{self, SequenceSettings};
 use crate::core::subtitle::{SrtCue, SubtitleSpec, SubtitleStyle};
 use crate::core::title::TitleSpec;
@@ -45,6 +46,10 @@ pub enum TrackFlag {
     Muted,
     Solo,
     Locked,
+    /// Sync-Lock (rippelt bei Insert/Extract mit).
+    SyncLock,
+    /// Spur-Targeting (Ziel von Lift/Extract/Match Frame).
+    Targeted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,11 +70,85 @@ pub struct TimelineTrack {
     /// Stereo-Balance −1 (links) .. +1 (rechts); nur für Audio-Spuren relevant.
     #[serde(default)]
     pub pan: f64,
+    /// Sync-Lock: rippelt bei Insert/Extract mit, auch ohne neues Material,
+    /// damit der Mehrspur-Sync erhalten bleibt (Premiere-Semantik). Formatv7.
+    #[serde(default)]
+    pub sync_lock: bool,
+    /// Spur-Targeting: Ziel playheadbezogener Operationen (Lift/Extract/
+    /// Match Frame). Mehrfachauswahl möglich. Formatversion 7.
+    #[serde(default)]
+    pub targeted: bool,
+    /// Source-Patching: empfängt das passende Quell-Material (Video bzw.
+    /// Audio) beim Three-Point-Edit. Pro Spurart höchstens eine Spur (Radio).
+    /// Formatversion 7.
+    #[serde(default)]
+    pub source_patched: bool,
     /// Gestaltung der Untertitel-Spur (None außerhalb von Untertitel-Spuren
     /// bzw. Standardstil). `muted` dient bei Untertitel-Spuren als
     /// Sichtbarkeits-Schalter (ausgeblendet = nicht in Monitor/Export).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle_style: Option<SubtitleStyle>,
+    /// Audio-Effekt-Kette der Spur (Bus-Insert): wirkt auf die Summe aller
+    /// Clips der Spur, NACH den Clip-Effekten und VOR Spur-Gain/Pan. Nur für
+    /// Audio-Spuren sinnvoll. Reihenfolge = Verarbeitungsreihenfolge.
+    /// Formatversion 7.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<EffectInstance>,
+    /// Lautstärke-Automation (dB-Offset zum Fader, Keyframes in SEQUENZZEIT).
+    /// Statische Null = keine Automation (Fader gilt). Formatversion 7.
+    #[serde(default = "zero_auto", skip_serializing_if = "AnimatedParam::is_static_zero")]
+    pub volume_auto: AnimatedParam,
+    /// Pan-Automation (Offset zur Balance, Keyframes in SEQUENZZEIT).
+    /// Statische Null = keine Automation. Formatversion 7.
+    #[serde(default = "zero_auto", skip_serializing_if = "AnimatedParam::is_static_zero")]
+    pub pan_auto: AnimatedParam,
+}
+
+fn zero_auto() -> AnimatedParam {
+    AnimatedParam::fixed(0.0)
+}
+
+/// Welcher Automations-Parameter einer Spur (Timeline-Rubber-Band, Mixer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackAutoParam {
+    Volume,
+    Pan,
+}
+
+impl TimelineTrack {
+    /// Wirksame Spur-Verstärkung (dB) zur Sequenzzeit `t`: Fader + Automation.
+    pub fn gain_db_at(&self, t: f64) -> f64 {
+        self.gain_db + self.volume_auto.eval(t)
+    }
+
+    /// Wirksame Stereo-Balance zur Sequenzzeit `t`: Fader + Automation.
+    pub fn pan_at(&self, t: f64) -> f64 {
+        (self.pan + self.pan_auto.eval(t)).clamp(-1.0, 1.0)
+    }
+
+    /// Hat die Spur eine wirksame Lautstärke- oder Pan-Automation?
+    pub fn has_automation(&self) -> bool {
+        self.volume_auto.is_animated() || self.pan_auto.is_animated()
+    }
+
+    pub fn auto_param(&self, p: TrackAutoParam) -> &AnimatedParam {
+        match p {
+            TrackAutoParam::Volume => &self.volume_auto,
+            TrackAutoParam::Pan => &self.pan_auto,
+        }
+    }
+
+    pub fn auto_param_mut(&mut self, p: TrackAutoParam) -> &mut AnimatedParam {
+        match p {
+            TrackAutoParam::Volume => &mut self.volume_auto,
+            TrackAutoParam::Pan => &mut self.pan_auto,
+        }
+    }
+
+    /// Hat die Spur aktive Audio-Effekte (für Schnellpfad-Entscheidungen)?
+    pub fn has_audio_effects(&self) -> bool {
+        self.effects.iter().any(|e| e.enabled && e.kind.is_audio())
+    }
 }
 
 fn make_track(kind: TrackKind) -> TimelineTrack {
@@ -81,7 +160,13 @@ fn make_track(kind: TrackKind) -> TimelineTrack {
         locked: false,
         gain_db: 0.0,
         pan: 0.0,
+        sync_lock: false,
+        targeted: false,
+        source_patched: false,
         subtitle_style: None,
+        effects: Vec::new(),
+        volume_auto: zero_auto(),
+        pan_auto: zero_auto(),
     }
 }
 
@@ -140,6 +225,12 @@ pub struct TimelineClip {
     /// (belegte Medienspanne = 0, Dauer frei dehnbar).
     #[serde(default, skip_serializing_if = "is_false")]
     pub freeze: bool,
+    /// Clip-Marker in MEDIENZEIT (Quell-Sekunden, gleiche Achse wie `src_in`).
+    /// Sie hängen am Material und wandern dadurch beim Trimmen/Verschieben
+    /// korrekt mit; beim Teilen werden sie auf die Hälften aufgeteilt
+    /// (Formatversion 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Marker>,
 }
 
 fn default_enabled() -> bool {
@@ -305,6 +396,22 @@ impl TimelineClip {
     pub fn is_generator(&self) -> bool {
         self.is_title() || self.is_subtitle()
     }
+
+    /// Liegt eine Medienzeit `m` im aktuell sichtbaren Quellausschnitt des
+    /// Clips? (Clip-Marker außerhalb sind weggetrimmt und werden nicht
+    /// gezeichnet, bleiben aber erhalten.)
+    pub fn media_in_view(&self, m: f64) -> bool {
+        m >= self.media_in() - EPS && m <= self.media_out() + EPS
+    }
+
+    /// Sichtbare Clip-Marker als (Sequenzzeit, &Marker) — bereits in den
+    /// Clipausschnitt projiziert (für Lineal-Kerben und Tooltips).
+    pub fn visible_markers(&self) -> impl Iterator<Item = (f64, &Marker)> {
+        self.markers
+            .iter()
+            .filter(move |m| self.media_in_view(m.time))
+            .map(move |m| (self.seq_time_of_media(m.time), m))
+    }
 }
 
 /// Ende des letzten Clips — die effektive Sequenzdauer.
@@ -350,6 +457,7 @@ struct Snapshot {
     tracks: Vec<TimelineTrack>,
     clips: Vec<TimelineClip>,
     transitions: Vec<Transition>,
+    markers: Vec<Marker>,
     master_gain_db: f64,
 }
 
@@ -407,6 +515,9 @@ pub struct TimelineStore {
     pub clips: Vec<TimelineClip>,
     /// Übergänge an Schnittkanten (Teil der Undo-History und Projektdatei).
     pub transitions: Vec<Transition>,
+    /// Sequenz-Marker in Sequenz-Sekunden (Teil der Undo-History und
+    /// Projektdatei). Stets nach Zeit sortiert gehalten.
+    pub markers: Vec<Marker>,
     pub selected_clip_ids: Vec<String>,
     /// Ausgewählte Übergänge (wie die Clip-Auswahl nicht Teil der History).
     pub selected_transition_ids: Vec<String>,
@@ -440,17 +551,25 @@ pub struct TimelineStore {
 impl Default for TimelineStore {
     fn default() -> Self {
         // Startbelegung wie ein frisches Premiere-Projekt: 2 Video-, 2 Audiospuren.
+        // V1 (unterste Video-) und A1 (oberste Audiospur) sind Patch- und
+        // Targeting-Ziel — der Standard-Schnittpfad ohne weitere Eingaben.
+        let mut tracks = vec![
+            make_track(TrackKind::Video),
+            make_track(TrackKind::Video),
+            make_track(TrackKind::Audio),
+            make_track(TrackKind::Audio),
+        ];
+        tracks[1].source_patched = true;
+        tracks[1].targeted = true;
+        tracks[2].source_patched = true;
+        tracks[2].targeted = true;
         TimelineStore {
             settings: SequenceSettings::default(),
             pending_media_match: None,
-            tracks: vec![
-                make_track(TrackKind::Video),
-                make_track(TrackKind::Video),
-                make_track(TrackKind::Audio),
-                make_track(TrackKind::Audio),
-            ],
+            tracks,
             clips: Vec::new(),
             transitions: Vec::new(),
+            markers: Vec::new(),
             selected_clip_ids: Vec::new(),
             selected_transition_ids: Vec::new(),
             clipboard: Vec::new(),
@@ -753,6 +872,11 @@ pub fn plan_asset_placements(
     placements
 }
 
+/// Marker stabil nach Zeitpunkt sortieren (Lineal, Panel, Navigation).
+pub fn sort_markers(markers: &mut [Marker]) {
+    markers.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+}
+
 /// Sortierte, eindeutige Schnittpunkte (Clipgrenzen) der Sequenz.
 pub fn edit_points(clips: &[TimelineClip]) -> Vec<f64> {
     let mut points: Vec<f64> = vec![0.0];
@@ -771,6 +895,7 @@ impl TimelineStore {
             tracks: self.tracks.clone(),
             clips: self.clips.clone(),
             transitions: self.transitions.clone(),
+            markers: self.markers.clone(),
             master_gain_db: self.master_gain_db,
         });
         if self.past.len() > HISTORY_LIMIT {
@@ -789,6 +914,7 @@ impl TimelineStore {
         tracks: Vec<TimelineTrack>,
         clips: Vec<TimelineClip>,
         transitions: Vec<Transition>,
+        markers: Vec<Marker>,
         playhead_sec: f64,
         in_point: Option<f64>,
         out_point: Option<f64>,
@@ -822,6 +948,10 @@ impl TimelineStore {
             for e in &mut c.effects {
                 e.normalize();
             }
+            for m in &mut c.markers {
+                m.sanitize();
+            }
+            sort_markers(&mut c.markers);
             // Geschwindigkeit defensiv klemmen (fremde/kaputte Dateien).
             if !c.speed.is_finite() || c.speed <= 0.0 {
                 c.speed = 1.0;
@@ -839,6 +969,12 @@ impl TimelineStore {
             .collect();
         self.selected_transition_ids.clear();
         self.reconcile_transitions();
+        // Sequenz-Marker defensiv bereinigen + sortieren.
+        self.markers = markers;
+        for m in &mut self.markers {
+            m.sanitize();
+        }
+        sort_markers(&mut self.markers);
         self.clipboard.clear();
         self.clipboard_transitions.clear();
         self.selected_clip_ids = selected_clip_ids;
@@ -948,6 +1084,237 @@ impl TimelineStore {
         let edges = edit_points(&self.clips);
         if let Some(next) = edges.iter().find(|e| **e > self.playhead_sec + EPS) {
             self.playhead_sec = *next;
+        }
+    }
+
+    // ------------------------------------------------------------ Marker
+    // Sequenz-Marker liegen in Sequenz-Sekunden und sind Teil der
+    // Undo-History (über push_history). Sie werden stets frame-genau gegen
+    // die Sequenzrate gerastert und nach Zeit sortiert gehalten.
+
+    /// Rastert eine Sequenzzeit frame-genau (rationale NTSC-Arithmetik).
+    pub fn snap_to_frame(&self, t: f64) -> f64 {
+        let rate = self.settings.rate;
+        if rate.num == 0 || rate.den == 0 || !t.is_finite() {
+            return t.max(0.0);
+        }
+        rate.time_of_frame(rate.frame_round(t.max(0.0)) as f64).max(0.0)
+    }
+
+    /// Sequenz-Marker exakt (innerhalb eines halben Frames) bei `t`.
+    fn marker_index_at(&self, t: f64) -> Option<usize> {
+        let tol = (0.5 / self.settings.rate.fps()).max(EPS);
+        self.markers.iter().position(|m| (m.time - t).abs() <= tol)
+    }
+
+    /// Sequenz-Marker am Playhead setzen (M) — latenzfrei, idempotent:
+    /// existiert am selben Frame schon einer, wird dessen ID zurückgegeben.
+    /// Liefert die ID des (neuen oder bestehenden) Markers.
+    pub fn add_marker_at(&mut self, t: f64) -> String {
+        let t = self.snap_to_frame(t);
+        if let Some(idx) = self.marker_index_at(t) {
+            return self.markers[idx].id.clone();
+        }
+        self.push_history();
+        let marker = Marker::new(t);
+        let id = marker.id.clone();
+        self.markers.push(marker);
+        sort_markers(&mut self.markers);
+        id
+    }
+
+    /// Beginn einer Marker-Geste (Drag/Dialog) — ein Snapshot.
+    pub fn begin_marker_edit(&mut self) {
+        self.push_history();
+    }
+
+    /// Sequenz-Marker ändern OHNE neuen Snapshot (laufende Geste nach
+    /// `begin_marker_edit`). Hält die Sortierung aufrecht.
+    pub fn marker_update_live(&mut self, id: &str, f: impl FnOnce(&mut Marker)) {
+        if let Some(m) = self.markers.iter_mut().find(|m| m.id == id) {
+            f(m);
+            m.sanitize();
+        }
+        sort_markers(&mut self.markers);
+        self.revision += 1;
+    }
+
+    /// Sequenz-Marker ändern (mit Undo-Snapshot) — für Einzelaktionen.
+    pub fn marker_update(&mut self, id: &str, f: impl FnOnce(&mut Marker)) {
+        if !self.markers.iter().any(|m| m.id == id) {
+            return;
+        }
+        self.push_history();
+        self.marker_update_live(id, f);
+    }
+
+    /// Einen Sequenz-Marker entfernen.
+    pub fn remove_marker(&mut self, id: &str) {
+        if !self.markers.iter().any(|m| m.id == id) {
+            return;
+        }
+        self.push_history();
+        self.markers.retain(|m| m.id != id);
+    }
+
+    /// Alle Sequenz-Marker entfernen.
+    pub fn clear_markers(&mut self) {
+        if self.markers.is_empty() {
+            return;
+        }
+        self.push_history();
+        self.markers.clear();
+    }
+
+    /// Sequenz-Marker, der den Playhead überdeckt (Punkt: exakt am Frame;
+    /// Bereich: Playhead in [time, end]) — für „Marker löschen" / Dialog.
+    pub fn marker_at_playhead(&self) -> Option<&Marker> {
+        let t = self.snap_to_frame(self.playhead_sec);
+        let tol = (0.5 / self.settings.rate.fps()).max(EPS);
+        // Exakter Punkttreffer hat Vorrang vor Bereichsüberdeckung.
+        self.markers
+            .iter()
+            .find(|m| (m.time - t).abs() <= tol)
+            .or_else(|| {
+                self.markers
+                    .iter()
+                    .find(|m| m.duration > 0.0 && t >= m.time - tol && t <= m.end() + tol)
+            })
+    }
+
+    /// Den nächstgelegenen Marker zum Playhead löschen (Premiere: „Marker
+    /// löschen" wirkt am aktuellen/überdeckten Marker).
+    pub fn remove_marker_at_playhead(&mut self) -> bool {
+        let Some(id) = self.marker_at_playhead().map(|m| m.id.clone()) else {
+            return false;
+        };
+        self.remove_marker(&id);
+        true
+    }
+
+    /// Playhead auf den nächsten Sequenz-Marker (echt rechts) setzen.
+    pub fn go_to_next_marker(&mut self) -> bool {
+        let t = self.playhead_sec;
+        if let Some(next) = self
+            .markers
+            .iter()
+            .map(|m| m.time)
+            .filter(|mt| *mt > t + EPS)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            self.playhead_sec = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Playhead auf den vorherigen Sequenz-Marker (echt links) setzen.
+    pub fn go_to_prev_marker(&mut self) -> bool {
+        let t = self.playhead_sec;
+        if let Some(prev) = self
+            .markers
+            .iter()
+            .map(|m| m.time)
+            .filter(|mt| *mt < t - EPS)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            self.playhead_sec = prev;
+            true
+        } else {
+            false
+        }
+    }
+
+    // -------- Clip-Marker (Medienzeit; wandern mit dem Material) ----------
+
+    /// Clip-Marker an der zur Sequenzzeit `t_seq` gehörenden Medienzeit
+    /// setzen (z. B. Playhead über dem Clip). Idempotent pro Quell-Frame.
+    /// Liefert die Marker-ID, falls der Clip existiert und `t_seq` ihn trifft.
+    pub fn add_clip_marker_at_seq(&mut self, clip_id: &str, t_seq: f64) -> Option<String> {
+        let Some(clip) = self.clips.iter().find(|c| c.id == clip_id) else {
+            return None;
+        };
+        if t_seq < clip.start - EPS || t_seq > clip.end() + EPS {
+            return None;
+        }
+        let media_t = clip.media_time_at(t_seq).max(0.0);
+        self.add_clip_marker(clip_id, media_t)
+    }
+
+    /// Clip-Marker an einer absoluten Medienzeit setzen (idempotent pro
+    /// Quell-Frame). Liefert die ID des (neuen oder bestehenden) Markers.
+    pub fn add_clip_marker(&mut self, clip_id: &str, media_t: f64) -> Option<String> {
+        let tol = (0.5 / self.settings.rate.fps()).max(EPS);
+        let Some(clip) = self.clips.iter().find(|c| c.id == clip_id) else {
+            return None;
+        };
+        if let Some(existing) = clip
+            .markers
+            .iter()
+            .find(|m| (m.time - media_t).abs() <= tol)
+            .map(|m| m.id.clone())
+        {
+            return Some(existing);
+        }
+        self.push_history();
+        let clip = self.clips.iter_mut().find(|c| c.id == clip_id)?;
+        let marker = Marker::new(media_t.max(0.0));
+        let id = marker.id.clone();
+        clip.markers.push(marker);
+        sort_markers(&mut clip.markers);
+        Some(id)
+    }
+
+    /// Clip-Marker ändern OHNE Snapshot (laufende Geste).
+    pub fn clip_marker_update_live(
+        &mut self,
+        clip_id: &str,
+        marker_id: &str,
+        f: impl FnOnce(&mut Marker),
+    ) {
+        if let Some(clip) = self.clips.iter_mut().find(|c| c.id == clip_id) {
+            if let Some(m) = clip.markers.iter_mut().find(|m| m.id == marker_id) {
+                f(m);
+                m.sanitize();
+            }
+            sort_markers(&mut clip.markers);
+        }
+        self.revision += 1;
+    }
+
+    /// Clip-Marker ändern (mit Undo-Snapshot).
+    pub fn clip_marker_update(
+        &mut self,
+        clip_id: &str,
+        marker_id: &str,
+        f: impl FnOnce(&mut Marker),
+    ) {
+        let exists = self
+            .clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .is_some_and(|c| c.markers.iter().any(|m| m.id == marker_id));
+        if !exists {
+            return;
+        }
+        self.push_history();
+        self.clip_marker_update_live(clip_id, marker_id, f);
+    }
+
+    /// Einen Clip-Marker entfernen.
+    pub fn remove_clip_marker(&mut self, clip_id: &str, marker_id: &str) {
+        let exists = self
+            .clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .is_some_and(|c| c.markers.iter().any(|m| m.id == marker_id));
+        if !exists {
+            return;
+        }
+        self.push_history();
+        if let Some(clip) = self.clips.iter_mut().find(|c| c.id == clip_id) {
+            clip.markers.retain(|m| m.id != marker_id);
         }
     }
 
@@ -1097,11 +1464,90 @@ impl TimelineStore {
                 TrackFlag::Muted => t.muted = !t.muted,
                 TrackFlag::Solo => t.solo = !t.solo,
                 TrackFlag::Locked => t.locked = !t.locked,
+                TrackFlag::SyncLock => t.sync_lock = !t.sync_lock,
+                TrackFlag::Targeted => t.targeted = !t.targeted,
             }
             // Flags werden mitgespeichert → Projekt muss dirty werden
             // (bewusst ohne History-Snapshot, wie In-/Out-Punkte).
             self.revision += 1;
         }
+    }
+
+    /// Spur als Source-Patch-Ziel ihrer Art setzen (Radio: höchstens eine
+    /// Video- und eine Audiospur). Erneutes Klicken hebt den Patch auf, sodass
+    /// das entsprechende Quell-Material beim Edit übersprungen wird (Premiere:
+    /// Patch deaktivieren). Untertitel-Spuren sind kein Patch-Ziel.
+    pub fn toggle_source_patch(&mut self, track_id: &str) {
+        let Some(kind) = self.tracks.iter().find(|t| t.id == track_id).map(|t| t.kind) else {
+            return;
+        };
+        if kind == TrackKind::Subtitle {
+            return;
+        }
+        let was = self
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .map(|t| t.source_patched)
+            .unwrap_or(false);
+        for t in &mut self.tracks {
+            if t.kind == kind {
+                t.source_patched = false;
+            }
+        }
+        if !was {
+            if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+                t.source_patched = true;
+            }
+        }
+        self.revision += 1;
+    }
+
+    /// Aktuelles Source-Patch-Ziel einer Art (ungesperrt), falls vorhanden.
+    pub fn source_patch_track(&self, kind: TrackKind) -> Option<&str> {
+        self.tracks
+            .iter()
+            .find(|t| t.kind == kind && t.source_patched && !t.locked)
+            .map(|t| t.id.as_str())
+    }
+
+    /// Anvisierte, ungesperrte Spur-IDs (Lift/Extract/Match-Frame-Ziele).
+    pub fn targeted_track_ids(&self) -> std::collections::HashSet<String> {
+        self.tracks
+            .iter()
+            .filter(|t| t.targeted && !t.locked && t.kind != TrackKind::Subtitle)
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// Stellt für Video und Audio je ein Patch- und Targeting-Ziel sicher,
+    /// falls keines gesetzt ist (Migration von Altprojekten vor Formatv7).
+    /// Standard wie ein frisches Projekt: V1 (unterste Video-) und A1 (oberste
+    /// Audiospur).
+    pub fn ensure_patch_target_defaults(&mut self) {
+        for kind in [TrackKind::Video, TrackKind::Audio] {
+            let default_id = match kind {
+                TrackKind::Video => self
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == kind)
+                    .next_back()
+                    .map(|t| t.id.clone()),
+                _ => self.tracks.iter().find(|t| t.kind == kind).map(|t| t.id.clone()),
+            };
+            let Some(default_id) = default_id else { continue };
+            if !self.tracks.iter().any(|t| t.kind == kind && t.source_patched) {
+                if let Some(t) = self.tracks.iter_mut().find(|t| t.id == default_id) {
+                    t.source_patched = true;
+                }
+            }
+            if !self.tracks.iter().any(|t| t.kind == kind && t.targeted) {
+                if let Some(t) = self.tracks.iter_mut().find(|t| t.id == default_id) {
+                    t.targeted = true;
+                }
+            }
+        }
+        self.revision += 1;
     }
 
     // ------------------------------------------------------------- Mixer
@@ -1240,6 +1686,23 @@ impl TimelineStore {
                 None
             };
             clips = overwrite_range(clips, &track_id, p.start, p.start + p.duration);
+            // Asset-Marker (Quellmonitor) in Clip-Marker übernehmen, sofern
+            // sie in den belegten Quellausschnitt [0, duration] fallen.
+            let markers: Vec<Marker> = assets
+                .iter()
+                .find(|a| a.id == p.asset_id)
+                .map(|a| {
+                    a.markers
+                        .iter()
+                        .filter(|m| m.time >= -EPS && m.time <= p.duration + EPS)
+                        .map(|m| {
+                            let mut nm = m.clone();
+                            nm.id = new_id();
+                            nm
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             inserted.push(TimelineClip {
                 id: new_id(),
                 track_id,
@@ -1261,6 +1724,7 @@ impl TimelineStore {
                 speed: 1.0,
                 reverse: false,
                 freeze: false,
+                markers,
             });
         }
 
@@ -1283,6 +1747,229 @@ impl TimelineStore {
                 }
             }
         }
+    }
+
+    // -------------------------------------------- Insert / Three-Point-Edit
+
+    /// Insert-Ripple-Primitive: öffnet auf den `affected`-Spuren bei `at` eine
+    /// Lücke der Breite `amount`. Clips, die `at` durchschneiden, werden geteilt
+    /// (Marker und End-Übergänge wandern auf die rechte Hälfte); alles ab `at`
+    /// rückt nach hinten. KEIN History-Snapshot (der Aufrufer macht einen).
+    fn open_gap(&mut self, affected: &std::collections::HashSet<String>, at: f64, amount: f64) {
+        use std::collections::HashMap;
+        if amount <= EPS {
+            return;
+        }
+        let mut new_link_ids: HashMap<String, String> = HashMap::new();
+        // Original-Clip → rechte Hälfte: End-Übergänge müssen mitwandern.
+        let mut right_ids: HashMap<String, String> = HashMap::new();
+        let mut out: Vec<TimelineClip> = Vec::with_capacity(self.clips.len() + 4);
+        for c in std::mem::take(&mut self.clips) {
+            let on_track = affected.contains(&c.track_id);
+            let straddles = on_track
+                && at > c.start + MIN_CLIP_DURATION - EPS
+                && at < c.end() - MIN_CLIP_DURATION + EPS;
+            if straddles {
+                let left_len = at - c.start;
+                let (left_src_in, right_src_in) = c.split_src_ins(left_len);
+                let right_link = c.link_id.as_ref().map(|link| {
+                    new_link_ids.entry(link.clone()).or_insert_with(new_id).clone()
+                });
+                let cut_media = c.media_time_at(at);
+                let on_right = |m: &Marker| -> bool {
+                    if c.freeze {
+                        false
+                    } else if c.reverse {
+                        m.time <= cut_media
+                    } else {
+                        m.time >= cut_media
+                    }
+                };
+                let mut left = c.clone();
+                left.src_in = left_src_in;
+                left.duration = left_len;
+                left.markers = c.markers.iter().filter(|m| !on_right(m)).cloned().collect();
+                let mut right = c.clone();
+                right.id = new_id();
+                right_ids.insert(c.id.clone(), right.id.clone());
+                right.start = at + amount;
+                right.src_in = right_src_in;
+                right.duration = c.end() - at;
+                right.link_id = right_link;
+                right.markers = c.markers.iter().filter(|m| on_right(m)).cloned().collect();
+                out.push(left);
+                out.push(right);
+            } else {
+                let mut c = c;
+                if on_track && c.start >= at - EPS {
+                    c.start += amount;
+                }
+                out.push(c);
+            }
+        }
+        self.clips = out;
+        for tr in &mut self.transitions {
+            if let Some(right) = tr.from_clip_id.as_ref().and_then(|id| right_ids.get(id)) {
+                tr.from_clip_id = Some(right.clone());
+            }
+        }
+    }
+
+    /// Fertige Quell-Clips als Insert- (Ripple) oder Overwrite-Edit setzen.
+    /// `gap_at`/`gap_len` = der von den Clips belegte Sequenzbereich:
+    /// beim Insert die zu öffnende Lücke (auf Ziel- UND Sync-Lock-Spuren),
+    /// beim Overwrite der zu leerende Bereich (nur Zielspuren). Verknüpfung,
+    /// src_in und Marker stecken bereits in `new_clips`. Ein History-Eintrag.
+    pub fn commit_edit(
+        &mut self,
+        new_clips: Vec<TimelineClip>,
+        gap_at: f64,
+        gap_len: f64,
+        ripple: bool,
+    ) {
+        use std::collections::HashSet;
+        if new_clips.is_empty() || gap_len <= EPS {
+            return;
+        }
+        self.push_history();
+        let targets: HashSet<String> = new_clips.iter().map(|c| c.track_id.clone()).collect();
+        if ripple {
+            let mut affected = targets.clone();
+            for t in &self.tracks {
+                if t.sync_lock && !t.locked {
+                    affected.insert(t.id.clone());
+                }
+            }
+            self.open_gap(&affected, gap_at, gap_len);
+        } else {
+            let mut clips = std::mem::take(&mut self.clips);
+            for tid in &targets {
+                clips = overwrite_range(clips, tid, gap_at, gap_at + gap_len);
+            }
+            self.clips = clips;
+        }
+        self.selected_clip_ids = new_clips.iter().map(|c| c.id.clone()).collect();
+        self.clips.extend(new_clips);
+        self.reconcile_transitions();
+    }
+
+    /// Lift (Premiere): den Sequenz-In/Out-Bereich auf allen anvisierten Spuren
+    /// leeren — die Lücke bleibt stehen (kein Ripple). Liefert false, wenn
+    /// nichts zu tun ist. Ein History-Eintrag.
+    pub fn lift_range(&mut self) -> bool {
+        let (Some(a), Some(b)) = (self.in_point, self.out_point) else {
+            return false;
+        };
+        let (a, b) = (a.min(b), a.max(b));
+        if b - a < MIN_CLIP_DURATION {
+            return false;
+        }
+        let targets = self.targeted_track_ids();
+        if targets.is_empty() {
+            return false;
+        }
+        let has_work = self.clips.iter().any(|c| {
+            targets.contains(&c.track_id) && c.start < b - EPS && c.end() > a + EPS
+        });
+        if !has_work {
+            return false;
+        }
+        self.push_history();
+        let mut clips = std::mem::take(&mut self.clips);
+        for tid in &targets {
+            clips = overwrite_range(clips, tid, a, b);
+        }
+        self.clips = clips;
+        self.set_playhead(a);
+        self.prune_selection();
+        self.reconcile_transitions();
+        true
+    }
+
+    /// Extract (Premiere): den Sequenz-In/Out-Bereich auf den anvisierten Spuren
+    /// entfernen UND die Lücke schließen. Sync-Lock-Spuren rippeln mit (ihr
+    /// Material im Bereich wird ebenfalls entfernt, damit der Sync erhalten
+    /// bleibt). Liefert false, wenn nichts zu tun ist. Ein History-Eintrag.
+    pub fn extract_range(&mut self) -> bool {
+        use std::collections::HashSet;
+        let (Some(a), Some(b)) = (self.in_point, self.out_point) else {
+            return false;
+        };
+        let (a, b) = (a.min(b), a.max(b));
+        let d = b - a;
+        if d < MIN_CLIP_DURATION {
+            return false;
+        }
+        let targets = self.targeted_track_ids();
+        if targets.is_empty() {
+            return false;
+        }
+        let mut affected: HashSet<String> = targets;
+        for t in &self.tracks {
+            if t.sync_lock && !t.locked {
+                affected.insert(t.id.clone());
+            }
+        }
+        let has_work = self.clips.iter().any(|c| {
+            affected.contains(&c.track_id)
+                && ((c.start < b - EPS && c.end() > a + EPS) || c.start >= b - EPS)
+        });
+        if !has_work {
+            return false;
+        }
+        self.push_history();
+        let mut clips = std::mem::take(&mut self.clips);
+        for tid in &affected {
+            clips = overwrite_range(clips, tid, a, b);
+        }
+        for c in &mut clips {
+            if affected.contains(&c.track_id) && c.start >= b - EPS {
+                c.start = (c.start - d).max(0.0);
+            }
+        }
+        self.clips = clips;
+        self.set_playhead(a);
+        self.prune_selection();
+        self.reconcile_transitions();
+        true
+    }
+
+    /// Erstes echtes Material-Clip (kein Generator) unter Sequenzzeit `t` auf
+    /// einer Spur der gewünschten Art; optional auf anvisierte Spuren beschränkt.
+    /// Reihenfolge folgt dem Track-Stack (oben zuerst).
+    fn first_clip_at(
+        &self,
+        t: f64,
+        kind: TrackKind,
+        targeted_only: bool,
+    ) -> Option<&TimelineClip> {
+        for track in self.tracks.iter().filter(|tr| tr.kind == kind) {
+            if targeted_only && !track.targeted {
+                continue;
+            }
+            if let Some(c) = self.clips.iter().find(|c| {
+                c.track_id == track.id
+                    && !c.is_generator()
+                    && !c.asset_id.is_empty()
+                    && c.start <= t + EPS
+                    && c.end() > t - EPS
+            }) {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// Match Frame: Quelle (asset_id) und exakte Medienzeit unter dem Playhead.
+    /// Bevorzugt anvisierte Video-, dann anvisierte Audio-, dann beliebige
+    /// Video-/Audiospuren (oberste Ebene mit Material).
+    pub fn match_frame_source(&self, t: f64) -> Option<(String, f64)> {
+        let clip = self
+            .first_clip_at(t, TrackKind::Video, true)
+            .or_else(|| self.first_clip_at(t, TrackKind::Audio, true))
+            .or_else(|| self.first_clip_at(t, TrackKind::Video, false))
+            .or_else(|| self.first_clip_at(t, TrackKind::Audio, false))?;
+        Some((clip.asset_id.clone(), clip.media_time_at(t)))
     }
 
     /// Bewusst keine Link-Expansion: die Auswahl ist bereits expandiert,
@@ -1729,6 +2416,20 @@ impl TimelineStore {
             let mut left = c.clone();
             left.src_in = left_src_in;
             left.duration = left_len;
+            // Clip-Marker an der Schnittkante (Medienzeit) auf die Hälften
+            // aufteilen — jede Hälfte behält die Marker ihres Quellausschnitts.
+            let cut_media = c.media_time_at(time);
+            let on_right = |m: &Marker| -> bool {
+                if c.freeze {
+                    false
+                } else if c.reverse {
+                    m.time <= cut_media
+                } else {
+                    m.time >= cut_media
+                }
+            };
+            right.markers = c.markers.iter().filter(|m| on_right(m)).cloned().collect();
+            left.markers = c.markers.iter().filter(|m| !on_right(m)).cloned().collect();
             if self.selected_clip_ids.contains(&c.id) {
                 new_selection.push(left.id.clone());
                 new_selection.push(right.id.clone());
@@ -2104,6 +2805,7 @@ impl TimelineStore {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         };
         let id = clip.id.clone();
         self.selected_clip_ids = vec![id.clone()];
@@ -2259,6 +2961,7 @@ impl TimelineStore {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         }
     }
 
@@ -2905,6 +3608,23 @@ impl TimelineStore {
         clip.effects.swap(idx, new_idx as usize);
     }
 
+    /// Effekt an eine Zielposition im Stapel ziehen (Drag-to-Reorder): `dest`
+    /// = gewünschter Index NACH dem Entfernen (geklemmt). No-op ohne Bewegung.
+    pub fn effects_reorder(&mut self, clip_id: &str, fx_id: &str, dest: usize) {
+        let Some(clip) = self.clip(clip_id) else { return };
+        let Some(cur) = clip.effects.iter().position(|e| e.id == fx_id) else {
+            return;
+        };
+        let dest = dest.min(clip.effects.len().saturating_sub(1));
+        if dest == cur || self.fx_clip_mut(clip_id).is_none() {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(clip_id).expect("clip nach Snapshot");
+        let inst = clip.effects.remove(cur);
+        clip.effects.insert(dest.min(clip.effects.len()), inst);
+    }
+
     /// Bypass eines Effekts umschalten (Werte bleiben erhalten).
     pub fn effects_toggle_enabled(&mut self, clip_id: &str, fx_id: &str) {
         let exists = self
@@ -2933,6 +3653,165 @@ impl TimelineStore {
         if let Some(e) = clip.effects.iter_mut().find(|e| e.id == fx_id) {
             e.reset();
         }
+    }
+
+    // -------------------------------------------------- Spur-Effekte (Bus)
+
+    /// Index einer editierbaren (entsperrten) Audio-Spur.
+    fn track_audio_idx(&self, track_id: &str) -> Option<usize> {
+        self.tracks
+            .iter()
+            .position(|t| t.id == track_id && t.kind == TrackKind::Audio && !t.locked)
+    }
+
+    fn track_idx(&self, track_id: &str) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == track_id)
+    }
+
+    /// Audio-Effekt an die Bus-Kette der Spur anhängen.
+    pub fn track_effects_add(&mut self, track_id: &str, kind: EffectKind) -> bool {
+        if !kind.is_audio() || self.track_audio_idx(track_id).is_none() {
+            return false;
+        }
+        self.push_history();
+        let i = self.track_audio_idx(track_id).expect("Spur nach Snapshot");
+        self.tracks[i].effects.push(EffectInstance::new(kind));
+        true
+    }
+
+    pub fn track_effects_remove(&mut self, track_id: &str, fx_id: &str) {
+        let Some(i) = self.track_audio_idx(track_id) else {
+            return;
+        };
+        if !self.tracks[i].effects.iter().any(|e| e.id == fx_id) {
+            return;
+        }
+        self.push_history();
+        self.tracks[i].effects.retain(|e| e.id != fx_id);
+    }
+
+    pub fn track_effects_move(&mut self, track_id: &str, fx_id: &str, delta: i32) {
+        let Some(i) = self.track_audio_idx(track_id) else {
+            return;
+        };
+        let Some(idx) = self.tracks[i].effects.iter().position(|e| e.id == fx_id) else {
+            return;
+        };
+        let new_idx = idx as i32 + delta;
+        if new_idx < 0 || new_idx >= self.tracks[i].effects.len() as i32 {
+            return;
+        }
+        self.push_history();
+        self.tracks[i].effects.swap(idx, new_idx as usize);
+    }
+
+    pub fn track_effects_toggle_enabled(&mut self, track_id: &str, fx_id: &str) {
+        let Some(i) = self.track_audio_idx(track_id) else {
+            return;
+        };
+        if !self.tracks[i].effects.iter().any(|e| e.id == fx_id) {
+            return;
+        }
+        self.push_history();
+        if let Some(e) = self.tracks[i].effects.iter_mut().find(|e| e.id == fx_id) {
+            e.enabled = !e.enabled;
+        }
+    }
+
+    pub fn track_effects_reset(&mut self, track_id: &str, fx_id: &str) {
+        let Some(i) = self.track_audio_idx(track_id) else {
+            return;
+        };
+        if !self.tracks[i].effects.iter().any(|e| e.id == fx_id) {
+            return;
+        }
+        self.push_history();
+        if let Some(e) = self.tracks[i].effects.iter_mut().find(|e| e.id == fx_id) {
+            e.reset();
+        }
+    }
+
+    // --------------------------------------------------- Spur-Automation
+    // Lautstärke/Pan als Keyframe-Kurven über die SEQUENZZEIT (anders als
+    // Clip-Keyframes, die in Medienzeit kleben). Diskrete Punkt-Operationen
+    // legen einen Undo-Snapshot an; Drag-Gesten nutzen `begin_mix_edit` +
+    // die `*_live`-Varianten (ein Snapshot pro Geste).
+
+    pub fn track_auto_add_point(
+        &mut self,
+        track_id: &str,
+        param: TrackAutoParam,
+        t: f64,
+        value: f64,
+    ) {
+        let Some(i) = self.track_idx(track_id) else {
+            return;
+        };
+        self.push_history();
+        self.tracks[i].auto_param_mut(param).upsert_key(t.max(0.0), value);
+    }
+
+    pub fn track_auto_remove_point(&mut self, track_id: &str, param: TrackAutoParam, t: f64) {
+        let Some(i) = self.track_idx(track_id) else {
+            return;
+        };
+        if self.tracks[i].auto_param(param).key_index_at(t).is_none() {
+            return;
+        }
+        self.push_history();
+        self.tracks[i].auto_param_mut(param).remove_key_at(t);
+    }
+
+    pub fn track_auto_clear(&mut self, track_id: &str, param: TrackAutoParam) {
+        let Some(i) = self.track_idx(track_id) else {
+            return;
+        };
+        if !self.tracks[i].auto_param(param).is_animated() {
+            return;
+        }
+        self.push_history();
+        self.tracks[i].auto_param_mut(param).keyframes.clear();
+    }
+
+    /// Lautstärke- und Pan-Automation der anvisierten Audio-Spuren löschen
+    /// (ohne Targeting: aller Audio-Spuren) — ein Undo-Schritt. Command-Ziel.
+    pub fn clear_track_automation_targeted(&mut self) {
+        let any_targeted = self
+            .tracks
+            .iter()
+            .any(|t| t.kind == TrackKind::Audio && t.targeted);
+        let idxs: Vec<usize> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.kind == TrackKind::Audio
+                    && (!any_targeted || t.targeted)
+                    && t.has_automation()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if idxs.is_empty() {
+            return;
+        }
+        self.push_history();
+        for i in idxs {
+            self.tracks[i].volume_auto.keyframes.clear();
+            self.tracks[i].pan_auto.keyframes.clear();
+        }
+    }
+
+    /// Ganze Kurve ohne History ersetzen (Punkt-Drag in Zeit + Wert).
+    pub fn track_auto_replace_live(
+        &mut self,
+        track_id: &str,
+        param: TrackAutoParam,
+        keys: Vec<Keyframe>,
+    ) {
+        let Some(i) = self.track_idx(track_id) else {
+            return;
+        };
+        self.tracks[i].auto_param_mut(param).replace_keys(keys);
     }
 
     /// Alle Effekte der Clips entfernen.
@@ -3092,6 +3971,7 @@ impl TimelineStore {
                 tracks: std::mem::replace(&mut self.tracks, prev.tracks),
                 clips: std::mem::replace(&mut self.clips, prev.clips),
                 transitions: std::mem::replace(&mut self.transitions, prev.transitions),
+                markers: std::mem::replace(&mut self.markers, prev.markers),
                 master_gain_db: std::mem::replace(&mut self.master_gain_db, prev.master_gain_db),
             },
         );
@@ -3109,6 +3989,7 @@ impl TimelineStore {
             tracks: std::mem::replace(&mut self.tracks, next.tracks),
             clips: std::mem::replace(&mut self.clips, next.clips),
             transitions: std::mem::replace(&mut self.transitions, next.transitions),
+            markers: std::mem::replace(&mut self.markers, next.markers),
             master_gain_db: std::mem::replace(&mut self.master_gain_db, next.master_gain_db),
         });
         self.prune_selection();
@@ -3526,6 +4407,7 @@ mod tests {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         }
     }
 
@@ -3536,6 +4418,194 @@ mod tests {
             .filter(|t| t.kind == kind)
             .map(|t| t.id.clone())
             .collect()
+    }
+
+    fn placed_clip(track_id: &str, kind: TrackKind, start: f64, duration: f64, src_in: f64) -> TimelineClip {
+        let mut c = test_clip(track_id, kind, start, duration);
+        c.src_in = src_in;
+        c.src_duration = 1000.0;
+        c
+    }
+
+    /// Clips einer Spur nach Startzeit sortiert.
+    fn clips_on(store: &TimelineStore, track_id: &str) -> Vec<TimelineClip> {
+        let mut v: Vec<TimelineClip> = store
+            .clips
+            .iter()
+            .filter(|c| c.track_id == track_id)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.start.total_cmp(&b.start));
+        v
+    }
+
+    #[test]
+    fn commit_edit_insert_splits_clip_at_insert_point() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        // 4-s-Clip bei t=5 einfügen (Ripple).
+        let new = placed_clip(&v1, TrackKind::Video, 5.0, 4.0, 0.0);
+        store.commit_edit(vec![new], 5.0, 4.0, true);
+        let on_v1 = clips_on(&store, &v1);
+        assert_eq!(on_v1.len(), 3, "Split + eingefügter Clip");
+        // Linke Hälfte [0,5), neuer Clip [5,9), rechte Hälfte verschoben [9,14).
+        assert!((on_v1[0].start - 0.0).abs() < 1e-6 && (on_v1[0].duration - 5.0).abs() < 1e-6);
+        assert!((on_v1[1].start - 5.0).abs() < 1e-6 && (on_v1[1].duration - 4.0).abs() < 1e-6);
+        assert!((on_v1[2].start - 9.0).abs() < 1e-6 && (on_v1[2].duration - 5.0).abs() < 1e-6);
+        // Rechte Hälfte trägt den Medien-Versatz weiter (src_in = 5).
+        assert!((on_v1[2].src_in - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn commit_edit_overwrite_replaces_range() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        let new = placed_clip(&v1, TrackKind::Video, 5.0, 4.0, 0.0);
+        store.commit_edit(vec![new], 5.0, 4.0, false);
+        let on_v1 = clips_on(&store, &v1);
+        assert_eq!(on_v1.len(), 3);
+        // [0,5) bleibt, [5,9) ist neu, [9,10) Rest — keine Verschiebung.
+        assert!((on_v1[0].duration - 5.0).abs() < 1e-6);
+        assert!((on_v1[1].start - 5.0).abs() < 1e-6 && (on_v1[1].duration - 4.0).abs() < 1e-6);
+        assert!((on_v1[2].start - 9.0).abs() < 1e-6 && (on_v1[2].duration - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn insert_ripples_sync_locked_track_only() {
+        // V1 + A1 je ein 10-s-Clip; A1 mit Sync-Lock, A2 ohne.
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let audios = track_ids(&store, TrackKind::Audio);
+        let (a1, a2) = (audios[0].clone(), audios[1].clone());
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.clips.push(placed_clip(&a1, TrackKind::Audio, 0.0, 10.0, 0.0));
+        store.clips.push(placed_clip(&a2, TrackKind::Audio, 0.0, 10.0, 0.0));
+        // A1 sync-locked, A2 nicht.
+        store.toggle_track_flag(&a1, TrackFlag::SyncLock);
+
+        let new = placed_clip(&v1, TrackKind::Video, 2.0, 4.0, 0.0);
+        store.commit_edit(vec![new], 2.0, 4.0, true);
+
+        // A1 rippelt mit: Split bei 2 → [0,2) + [6,14) (Lücke [2,6)).
+        let on_a1 = clips_on(&store, &a1);
+        assert_eq!(on_a1.len(), 2, "Sync-Lock-Spur wird geteilt");
+        assert!((on_a1[0].duration - 2.0).abs() < 1e-6);
+        assert!((on_a1[1].start - 6.0).abs() < 1e-6);
+        // A2 bleibt unangetastet (kein Sync-Lock).
+        let on_a2 = clips_on(&store, &a2);
+        assert_eq!(on_a2.len(), 1);
+        assert!((on_a2[0].start - 0.0).abs() < 1e-6 && (on_a2[0].duration - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lift_clears_targeted_range_and_keeps_gap() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.set_in_out_range(3.0, 7.0);
+        assert!(store.lift_range());
+        let on_v1 = clips_on(&store, &v1);
+        assert_eq!(on_v1.len(), 2, "Lücke bleibt stehen");
+        assert!((on_v1[0].duration - 3.0).abs() < 1e-6);
+        assert!((on_v1[1].start - 7.0).abs() < 1e-6 && (on_v1[1].duration - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extract_removes_range_and_ripples_left() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.set_in_out_range(3.0, 7.0);
+        assert!(store.extract_range());
+        let on_v1 = clips_on(&store, &v1);
+        assert_eq!(on_v1.len(), 2);
+        // [0,3) bleibt, [7,10) rückt auf [3,6).
+        assert!((on_v1[0].duration - 3.0).abs() < 1e-6);
+        assert!((on_v1[1].start - 3.0).abs() < 1e-6 && (on_v1[1].duration - 3.0).abs() < 1e-6);
+        assert!((store.playhead_sec - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extract_sync_lock_keeps_other_track_in_sync() {
+        // V1 (targeted) + A1 (nur sync-locked, NICHT targeted).
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let a1 = track_ids(&store, TrackKind::Audio)[0].clone();
+        // A1 von Targeting befreien, dafür Sync-Lock.
+        if let Some(t) = store.tracks.iter_mut().find(|t| t.id == a1) {
+            t.targeted = false;
+            t.sync_lock = true;
+        }
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.clips.push(placed_clip(&a1, TrackKind::Audio, 0.0, 10.0, 0.0));
+        store.set_in_out_range(3.0, 7.0);
+        assert!(store.extract_range());
+        // Beide Spuren verlieren [3,7) und schließen die Lücke.
+        for tid in [&v1, &a1] {
+            let on = clips_on(&store, tid);
+            assert_eq!(on.len(), 2, "Spur {tid} extrahiert + rippelt");
+            assert!((on[0].duration - 3.0).abs() < 1e-6);
+            assert!((on[1].start - 3.0).abs() < 1e-6 && (on[1].duration - 3.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn source_patch_is_radio_per_kind() {
+        let mut store = TimelineStore::default();
+        let videos = track_ids(&store, TrackKind::Video);
+        // Standard: V1 (idx 1) gepatcht.
+        assert_eq!(store.source_patch_track(TrackKind::Video), Some(videos[1].as_str()));
+        // Auf V2 (idx 0) umschalten → V1 verliert den Patch.
+        store.toggle_source_patch(&videos[0]);
+        assert_eq!(store.source_patch_track(TrackKind::Video), Some(videos[0].as_str()));
+        assert!(!store.tracks.iter().find(|t| t.id == videos[1]).unwrap().source_patched);
+        // Erneut V2 klicken → Patch aus (kein Ziel mehr).
+        store.toggle_source_patch(&videos[0]);
+        assert_eq!(store.source_patch_track(TrackKind::Video), None);
+    }
+
+    #[test]
+    fn ensure_patch_target_defaults_picks_v1_a1() {
+        let mut store = TimelineStore::default();
+        // Alle Flags löschen (Altprojekt-Zustand).
+        for t in &mut store.tracks {
+            t.source_patched = false;
+            t.targeted = false;
+        }
+        store.ensure_patch_target_defaults();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let a1 = track_ids(&store, TrackKind::Audio)[0].clone();
+        assert_eq!(store.source_patch_track(TrackKind::Video), Some(v1.as_str()));
+        assert_eq!(store.source_patch_track(TrackKind::Audio), Some(a1.as_str()));
+        assert!(store.tracks.iter().find(|t| t.id == v1).unwrap().targeted);
+        assert!(store.tracks.iter().find(|t| t.id == a1).unwrap().targeted);
+    }
+
+    #[test]
+    fn match_frame_source_maps_media_time_on_targeted_track() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        // Clip bei [4,14) mit src_in=2 → bei Sequenzzeit 6 ist Medienzeit 4.
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 4.0, 10.0, 2.0));
+        let (asset, media_t) = store.match_frame_source(6.0).expect("Clip am Playhead");
+        assert_eq!(asset, "asset");
+        assert!((media_t - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn commit_edit_is_single_undo_step() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        let before = store.clips.len();
+        let new = placed_clip(&v1, TrackKind::Video, 5.0, 4.0, 0.0);
+        store.commit_edit(vec![new], 5.0, 4.0, true);
+        assert!(store.can_undo());
+        store.undo();
+        assert_eq!(store.clips.len(), before, "ein Undo stellt den Ausgangszustand her");
+        assert_eq!(clips_on(&store, &v1).len(), 1);
     }
 
     #[test]
@@ -3789,6 +4859,137 @@ mod tests {
         assert_eq!(store.clip(&vid).unwrap().effects.len(), 1);
         store.undo();
         assert_eq!(store.clip(&vid).unwrap().effects.len(), 2);
+    }
+
+    // ---------------------------------------------- Spur-Effekte/Automation
+
+    #[test]
+    fn track_effects_chain_with_undo_and_locking() {
+        let mut store = TimelineStore::default();
+        let a1 = track_ids(&store, TrackKind::Audio)[0].clone();
+        // Nur Audio-Effekte auf Audio-Spuren.
+        assert!(!store.track_effects_add(&a1, EffectKind::GaussianBlur));
+        assert!(store.track_effects_add(&a1, EffectKind::Equalizer));
+        assert!(store.track_effects_add(&a1, EffectKind::Limiter));
+        let fx: Vec<String> = store
+            .tracks
+            .iter()
+            .find(|t| t.id == a1)
+            .unwrap()
+            .effects
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(fx.len(), 2);
+        // Reorder: Limiter nach oben.
+        store.track_effects_move(&a1, &fx[1], -1);
+        assert_eq!(
+            store.tracks.iter().find(|t| t.id == a1).unwrap().effects[0].id,
+            fx[1]
+        );
+        // Bypass.
+        store.track_effects_toggle_enabled(&a1, &fx[0]);
+        assert!(!store
+            .tracks
+            .iter()
+            .find(|t| t.id == a1)
+            .unwrap()
+            .effects
+            .iter()
+            .find(|e| e.id == fx[0])
+            .unwrap()
+            .enabled);
+        // Entfernen + Undo.
+        store.track_effects_remove(&a1, &fx[0]);
+        assert_eq!(store.tracks.iter().find(|t| t.id == a1).unwrap().effects.len(), 1);
+        store.undo();
+        assert_eq!(store.tracks.iter().find(|t| t.id == a1).unwrap().effects.len(), 2);
+        // Gesperrte Spur: kein Add.
+        let idx = store.tracks.iter().position(|t| t.id == a1).unwrap();
+        store.tracks[idx].locked = true;
+        assert!(!store.track_effects_add(&a1, EffectKind::Compressor));
+    }
+
+    #[test]
+    fn track_automation_interpolates_and_is_undoable() {
+        let mut store = TimelineStore::default();
+        let a1 = track_ids(&store, TrackKind::Audio)[0].clone();
+        store.track_auto_add_point(&a1, TrackAutoParam::Volume, 0.0, 0.0);
+        store.track_auto_add_point(&a1, TrackAutoParam::Volume, 4.0, 6.0);
+        store.set_track_gain_db(&a1, -3.0);
+        let tr = store.tracks.iter().find(|t| t.id == a1).unwrap();
+        assert!(tr.has_automation());
+        assert!((tr.gain_db_at(0.0) - (-3.0)).abs() < 1e-9);
+        assert!((tr.gain_db_at(2.0)).abs() < 1e-9, "Mitte: -3 + 3 = 0");
+        assert!((tr.gain_db_at(4.0) - 3.0).abs() < 1e-9);
+        // Pan-Automation.
+        store.track_auto_add_point(&a1, TrackAutoParam::Pan, 0.0, 0.0);
+        store.track_auto_add_point(&a1, TrackAutoParam::Pan, 2.0, 1.0);
+        let tr = store.tracks.iter().find(|t| t.id == a1).unwrap();
+        assert!((tr.pan_at(1.0) - 0.5).abs() < 1e-9, "Mitte 0..1 → 0.5");
+        // Fader-Offset + Clamp auf [−1, 1].
+        store.set_track_pan(&a1, 0.5);
+        let tr = store.tracks.iter().find(|t| t.id == a1).unwrap();
+        assert!((tr.pan_at(2.0) - 1.0).abs() < 1e-9, "0.5 + 1.0 → clamp 1.0");
+        // Undo des letzten Punkt-Adds.
+        store.undo();
+        assert!(store
+            .tracks
+            .iter()
+            .find(|t| t.id == a1)
+            .unwrap()
+            .pan_auto
+            .key_index_at(2.0)
+            .is_none());
+    }
+
+    #[test]
+    fn track_serde_roundtrip_preserves_fx_and_automation() {
+        let mut store = TimelineStore::default();
+        let a1 = track_ids(&store, TrackKind::Audio)[0].clone();
+        store.track_effects_add(&a1, EffectKind::Equalizer);
+        store.track_auto_add_point(&a1, TrackAutoParam::Volume, 1.0, 4.0);
+        let track = store.tracks.iter().find(|t| t.id == a1).unwrap().clone();
+        let json = serde_json::to_string(&track).unwrap();
+        let back: TimelineTrack = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.effects.len(), 1);
+        assert_eq!(back.effects[0].kind, EffectKind::Equalizer);
+        assert!(back.volume_auto.is_animated());
+        // Standardspur bleibt schlank (keine neuen Felder im JSON).
+        let plain = serde_json::to_string(&make_track(TrackKind::Audio)).unwrap();
+        assert!(!plain.contains("effects"), "leere FX-Liste nicht serialisiert");
+        assert!(!plain.contains("volumeAuto"), "Null-Automation nicht serialisiert");
+    }
+
+    #[test]
+    fn effects_reorder_moves_to_index_with_undo() {
+        let (mut store, vid, _) = store_with_av_pair();
+        store.effects_add(&vid, EffectKind::GaussianBlur);
+        store.effects_add(&vid, EffectKind::Invert);
+        store.effects_add(&vid, EffectKind::Sharpen);
+        let ids: Vec<String> = store
+            .clip(&vid)
+            .unwrap()
+            .effects
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        // Letzten (Sharpen) an Position 0 ziehen.
+        store.effects_reorder(&vid, &ids[2], 0);
+        let order: Vec<String> = store
+            .clip(&vid)
+            .unwrap()
+            .effects
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(order, vec![ids[2].clone(), ids[0].clone(), ids[1].clone()]);
+        store.undo();
+        assert_eq!(store.clip(&vid).unwrap().effects[2].id, ids[2]);
+        // No-op an gleiche Position: kein Undo-Eintrag.
+        let rev = store.revision;
+        store.effects_reorder(&vid, &ids[0], 0);
+        assert_eq!(store.revision, rev);
     }
 
     #[test]
@@ -4631,6 +5832,183 @@ mod tests {
         assert_eq!(c.speed_label().as_deref(), Some("−100 %"));
         c.freeze = true;
         assert_eq!(c.speed_label().as_deref(), Some("Standbild"));
+    }
+
+    // ------------------------------------------------------------ Marker
+
+    #[test]
+    fn marker_add_is_frame_snapped_and_idempotent() {
+        let mut store = TimelineStore::default(); // 25 fps ⇒ 0,04 s/Frame
+        let id1 = store.add_marker_at(0.41); // Frame 10 → 0,40 s
+        assert_eq!(store.markers.len(), 1);
+        assert!((store.markers[0].time - 0.40).abs() < 1e-9, "frame-gerastet");
+        // Erneut im selben Frame (0,405 → Frame 10): kein zweiter Marker.
+        let id2 = store.add_marker_at(0.405);
+        assert_eq!(store.markers.len(), 1);
+        assert_eq!(id1, id2);
+        // Anderer Frame: neuer Marker, Liste bleibt sortiert.
+        store.add_marker_at(0.10);
+        assert_eq!(store.markers.len(), 2);
+        assert!(store.markers[0].time < store.markers[1].time);
+    }
+
+    #[test]
+    fn marker_navigation_handles_edges() {
+        let mut store = TimelineStore::default();
+        // Keine Marker: Navigation bewegt nichts.
+        store.playhead_sec = 5.0;
+        assert!(!store.go_to_next_marker());
+        assert!(!store.go_to_prev_marker());
+        assert_eq!(store.playhead_sec, 5.0);
+
+        for t in [1.0, 2.0, 3.0] {
+            store.add_marker_at(t);
+        }
+        // Vor dem ersten: prev findet nichts, next springt auf 1,0.
+        store.playhead_sec = 0.0;
+        assert!(!store.go_to_prev_marker());
+        assert!(store.go_to_next_marker());
+        assert!((store.playhead_sec - 1.0).abs() < 1e-9);
+        // Exakt auf einem Marker: next/prev springen zum Nachbarn, nicht
+        // zum eigenen Frame.
+        store.playhead_sec = 2.0;
+        assert!(store.go_to_next_marker());
+        assert!((store.playhead_sec - 3.0).abs() < 1e-9);
+        store.playhead_sec = 2.0;
+        assert!(store.go_to_prev_marker());
+        assert!((store.playhead_sec - 1.0).abs() < 1e-9);
+        // Hinter dem letzten: next findet nichts.
+        store.playhead_sec = 9.0;
+        assert!(!store.go_to_next_marker());
+    }
+
+    #[test]
+    fn marker_undo_redo_roundtrip() {
+        use crate::core::marker::MarkerColor;
+        let mut store = TimelineStore::default();
+        let id = store.add_marker_at(2.0);
+        store.marker_update(&id, |m| {
+            m.name = "Take 1".into();
+            m.color = MarkerColor::Red;
+        });
+        assert_eq!(store.markers[0].name, "Take 1");
+        store.undo(); // Name/Farbe zurück
+        assert_eq!(store.markers[0].name, "");
+        store.undo(); // Marker weg
+        assert!(store.markers.is_empty());
+        store.redo();
+        assert_eq!(store.markers.len(), 1);
+        store.redo();
+        assert_eq!(store.markers[0].name, "Take 1");
+    }
+
+    #[test]
+    fn clip_marker_split_partitions_by_media_time() {
+        let mut store = TimelineStore::default();
+        let v = track_ids(&store, TrackKind::Video)[1].clone();
+        // Clip 0–10 s, Quelle ab 0, 1× Tempo: Medienzeit == Sequenzzeit.
+        let mut clip = test_clip(&v, TrackKind::Video, 0.0, 10.0);
+        clip.src_duration = 30.0;
+        clip.markers = vec![Marker::new(2.0), Marker::new(7.0)];
+        let cid = clip.id.clone();
+        store.clips.push(clip);
+        // Bei Sequenzzeit 5 schneiden.
+        store.split_at(5.0, Some(&[cid.clone()]));
+        let left = store.clips.iter().find(|c| c.id == cid).unwrap();
+        let right = store.clips.iter().find(|c| c.id != cid).unwrap();
+        assert_eq!(left.markers.len(), 1, "linke Hälfte behält Marker < Schnitt");
+        assert!((left.markers[0].time - 2.0).abs() < 1e-9);
+        assert_eq!(right.markers.len(), 1, "rechte Hälfte behält Marker ≥ Schnitt");
+        assert!((right.markers[0].time - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clip_marker_anchors_to_media_through_trim_and_move() {
+        let mut store = TimelineStore::default();
+        let v = track_ids(&store, TrackKind::Video)[1].clone();
+        let mut clip = test_clip(&v, TrackKind::Video, 4.0, 10.0);
+        clip.src_in = 0.0;
+        clip.src_duration = 30.0;
+        // Marker bei Medienzeit 3 ⇒ Sequenzzeit 4+3 = 7.
+        clip.markers = vec![Marker::new(3.0)];
+        let cid = clip.id.clone();
+        store.clips.push(clip);
+        let seq0 = store.clip(&cid).unwrap().visible_markers().next().unwrap().0;
+        assert!((seq0 - 7.0).abs() < 1e-9);
+
+        // Kopf um 2 s trimmen (src_in → 2, start → 6): Medienzeit bleibt 3,
+        // Sequenzposition wandert auf 6 + (3−2) = 7? Nein: media 3, src_in 2,
+        // off = 3−2 = 1, seq = 6+1 = 7 bleibt gleich — der Marker hängt am
+        // Frame, nicht an der Clipkante.
+        store.trim_clip(&cid, TrimEdge::Start, 2.0);
+        let c = store.clip(&cid).unwrap();
+        assert!((c.src_in - 2.0).abs() < 1e-9);
+        assert_eq!(c.markers.len(), 1, "Marker bleibt erhalten");
+        assert!((c.markers[0].time - 3.0).abs() < 1e-9, "Medienzeit unverändert");
+        let seq1 = c.visible_markers().next().unwrap().0;
+        assert!((seq1 - 7.0).abs() < 1e-9, "Frame-Position stabil: {seq1}");
+
+        // Clip um +3 s verschieben (start 6 → 9): Medienzeit bleibt, die
+        // Sequenzposition wandert mit dem Clip auf 10.
+        store.move_clips(&[cid.clone()], 3.0, 0);
+        let c = store.clip(&cid).unwrap();
+        assert!((c.markers[0].time - 3.0).abs() < 1e-9);
+        let seq2 = c.visible_markers().next().unwrap().0;
+        assert!((seq2 - 10.0).abs() < 1e-9, "wandert mit dem Clip: {seq2}");
+    }
+
+    #[test]
+    fn insert_copies_asset_markers_into_clip() {
+        let mut store = TimelineStore::default();
+        let mut asset = MediaAsset {
+            id: "a1".into(),
+            path: "/tmp/x.mp4".into(),
+            name: "x.mp4".into(),
+            kind: MediaKind::Video,
+            info: crate::core::types::MediaInfo {
+                path: "/tmp/x.mp4".into(),
+                file_name: "x.mp4".into(),
+                container: "mp4".into(),
+                duration_sec: 10.0,
+                size_bytes: 1,
+                video: Vec::new(),
+                audio: Vec::new(),
+            },
+            thumbnail_path: None,
+            imported_at: 0.0,
+            offline: false,
+            markers: vec![Marker::new(2.0), Marker::new(8.0)],
+        };
+        asset.markers[0].name = "Beat".into();
+        let assets = vec![asset];
+        store.insert_assets(&assets, &["a1".into()], 0.0, None);
+        let clip = store
+            .clips
+            .iter()
+            .find(|c| c.asset_id == "a1")
+            .expect("Clip eingefügt");
+        // Beide Asset-Marker fallen in [0, 10] ⇒ als Clip-Marker kopiert,
+        // mit frischen IDs (kein Verweis auf die Asset-Marker-IDs).
+        assert_eq!(clip.markers.len(), 2);
+        assert!(clip.markers.iter().any(|m| m.name == "Beat"));
+        assert!(clip.markers.iter().all(|m| m.id != "" ));
+    }
+
+    #[test]
+    fn clip_marker_outside_view_is_hidden_but_kept() {
+        let mut store = TimelineStore::default();
+        let v = track_ids(&store, TrackKind::Video)[1].clone();
+        let mut clip = test_clip(&v, TrackKind::Video, 0.0, 5.0);
+        clip.src_in = 2.0;
+        clip.src_duration = 30.0;
+        // Marker bei Medienzeit 1 liegt VOR src_in (weggetrimmt).
+        clip.markers = vec![Marker::new(1.0), Marker::new(3.0)];
+        let cid = clip.id.clone();
+        store.clips.push(clip);
+        let c = store.clip(&cid).unwrap();
+        // Beide bleiben gespeichert, nur einer ist sichtbar.
+        assert_eq!(c.markers.len(), 2);
+        assert_eq!(c.visible_markers().count(), 1);
     }
 }
 

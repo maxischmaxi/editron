@@ -10,6 +10,23 @@ pub static ICON_DATA: &[(&str, &[E])] = &[
     ("audio-waveform", &[E::Path("M2 13a2 2 0 0 0 2-2V7a2 2 0 0 1 4 0v13a2 2 0 0 0 4 0V4a2 2 0 0 1 4 0v13a2 2 0 0 0 4 0v-4a2 2 0 0 1 2-2")]),
     ("ban", &[E::Circle(12f32, 12f32, 10f32), E::Path("M4.929 4.929 19.07 19.071")]),
     ("blend", &[E::Circle(9f32, 9f32, 7f32), E::Circle(15f32, 15f32, 7f32)]),
+    ("bookmark", &[E::Path("m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z")]),
+    (
+        "bookmark-plus",
+        &[
+            E::Path("m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"),
+            E::Line(12f32, 7f32, 12f32, 13f32),
+            E::Line(15f32, 10f32, 9f32, 10f32),
+        ],
+    ),
+    ("filter", &[E::Polygon("22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3")]),
+    (
+        "flag",
+        &[
+            E::Path("M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"),
+            E::Line(4f32, 22f32, 4f32, 15f32),
+        ],
+    ),
     ("captions", &[E::Rect(3f32, 5f32, 18f32, 14f32, 2f32), E::Path("M7 15h4"), E::Path("M15 15h2"), E::Path("M7 11h2"), E::Path("M13 11h4")]),
     ("check", &[E::Path("M20 6 9 17l-5-5")]),
     ("chevrons-left-right", &[E::Path("m9 7-5 5 5 5"), E::Path("m15 7 5 5-5 5")]),

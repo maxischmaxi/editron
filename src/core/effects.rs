@@ -36,6 +36,10 @@ pub enum EffectKind {
     // ---- Audio ----
     Equalizer,
     Compressor,
+    Limiter,
+    Highpass,
+    Lowpass,
+    Gain,
     Reverb,
     NoiseGate,
     Delay,
@@ -162,6 +166,11 @@ const fn no_decimals(mut s: EffectParamSpec) -> EffectParamSpec {
     s
 }
 
+const fn dec2(mut s: EffectParamSpec) -> EffectParamSpec {
+    s.decimals = 2;
+    s
+}
+
 static SPECS_GAUSSIAN_BLUR: [EffectParamSpec; 1] =
     [slider("strength", "Stärke", "", 0.0, 100.0, 10.0, 0.25)];
 static SPECS_SHARPEN: [EffectParamSpec; 1] =
@@ -209,11 +218,22 @@ static SPECS_BRIGHTNESS_CONTRAST: [EffectParamSpec; 2] = [
     slider("brightness", "Helligkeit", "", -100.0, 100.0, 0.0, 0.5),
     slider("contrast", "Kontrast", "", -100.0, 100.0, 0.0, 0.5),
 ];
-static SPECS_EQUALIZER: [EffectParamSpec; 4] = [
-    slider("low", "Tiefen (120 Hz)", "dB", -24.0, 24.0, 0.0, 0.1),
-    slider("mid", "Mitten", "dB", -24.0, 24.0, 0.0, 0.1),
-    no_decimals(slider("midFreq", "Mitten-Frequenz", "Hz", 200.0, 8000.0, 1000.0, 10.0)),
-    slider("high", "Höhen (8 kHz)", "dB", -24.0, 24.0, 0.0, 0.1),
+// Parametrischer 4-Band-EQ: je Band Frequenz/Gain/Güte. Band 0 = Low-Shelf,
+// 1+2 = Glocken, 3 = High-Shelf (Reihenfolge ist DSP- und kurvenbindend,
+// siehe `audio_fx::eq_band_biquads`).
+static SPECS_EQUALIZER: [EffectParamSpec; 12] = [
+    no_decimals(slider("lowFreq", "Tiefen-Frequenz", "Hz", 20.0, 500.0, 100.0, 1.0)),
+    slider("lowGain", "Tiefen", "dB", -18.0, 18.0, 0.0, 0.1),
+    dec2(slider("lowQ", "Tiefen-Güte", "", 0.3, 3.0, 0.71, 0.01)),
+    no_decimals(slider("mid1Freq", "Mitte 1 — Frequenz", "Hz", 40.0, 2000.0, 250.0, 2.0)),
+    slider("mid1Gain", "Mitte 1 — Gain", "dB", -18.0, 18.0, 0.0, 0.1),
+    dec2(slider("mid1Q", "Mitte 1 — Güte", "", 0.2, 10.0, 1.0, 0.02)),
+    no_decimals(slider("mid2Freq", "Mitte 2 — Frequenz", "Hz", 200.0, 8000.0, 2000.0, 5.0)),
+    slider("mid2Gain", "Mitte 2 — Gain", "dB", -18.0, 18.0, 0.0, 0.1),
+    dec2(slider("mid2Q", "Mitte 2 — Güte", "", 0.2, 10.0, 1.0, 0.02)),
+    no_decimals(slider("highFreq", "Höhen-Frequenz", "Hz", 1000.0, 20000.0, 8000.0, 10.0)),
+    slider("highGain", "Höhen", "dB", -18.0, 18.0, 0.0, 0.1),
+    dec2(slider("highQ", "Höhen-Güte", "", 0.3, 3.0, 0.71, 0.01)),
 ];
 static SPECS_COMPRESSOR: [EffectParamSpec; 5] = [
     slider("threshold", "Threshold", "dB", -60.0, 0.0, -18.0, 0.25),
@@ -222,6 +242,20 @@ static SPECS_COMPRESSOR: [EffectParamSpec; 5] = [
     slider("release", "Release", "ms", 10.0, 2000.0, 150.0, 2.0),
     slider("makeup", "Makeup-Gain", "dB", 0.0, 24.0, 0.0, 0.1),
 ];
+static SPECS_LIMITER: [EffectParamSpec; 2] = [
+    slider("ceiling", "Ceiling", "dB", -24.0, 0.0, -1.0, 0.1),
+    slider("release", "Release", "ms", 1.0, 500.0, 50.0, 1.0),
+];
+static SPECS_HIGHPASS: [EffectParamSpec; 2] = [
+    no_decimals(slider("freq", "Frequenz", "Hz", 20.0, 2000.0, 80.0, 1.0)),
+    dec2(slider("q", "Güte", "", 0.3, 3.0, 0.71, 0.01)),
+];
+static SPECS_LOWPASS: [EffectParamSpec; 2] = [
+    no_decimals(slider("freq", "Frequenz", "Hz", 200.0, 20000.0, 12000.0, 10.0)),
+    dec2(slider("q", "Güte", "", 0.3, 3.0, 0.71, 0.01)),
+];
+static SPECS_GAIN: [EffectParamSpec; 1] =
+    [slider("gain", "Verstärkung", "dB", -24.0, 24.0, 0.0, 0.1)];
 static SPECS_REVERB: [EffectParamSpec; 3] = [
     slider("roomSize", "Raumgröße", "%", 0.0, 100.0, 50.0, 0.5),
     slider("damping", "Dämpfung", "%", 0.0, 100.0, 50.0, 0.5),
@@ -238,7 +272,7 @@ static SPECS_DELAY: [EffectParamSpec; 3] = [
 ];
 
 impl EffectKind {
-    pub const ALL: [EffectKind; 17] = [
+    pub const ALL: [EffectKind; 21] = [
         EffectKind::GaussianBlur,
         EffectKind::Sharpen,
         EffectKind::Glow,
@@ -253,6 +287,10 @@ impl EffectKind {
         EffectKind::BrightnessContrast,
         EffectKind::Equalizer,
         EffectKind::Compressor,
+        EffectKind::Limiter,
+        EffectKind::Highpass,
+        EffectKind::Lowpass,
+        EffectKind::Gain,
         EffectKind::Reverb,
         EffectKind::NoiseGate,
         EffectKind::Delay,
@@ -272,8 +310,12 @@ impl EffectKind {
             EffectKind::Invert => "Negativ",
             EffectKind::HueSaturation => "Farbton & Sättigung",
             EffectKind::BrightnessContrast => "Helligkeit & Kontrast",
-            EffectKind::Equalizer => "Equalizer (3 Bänder)",
+            EffectKind::Equalizer => "Parametrischer EQ",
             EffectKind::Compressor => "Kompressor",
+            EffectKind::Limiter => "Limiter",
+            EffectKind::Highpass => "Hochpass",
+            EffectKind::Lowpass => "Tiefpass",
+            EffectKind::Gain => "Verstärkung",
             EffectKind::Reverb => "Hall",
             EffectKind::NoiseGate => "Rauschgate",
             EffectKind::Delay => "Echo",
@@ -294,8 +336,12 @@ impl EffectKind {
             EffectKind::Invert => "Invertiert die Farben (Negativ), stufenlos zumischbar.",
             EffectKind::HueSaturation => "Farbton drehen, Sättigung und Helligkeit anpassen.",
             EffectKind::BrightnessContrast => "Einfache Helligkeits- und Kontrastkorrektur.",
-            EffectKind::Equalizer => "3-Band-EQ: Tiefen-/Höhen-Shelf und durchstimmbares Mittenband.",
+            EffectKind::Equalizer => "Parametrischer 4-Band-EQ: Tiefen-/Höhen-Shelf und zwei durchstimmbare Glockenfilter, je mit Frequenz, Gain und Güte.",
             EffectKind::Compressor => "Dynamikkompressor mit Threshold, Ratio, Attack/Release und Makeup-Gain.",
+            EffectKind::Limiter => "Brick-Wall-Limiter ohne Latenz: hält den Pegel sicher unter der Ceiling (master-tauglich).",
+            EffectKind::Highpass => "Hochpassfilter (12 dB/Okt.): entfernt Tieftonanteile unterhalb der Frequenz.",
+            EffectKind::Lowpass => "Tiefpassfilter (12 dB/Okt.): entfernt Höhenanteile oberhalb der Frequenz.",
+            EffectKind::Gain => "Einfache Verstärkung in dB (zipper-frei geglättet) — gut für Lautstärke-Keyframes.",
             EffectKind::Reverb => "Raumhall mit Raumgröße, Dämpfung und Mischanteil.",
             EffectKind::NoiseGate => "Schaltet Signal unterhalb der Schwelle stumm (Atmo/Rauschen zwischen Takes).",
             EffectKind::Delay => "Echo mit Verzögerungszeit, Feedback und Mischanteil.",
@@ -318,6 +364,10 @@ impl EffectKind {
             EffectKind::BrightnessContrast => "sun-medium",
             EffectKind::Equalizer => "sliders-horizontal",
             EffectKind::Compressor => "activity",
+            EffectKind::Limiter => "gauge",
+            EffectKind::Highpass => "chevron-up",
+            EffectKind::Lowpass => "chevron-down",
+            EffectKind::Gain => "volume-2",
             EffectKind::Reverb => "audio-waveform",
             EffectKind::NoiseGate => "mic-off",
             EffectKind::Delay => "timer-reset",
@@ -337,6 +387,10 @@ impl EffectKind {
             EffectKind::Crop | EffectKind::Flip => EffectCategory::Transform,
             EffectKind::Equalizer
             | EffectKind::Compressor
+            | EffectKind::Limiter
+            | EffectKind::Highpass
+            | EffectKind::Lowpass
+            | EffectKind::Gain
             | EffectKind::Reverb
             | EffectKind::NoiseGate
             | EffectKind::Delay => EffectCategory::Audio,
@@ -364,6 +418,10 @@ impl EffectKind {
             EffectKind::BrightnessContrast => &SPECS_BRIGHTNESS_CONTRAST,
             EffectKind::Equalizer => &SPECS_EQUALIZER,
             EffectKind::Compressor => &SPECS_COMPRESSOR,
+            EffectKind::Limiter => &SPECS_LIMITER,
+            EffectKind::Highpass => &SPECS_HIGHPASS,
+            EffectKind::Lowpass => &SPECS_LOWPASS,
+            EffectKind::Gain => &SPECS_GAIN,
             EffectKind::Reverb => &SPECS_REVERB,
             EffectKind::NoiseGate => &SPECS_NOISE_GATE,
             EffectKind::Delay => &SPECS_DELAY,
@@ -387,6 +445,10 @@ impl EffectKind {
             EffectKind::BrightnessContrast => "brightnessContrast",
             EffectKind::Equalizer => "equalizer",
             EffectKind::Compressor => "compressor",
+            EffectKind::Limiter => "limiter",
+            EffectKind::Highpass => "highpass",
+            EffectKind::Lowpass => "lowpass",
+            EffectKind::Gain => "gain",
             EffectKind::Reverb => "reverb",
             EffectKind::NoiseGate => "noiseGate",
             EffectKind::Delay => "delay",

@@ -16,6 +16,8 @@ pub enum CustomAction {
     TimelinePasteAt { t: f64 },
     TimelineRemoveTrack { track_id: String },
     TimelineToggleTrackFlag { track_id: String, flag: crate::core::timeline::TrackFlag },
+    /// Source-Patch-Ziel der Spurart umschalten (Radio).
+    TimelineToggleSourcePatch { track_id: String },
     TimelineSetInAt { t: f64 },
     TimelineSetOutAt { t: f64 },
     TimelineClearInOut,
@@ -46,6 +48,24 @@ pub enum CustomAction {
     EffectsToggle { clip_id: String, fx_id: String },
     /// Alle Parameter einer Effekt-Instanz zurücksetzen.
     EffectsReset { clip_id: String, fx_id: String },
+    /// Audio-Effekt an die Bus-Kette einer Spur anhängen.
+    TrackEffectsAdd {
+        track_id: String,
+        kind: crate::core::effects::EffectKind,
+    },
+    /// Bus-Effekt einer Spur entfernen.
+    TrackEffectsRemove { track_id: String, fx_id: String },
+    /// Bypass eines Bus-Effekts umschalten.
+    TrackEffectsToggle { track_id: String, fx_id: String },
+    /// Bus-Effekt einer Spur zurücksetzen.
+    TrackEffectsReset { track_id: String, fx_id: String },
+    /// Bus-Effekt im Stapel verschieben (−1 = hoch, +1 = runter).
+    TrackEffectsMove { track_id: String, fx_id: String, delta: i32 },
+    /// Spur-Automation eines Parameters löschen (Fader gilt wieder).
+    TrackAutoClear {
+        track_id: String,
+        param: crate::core::timeline::TrackAutoParam,
+    },
     /// Übergang entfernen.
     TransitionRemove { id: String },
     /// Übergangsart ersetzen.
@@ -62,6 +82,26 @@ pub enum CustomAction {
     },
     /// Dauer-Eingabe in der Timeline öffnen.
     TransitionEditDuration { id: String },
+    /// Marker-Bearbeiten-Dialog für ein Ziel öffnen.
+    MarkerEdit {
+        scope: crate::core::marker::MarkerScope,
+        marker_id: String,
+    },
+    /// Marker entfernen.
+    MarkerDelete {
+        scope: crate::core::marker::MarkerScope,
+        marker_id: String,
+    },
+    /// Markerfarbe setzen.
+    MarkerSetColor {
+        scope: crate::core::marker::MarkerScope,
+        marker_id: String,
+        color: crate::core::marker::MarkerColor,
+    },
+    /// Sequenz-Marker an einer Lineal-Zeit hinzufügen.
+    MarkerAddAt { t: f64 },
+    /// Clip-Marker an einer Sequenzzeit auf einem bestimmten Clip hinzufügen.
+    MarkerAddClipAt { clip_id: String, t: f64 },
 }
 
 #[derive(Clone)]

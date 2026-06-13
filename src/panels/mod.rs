@@ -7,6 +7,7 @@ pub mod effect_controls;
 pub mod effects;
 pub mod graphics;
 pub mod info;
+pub mod markers;
 pub mod media_browser;
 pub mod monitor;
 pub mod scopes;
@@ -23,7 +24,7 @@ use crate::ui::{FontKind, Ui};
 use std::collections::HashMap;
 
 /// (id, deutscher Titel, Lucide-Icon).
-pub const PANEL_DEFS: [(&str, &str, &str); 13] = [
+pub const PANEL_DEFS: [(&str, &str, &str); 14] = [
     ("media", "Medien", "folder-open"),
     ("source", "Quelle", "film"),
     ("program", "Programm", "play"),
@@ -35,6 +36,7 @@ pub const PANEL_DEFS: [(&str, &str, &str); 13] = [
     ("scopes", "Scopes", "activity"),
     ("graphics", "Grafiken", "type"),
     ("subtitles", "Untertitel", "captions"),
+    ("markers", "Marker", "bookmark"),
     ("info", "Info", "info"),
     ("history", "Verlauf", "history"),
 ];
@@ -120,6 +122,7 @@ impl PanelHost {
             "effectControls".into(),
             Box::new(effect_controls::EffectControlsPanel::default()),
         );
+        instances.insert("markers".into(), Box::new(markers::MarkersPanel::default()));
         for (id, title, icon) in PANEL_DEFS {
             instances
                 .entry(id.to_string())

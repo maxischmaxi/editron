@@ -721,6 +721,44 @@ pub struct AudioClipPlan {
     pub fades: Vec<PlanAudioFade>,
 }
 
+/// Audio-Spur mit Bus-Effekten und/oder Automation: wird getrennt gemischt
+/// (Clips → Per-Spur-WAV → Bus-FX + Spur-Gain/Pan + Master → Master-WAV),
+/// damit die Effekte auf die SUMME der Spur wirken — exakt wie der Player-
+/// Mixdown. Spuren ohne FX/Automation laufen über den Schnellpfad
+/// (`RenderPlan::audio`, Gains fertig eingebacken).
+#[derive(Clone, Debug)]
+pub struct AudioTrackPlan {
+    /// Clips der Spur; `gain_l`/`gain_r` enthalten NUR den Clip-Anteil
+    /// (Clip-Gain), Spur-Gain/Pan und Master folgen in der Bus-Verarbeitung.
+    pub clips: Vec<AudioClipPlan>,
+    /// Bus-Effekt-Kette (Insert) der Spur.
+    pub effects: Vec<EffectInstance>,
+    /// Lautstärke-Automation (dB-Offset, Keyframes in Sequenzzeit).
+    pub volume_auto: AnimatedParam,
+    /// Pan-Automation (Offset, Keyframes in Sequenzzeit).
+    pub pan_auto: AnimatedParam,
+    /// Statischer Spur-Fader (dB) und Balance.
+    pub gain_db: f64,
+    pub pan: f64,
+    /// Master-Fader (dB) — beim Summieren in den Master angewendet.
+    pub master_db: f64,
+    /// Sequenzzeit, die Mix-Zeit t=0 entspricht (Exportbeginn) — für die
+    /// Automations-Auswertung.
+    pub seq_start: f64,
+}
+
+impl AudioTrackPlan {
+    /// Wirksame Spur-Verstärkung (dB) zur Mix-Zeit `mix_t`: Fader + Automation.
+    fn gain_db_at(&self, mix_t: f64) -> f64 {
+        self.gain_db + self.volume_auto.eval(self.seq_start + mix_t)
+    }
+
+    /// Wirksame Balance zur Mix-Zeit `mix_t`: Fader + Automation (geklemmt).
+    fn pan_at(&self, mix_t: f64) -> f64 {
+        (self.pan + self.pan_auto.eval(self.seq_start + mix_t)).clamp(-1.0, 1.0)
+    }
+}
+
 /// Untertitel-Spur im Renderplan (Sidecar/Einbetten): Cue-Zeiten relativ
 /// zum Exportbeginn, frame-genau aufs Sequenzraster gerundet.
 #[derive(Clone, Debug)]
@@ -739,7 +777,11 @@ pub struct RenderPlan {
     pub fps: f64,
     pub total_frames: u64,
     pub segments: Vec<VideoSegment>,
+    /// Clips von Spuren OHNE Bus-FX/Automation (Schnellpfad: Gains fertig
+    /// eingebacken, mischen direkt in den Master).
     pub audio: Vec<AudioClipPlan>,
+    /// Spuren MIT Bus-FX und/oder Automation — getrennte Bus-Verarbeitung.
+    pub audio_tracks: Vec<AudioTrackPlan>,
     /// Sichtbare Untertitel-Spuren mit Cues im Exportbereich (nur bei
     /// `SubtitleMode::Sidecar`/`Embed` befüllt; Einbrennen läuft über die
     /// Video-Segmente).
@@ -750,6 +792,23 @@ impl RenderPlan {
     /// Mindestens ein echtes Video-Segment (kein reines Schwarzbild)?
     pub fn has_video_media(&self) -> bool {
         self.segments.iter().any(|s| !s.layers.is_empty())
+    }
+
+    /// Gesamte Audio-Arbeitseinheiten (Frames) für den Fortschritt: einfache
+    /// Clips + Per-Spur-Clips + die Bus-Verarbeitungs-Durchläufe der Spuren.
+    pub fn audio_total_units(&self, rate: u32) -> u64 {
+        let frames = |d: f64| (d * rate as f64) as u64;
+        let simple: u64 = self.audio.iter().map(|c| frames(c.duration)).sum();
+        let tracks: u64 = self
+            .audio_tracks
+            .iter()
+            .map(|t| {
+                let clips: u64 = t.clips.iter().map(|c| frames(c.duration)).sum();
+                // + ein voller Durchlauf über die Sequenzdauer (Bus-FX/Gain).
+                clips + frames(self.duration)
+            })
+            .sum();
+        simple + tracks
     }
 }
 
@@ -855,8 +914,14 @@ pub fn build_render_plan(
             .iter()
             .filter(|t| t.kind == TrackKind::Audio && !t.muted && (!solo_any || t.solo))
         {
+            // Spuren mit Bus-FX oder Automation brauchen die getrennte Bus-
+            // Verarbeitung (Effekte/Automation wirken auf die Spur-SUMME);
+            // alle anderen laufen über den Schnellpfad mit fertig
+            // eingebackenen Gains.
+            let processed = track.has_audio_effects() || track.has_automation();
             let track_gain = db_to_linear(track.gain_db);
             let (pan_l, pan_r) = pan_gains(track.pan);
+            let mut track_clips: Vec<AudioClipPlan> = Vec::new();
             for clip in timeline
                 .clips
                 .iter()
@@ -882,16 +947,25 @@ pub fn build_render_plan(
                 if asset.offline || asset.info.audio.is_empty() {
                     continue;
                 }
-                let gain = master * track_gain * db_to_linear(clip.gain_db);
-                plan.audio.push(AudioClipPlan {
+                // Schnellpfad: Master × Spur × Clip × Balance eingebacken.
+                // Bus-Pfad: nur Clip-Gain (mono) — Spur/Pan/Master folgen in
+                // der Bus-Verarbeitung.
+                let (gl, gr) = if processed {
+                    let g = db_to_linear(clip.gain_db);
+                    (g, g)
+                } else {
+                    let gain = master * track_gain * db_to_linear(clip.gain_db);
+                    (gain * pan_l, gain * pan_r)
+                };
+                let cp = AudioClipPlan {
                     path: asset.path.clone(),
                     start_in_mix: clip_start - start,
                     duration: clip_end - clip_start,
                     // Medienzeit am Mix-Beginn (zentrale Abbildung, vorwärts).
                     src_in: clip.media_time_at(clip_start).max(0.0),
                     speed: clip.eff_speed(),
-                    gain_l: gain * pan_l,
-                    gain_r: gain * pan_r,
+                    gain_l: gl,
+                    gain_r: gr,
                     volume: clip.fx.volume_db.clone(),
                     effects: clip
                         .effects
@@ -908,6 +982,29 @@ pub fn build_render_plan(
                             equal_power: *equal_power,
                         })
                         .collect(),
+                };
+                if processed {
+                    track_clips.push(cp);
+                } else {
+                    plan.audio.push(cp);
+                }
+            }
+            if processed && !track_clips.is_empty() {
+                track_clips.sort_by(|a, b| a.start_in_mix.total_cmp(&b.start_in_mix));
+                plan.audio_tracks.push(AudioTrackPlan {
+                    clips: track_clips,
+                    effects: track
+                        .effects
+                        .iter()
+                        .filter(|e| e.kind.is_audio())
+                        .cloned()
+                        .collect(),
+                    volume_auto: track.volume_auto.clone(),
+                    pan_auto: track.pan_auto.clone(),
+                    gain_db: track.gain_db,
+                    pan: track.pan,
+                    master_db: timeline.master_gain_db,
+                    seq_start: start,
                 });
             }
         }
@@ -1918,11 +2015,7 @@ fn export_inner(
     if with_audio {
         let audio = settings.audio.as_ref().expect("audio settings");
         let span = if with_video { 6.0 } else { 85.0 };
-        let total_units: u64 = plan
-            .audio
-            .iter()
-            .map(|c| (c.duration * audio.sample_rate as f64) as u64)
-            .sum();
+        let total_units = plan.audio_total_units(audio.sample_rate);
         progress.begin_phase(ExportPhase::MixAudio, 0.0, span, total_units.max(1), false);
         mix_audio_to_wav(plan, audio, wav, cancel, &mut children, &mut progress)
             .map_err(fail_or_cancel(cancel))?;
@@ -2048,20 +2141,64 @@ fn mix_audio_to_wav(
         return Err("Audio-Mix überschreitet die 4-GB-Grenze des WAV-Zwischenformats.".into());
     }
 
+    let (mut file, data_off) = create_silent_wav(wav, rate, ch, data_bytes)?;
+
+    // Schnellpfad-Clips (Spuren ohne Bus-FX/Automation): direkt in den Master.
+    mix_clips_into_wav(
+        &mut file, data_off, total_frames, rate, ch, &plan.audio, cancel, children, progress,
+    )?;
+
+    // Spuren mit Bus-FX und/oder Automation: getrennt mischen und einsummieren
+    // (Bus-FX wirken auf die Spur-Summe — exakt wie der Player-Mixdown).
+    for (idx, track) in plan.audio_tracks.iter().enumerate() {
+        process_audio_track(
+            &mut file, data_off, total_frames, rate, ch, wav, idx, track, cancel, children,
+            progress,
+        )?;
+    }
+
+    file.sync_all().ok();
+    Ok(())
+}
+
+/// Leere f32-WAV (Stille) anlegen; liefert (Datei, Daten-Offset).
+fn create_silent_wav(
+    path: &Path,
+    rate: u32,
+    ch: usize,
+    data_bytes: u64,
+) -> Result<(std::fs::File, u64), String> {
     let mut file = std::fs::File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(wav)
+        .open(path)
         .map_err(|e| format!("Audio-Zwischendatei konnte nicht angelegt werden: {e}"))?;
     let data_off = write_wav_header(&mut file, rate, ch as u16, data_bytes as u32)
         .map_err(|e| format!("WAV-Header: {e}"))?;
     // Mit Stille auffüllen (f32 0.0 = Null-Bytes — set_len reicht).
     file.set_len(data_off + data_bytes)
         .map_err(|e| format!("Audio-Zwischendatei: {e}"))?;
+    Ok((file, data_off))
+}
 
-    for clip in &plan.audio {
+/// Alle übergebenen Clips nacheinander in die WAV mischen (Read-Modify-Write
+/// an der Zielposition) — konstanter Speicher, beliebig viele Clips. Wird
+/// für den Master (Schnellpfad-Clips) UND für Per-Spur-WAVs genutzt.
+#[allow(clippy::too_many_arguments)]
+fn mix_clips_into_wav(
+    file: &mut std::fs::File,
+    data_off: u64,
+    total_frames: u64,
+    rate: u32,
+    ch: usize,
+    clips: &[AudioClipPlan],
+    cancel: &AtomicBool,
+    children: &mut ChildRegistry,
+    progress: &mut Progress,
+) -> Result<(), String> {
+    for clip in clips {
         if cancel.load(Ordering::Relaxed) {
             return Err("abgebrochen".into());
         }
@@ -2200,6 +2337,113 @@ fn mix_audio_to_wav(
     }
     file.sync_all().ok();
     Ok(())
+}
+
+/// Eine Spur MIT Bus-FX/Automation verarbeiten: Clips in eine temporäre WAV
+/// summieren, diese blockweise durch die Bus-Effektkette schicken, Spur-
+/// Gain/Pan (inkl. Automation, Sequenzzeit) und Master anwenden und additiv
+/// in die Master-WAV mischen. Identische DSP-Kette (`AudioFxChain`) und
+/// Gain-Mathematik wie der Player → Wiedergabe und Export klingen gleich.
+#[allow(clippy::too_many_arguments)]
+fn process_audio_track(
+    master: &mut std::fs::File,
+    data_off: u64,
+    total_frames: u64,
+    rate: u32,
+    ch: usize,
+    base_wav: &Path,
+    idx: usize,
+    track: &AudioTrackPlan,
+    cancel: &AtomicBool,
+    children: &mut ChildRegistry,
+    progress: &mut Progress,
+) -> Result<(), String> {
+    let data_bytes = total_frames * ch as u64 * 4;
+    let tmp = base_wav.with_extension(format!("track{idx}.wav"));
+    let mut run = || -> Result<(), String> {
+        // 1. Clips der Spur in die Temp-WAV (nur Clip-Gain).
+        let (mut tfile, toff) = create_silent_wav(&tmp, rate, ch, data_bytes)?;
+        mix_clips_into_wav(
+            &mut tfile, toff, total_frames, rate, ch, &track.clips, cancel, children, progress,
+        )?;
+
+        // 2. Bus-FX + Spur-Gain/Pan + Master, blockweise, in den Master.
+        let master_lin = db_to_linear(track.master_db);
+        let fx_refs: Vec<&EffectInstance> = track.effects.iter().collect();
+        let mut fx_chain = AudioFxChain::build(&fx_refs, rate, ch, track.seq_start);
+        let fx_animated = track.effects.iter().any(|e| e.any_animated());
+        const ENV_BLOCK: usize = 256;
+        const CHUNK_FRAMES: usize = 32768;
+        let mut tbuf = vec![0u8; CHUNK_FRAMES * ch * 4];
+        let mut mbuf = vec![0u8; CHUNK_FRAMES * ch * 4];
+        let mut fresh = vec![0f32; CHUNK_FRAMES * ch];
+        let mut frames_done: u64 = 0;
+        while frames_done < total_frames {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("abgebrochen".into());
+            }
+            let now = ((total_frames - frames_done) as usize).min(CHUNK_FRAMES);
+            let bytes = now * ch * 4;
+            let tpos = toff + frames_done * ch as u64 * 4;
+            tfile.seek(SeekFrom::Start(tpos)).map_err(|e| e.to_string())?;
+            tfile
+                .read_exact(&mut tbuf[..bytes])
+                .map_err(|e| format!("Spur-Lesen: {e}"))?;
+            for i in 0..now * ch {
+                let off = i * 4;
+                fresh[i] =
+                    f32::from_le_bytes([tbuf[off], tbuf[off + 1], tbuf[off + 2], tbuf[off + 3]]);
+            }
+            let mpos = data_off + frames_done * ch as u64 * 4;
+            master.seek(SeekFrom::Start(mpos)).map_err(|e| e.to_string())?;
+            master
+                .read_exact(&mut mbuf[..bytes])
+                .map_err(|e| format!("Mix-Lesen: {e}"))?;
+            let mut fi = 0usize;
+            while fi < now {
+                let n = ENV_BLOCK.min(now - fi);
+                let mix_t = (frames_done + fi as u64) as f64 / rate as f64;
+                if let Some(chain) = fx_chain.as_mut() {
+                    if fx_animated {
+                        chain.retune(&fx_refs, track.seq_start + mix_t);
+                    }
+                    chain.process(&mut fresh[fi * ch..(fi + n) * ch]);
+                }
+                // Spur-Gain/Pan inkl. Automation (Sequenzzeit) × Master.
+                let g = db_to_linear(track.gain_db_at(mix_t));
+                let (pl, pr) = pan_gains(track.pan_at(mix_t));
+                let (gl, gr) = (g * pl * master_lin, g * pr * master_lin);
+                let mono = (gl + gr) * 0.5;
+                for i in fi * ch..(fi + n) * ch {
+                    let gain = if ch == 2 {
+                        if i % 2 == 0 {
+                            gl
+                        } else {
+                            gr
+                        }
+                    } else {
+                        mono
+                    };
+                    let off = i * 4;
+                    let old =
+                        f32::from_le_bytes([mbuf[off], mbuf[off + 1], mbuf[off + 2], mbuf[off + 3]]);
+                    let sum = old + fresh[i] * gain;
+                    mbuf[off..off + 4].copy_from_slice(&sum.to_le_bytes());
+                }
+                fi += n;
+            }
+            master.seek(SeekFrom::Start(mpos)).map_err(|e| e.to_string())?;
+            master
+                .write_all(&mbuf[..bytes])
+                .map_err(|e| format!("Mix-Schreiben: {e}"))?;
+            frames_done += now as u64;
+            progress.advance(now as u64);
+        }
+        Ok(())
+    };
+    let result = run();
+    let _ = std::fs::remove_file(&tmp);
+    result
 }
 
 // ----------------------------------------------------------- Video-Render
@@ -3116,7 +3360,13 @@ mod tests {
             locked: false,
             gain_db: 0.0,
             pan: 0.0,
+            sync_lock: false,
+            targeted: false,
+            source_patched: false,
             subtitle_style: None,
+            effects: Vec::new(),
+            volume_auto: crate::core::animation::AnimatedParam::fixed(0.0),
+            pan_auto: crate::core::animation::AnimatedParam::fixed(0.0),
         }
     }
 
@@ -3142,6 +3392,7 @@ mod tests {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         }
     }
 
@@ -3177,6 +3428,7 @@ mod tests {
             thumbnail_path: None,
             imported_at: 0.0,
             offline: false,
+            markers: Vec::new(),
         }
     }
 
@@ -3288,6 +3540,74 @@ mod tests {
             plan.audio[0].effects[0].kind,
             crate::core::effects::EffectKind::Reverb
         );
+    }
+
+    #[test]
+    fn plan_routes_track_bus_fx_and_automation_to_processed() {
+        use crate::core::effects::{EffectInstance, EffectKind};
+        // Spur mit Bus-Effekt.
+        let mut t1 = track("a1", TrackKind::Audio);
+        t1.gain_db = -6.0;
+        t1.effects.push(EffectInstance::new(EffectKind::Equalizer));
+        let mut c1 = clip("c1", "a1", TrackKind::Audio, "A", 0.0, 4.0);
+        c1.gain_db = 3.0;
+        // Spur mit Automation (ohne FX).
+        let mut t2 = track("a2", TrackKind::Audio);
+        t2.volume_auto.upsert_key(0.0, 0.0);
+        t2.volume_auto.upsert_key(2.0, 6.0);
+        let c2 = clip("c2", "a2", TrackKind::Audio, "A", 0.0, 4.0);
+        // Einfache Spur.
+        let t3 = track("a3", TrackKind::Audio);
+        let c3 = clip("c3", "a3", TrackKind::Audio, "A", 0.0, 4.0);
+        let (tl, media) = state_with(
+            vec![t1, t2, t3],
+            vec![c1, c2, c3],
+            vec![video_asset("A", "/a.mp4")],
+        );
+        let plan = build_render_plan(&tl, &media, &test_settings());
+        // Eine einfache Spur → Schnellpfad; zwei verarbeitete → Bus-Pfad.
+        assert_eq!(plan.audio.len(), 1, "nur die einfache Spur im Schnellpfad");
+        assert_eq!(plan.audio_tracks.len(), 2);
+        // Verarbeitete Clip-Gains tragen NUR den Clip-Anteil (kein Master/
+        // Spur/Pan — das folgt in der Bus-Verarbeitung).
+        let bus = plan
+            .audio_tracks
+            .iter()
+            .find(|t| !t.effects.is_empty())
+            .expect("Bus-FX-Spur");
+        let expect = db_to_linear(3.0);
+        assert!((bus.clips[0].gain_l - expect).abs() < 1e-6, "nur Clip-Gain");
+        assert!((bus.clips[0].gain_r - expect).abs() < 1e-6);
+        assert_eq!(bus.gain_db, -6.0);
+    }
+
+    #[test]
+    fn processed_track_gain_matches_player_semantics() {
+        // AudioTrackPlan (Export) und TimelineTrack (Player) werten Spur-Gain/
+        // Pan inkl. Automation identisch aus — gemeinsame Mathematik, damit
+        // Wiedergabe und Export gleich klingen.
+        let mut t = track("a1", TrackKind::Audio);
+        t.gain_db = -4.0;
+        t.pan = 0.2;
+        t.volume_auto.upsert_key(0.0, 0.0);
+        t.volume_auto.upsert_key(4.0, 8.0);
+        t.pan_auto.upsert_key(0.0, 0.0);
+        t.pan_auto.upsert_key(4.0, 0.5);
+        let plan = AudioTrackPlan {
+            clips: vec![],
+            effects: vec![],
+            volume_auto: t.volume_auto.clone(),
+            pan_auto: t.pan_auto.clone(),
+            gain_db: t.gain_db,
+            pan: t.pan,
+            master_db: 0.0,
+            seq_start: 3.0,
+        };
+        for mix_t in [0.0, 1.0, 2.5, 4.0] {
+            let seq_t = 3.0 + mix_t;
+            assert!((plan.gain_db_at(mix_t) - t.gain_db_at(seq_t)).abs() < 1e-9);
+            assert!((plan.pan_at(mix_t) - t.pan_at(seq_t)).abs() < 1e-9);
+        }
     }
 
     #[test]

@@ -30,6 +30,16 @@ pub enum DialogId {
     MatchMedia,
     /// „Geschwindigkeit/Dauer“ der ausgewählten Clips (Mod+R).
     ClipSpeed,
+    /// Marker bearbeiten (Name/Notiz/Farbe/Timecode) — Ziel in
+    /// `AppStore::marker_editor`.
+    Marker,
+}
+
+/// Ziel des Marker-Bearbeiten-Dialogs: welche Sammlung + welcher Marker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkerEditTarget {
+    pub scope: crate::core::marker::MarkerScope,
+    pub marker_id: String,
 }
 
 pub type TimelineTool = &'static str;
@@ -89,6 +99,9 @@ pub struct AppStore {
     /// Übergangs-ID, deren Dauer-Eingabe die Timeline öffnen soll
     /// (gesetzt vom Kontextmenü, gelesen + geleert vom Timeline-Panel).
     pub edit_transition_duration: Option<String>,
+    /// Ziel des Marker-Bearbeiten-Dialogs (gesetzt beim Öffnen via
+    /// Shift+M / Doppelklick / Panel; gelesen vom MarkerDialog).
+    pub marker_editor: Option<MarkerEditTarget>,
 }
 
 /// Ziel einer Farbaufnahme: drei aufeinanderfolgende Effekt-Parameter
@@ -114,6 +127,7 @@ impl Default for AppStore {
             focused_panel: String::new(),
             color_pick: None,
             edit_transition_duration: None,
+            marker_editor: None,
         }
     }
 }
@@ -166,6 +180,70 @@ impl MediaStore {
     /// Anzahl der Assets, deren Quelldatei fehlt.
     pub fn offline_count(&self) -> usize {
         self.assets.iter().filter(|a| a.offline).count()
+    }
+
+    // ----------------------------------------------------------- Marker
+    // Asset-/Quell-Marker (Quellmonitor) liegen außerhalb der Timeline-
+    // Undo-History; sie zählen wie Import/Entfernen zum Dirty-Tracking.
+
+    /// Asset-Marker an der Quellzeit `t` setzen (idempotent pro Sekunde —
+    /// einfacher Toleranzvergleich, da Asset-fps hier nicht bekannt sind).
+    /// Liefert die ID des (neuen oder bestehenden) Markers.
+    pub fn add_asset_marker(&mut self, asset_id: &str, t: f64) -> Option<String> {
+        let asset = self.assets.iter_mut().find(|a| a.id == asset_id)?;
+        let t = t.max(0.0);
+        if let Some(existing) = asset
+            .markers
+            .iter()
+            .find(|m| (m.time - t).abs() < 1e-3)
+            .map(|m| m.id.clone())
+        {
+            return Some(existing);
+        }
+        let marker = crate::core::marker::Marker::new(t);
+        let id = marker.id.clone();
+        asset.markers.push(marker);
+        crate::core::timeline::sort_markers(&mut asset.markers);
+        self.revision += 1;
+        Some(id)
+    }
+
+    /// Asset-Marker ändern.
+    pub fn asset_marker_update(
+        &mut self,
+        asset_id: &str,
+        marker_id: &str,
+        f: impl FnOnce(&mut crate::core::marker::Marker),
+    ) {
+        if let Some(asset) = self.assets.iter_mut().find(|a| a.id == asset_id) {
+            if let Some(m) = asset.markers.iter_mut().find(|m| m.id == marker_id) {
+                f(m);
+                m.sanitize();
+                crate::core::timeline::sort_markers(&mut asset.markers);
+                self.revision += 1;
+            }
+        }
+    }
+
+    /// Asset-Marker entfernen.
+    pub fn remove_asset_marker(&mut self, asset_id: &str, marker_id: &str) {
+        if let Some(asset) = self.assets.iter_mut().find(|a| a.id == asset_id) {
+            let before = asset.markers.len();
+            asset.markers.retain(|m| m.id != marker_id);
+            if asset.markers.len() != before {
+                self.revision += 1;
+            }
+        }
+    }
+
+    /// Den zur Quellzeit `t` nächstgelegenen Asset-Marker (für „löschen").
+    pub fn asset_marker_at(&self, asset_id: &str, t: f64) -> Option<String> {
+        let asset = self.asset(asset_id)?;
+        asset
+            .markers
+            .iter()
+            .find(|m| (m.time - t).abs() < 1e-3 || (m.duration > 0.0 && t >= m.time && t <= m.end()))
+            .map(|m| m.id.clone())
     }
 
     /// Neue Quelldatei für ein Asset übernehmen (Relink): Pfad/Metadaten
@@ -235,6 +313,10 @@ pub struct AudioStore {
     pub track_levels: std::collections::HashMap<String, [f32; 2]>,
     /// Peak L/R der Summe nach Master-Gain.
     pub master_level: [f32; 2],
+    /// Live-Gain-Reduktion (dB, ≥ 0) je Dynamik-Effekt (fx_id) aus den
+    /// laufenden Clip-/Spur-Ketten — Quelle der GR-Meter im Panel
+    /// Effekteinstellungen. fx-IDs sind global eindeutig.
+    pub fx_gain_reduction: std::collections::HashMap<String, f32>,
 }
 
 /// Wiedergabeauflösung: 1 = voll, darunter kleinerer Offscreen-Render.

@@ -9,7 +9,7 @@
 //! `state.audio` für die Mixer-Meter); der Quellmonitor spielt das geladene
 //! Asset unter "player://source".
 
-use crate::core::audio_fx::AudioFxChain;
+use crate::core::audio_fx::{db_to_linear, pan_gains, AudioFxChain};
 use crate::core::compose;
 use crate::core::effects::EffectInstance;
 use crate::core::timeline::TrackKind;
@@ -295,21 +295,29 @@ enum Session {
 }
 
 // ---------------------------------------------------------------- Audio
+// `db_to_linear`/`pan_gains` leben in `core/audio_fx.rs` und werden von
+// Player UND Export genutzt — so klingen Wiedergabe und Export gleich.
 
-/// dB → linearer Faktor; ≤ −60 dB gilt als −∞ (stumm).
-fn db_to_linear(db: f64) -> f32 {
-    if db <= -60.0 {
-        0.0
-    } else {
-        10f32.powf(db as f32 / 20.0)
+/// Glättet die Spur-Gains über einen Block (Rampe `from`→`to`, zipper-frei
+/// bei Fader-/Automations-Sprüngen), misst den Spitzenpegel NACH dem Fader
+/// und liefert (Peak L, Peak R).
+fn apply_stereo_ramp(buf: &mut [f32], from: (f32, f32), to: (f32, f32)) -> (f32, f32) {
+    let frames = buf.len() / AUDIO_CHANNELS;
+    if frames == 0 {
+        return (0.0, 0.0);
     }
-}
-
-/// Stereo-Balance: dämpft die abgewandte Seite, Mitte bleibt bei 1.0
-/// (kein −3-dB-Center-Drop wie beim Constant-Power-Pan).
-fn pan_gains(pan: f64) -> (f32, f32) {
-    let p = pan.clamp(-1.0, 1.0) as f32;
-    (1.0 - p.max(0.0), 1.0 + p.min(0.0))
+    let inv = 1.0 / frames as f32;
+    let (mut pl, mut pr) = (0f32, 0f32);
+    for (i, fr) in buf.chunks_exact_mut(AUDIO_CHANNELS).enumerate() {
+        let u = i as f32 * inv;
+        let gl = from.0 + (to.0 - from.0) * u;
+        let gr = from.1 + (to.1 - from.1) * u;
+        fr[0] *= gl;
+        fr[1] *= gr;
+        pl = pl.max(fr[0].abs());
+        pr = pr.max(fr[1].abs());
+    }
+    (pl, pr)
 }
 
 /// Summen-Ausgabestream. raylib-rs' `AudioStream::update` übergibt
@@ -568,8 +576,16 @@ pub struct PlayerEngine {
     program_videos: std::collections::HashMap<String, Option<Session>>,
     source_video: Option<Session>,
     audio_decoders: Vec<AudioDecoder>,
-    /// Wiederverwendeter Mix-Block (interleaved L/R).
+    /// Wiederverwendeter Master-Mix-Block (interleaved L/R).
     mix_buf: Vec<f32>,
+    /// Wiederverwendeter Per-Spur-Buffer (Clips einer Spur werden hier
+    /// summiert, bevor Spur-FX + Spur-Gain/Pan greifen).
+    track_buf: Vec<f32>,
+    /// Bus-Effekt-Kette je Audio-Spur (Schlüssel = Spur-ID), Zustände bleiben
+    /// über Blöcke hinweg. Pro Tick mit dem Spur-Zustand synchronisiert.
+    track_fx: std::collections::HashMap<String, AudioFxChain>,
+    /// Geglättete Spur-Gains (L, R) je Spur — Rampenstart des nächsten Blocks.
+    track_gain_smooth: std::collections::HashMap<String, (f32, f32)>,
     /// EDITRON_AUDIO_DEBUG=1: einmal pro Sekunde Mix-Statistik auf stderr.
     debug: bool,
     debug_last: f64,
@@ -595,6 +611,9 @@ impl PlayerEngine {
             source_video: None,
             audio_decoders: Vec::new(),
             mix_buf: Vec::new(),
+            track_buf: Vec::new(),
+            track_fx: Default::default(),
+            track_gain_smooth: Default::default(),
             debug: std::env::var("EDITRON_AUDIO_DEBUG").is_ok(),
             debug_last: 0.0,
             debug_blocks: 0,
@@ -820,6 +839,11 @@ impl PlayerEngine {
             effects: Vec<EffectInstance>,
         }
         let mut wants: Vec<Want> = Vec::new();
+        // Per-Spur-Zielgains (Spur-Gain/Pan inkl. Automation) und aktive
+        // Spur-IDs — Grundlage der Bus-Verarbeitung im Mixdown.
+        let mut track_targets: Vec<(String, (f32, f32))> = Vec::new();
+        let mut active_track_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Programm: alle hörbaren Audio-Clips am Playhead.
         if state.playback.program_playing && (state.playback.program_rate - 1.0).abs() < 0.01 {
@@ -831,8 +855,30 @@ impl PlayerEngine {
                 .iter()
                 .filter(|tr| tr.kind == TrackKind::Audio && !tr.muted && (!solo_any || tr.solo))
             {
-                let track_gain = db_to_linear(track.gain_db);
-                let (pan_l, pan_r) = pan_gains(track.pan);
+                active_track_ids.insert(track.id.clone());
+                // Spur-Gain/Pan inkl. Automation (in SEQUENZZEIT ausgewertet —
+                // anders als die Clip-Keyframes in Medienzeit).
+                let tg = db_to_linear(track.gain_db_at(t));
+                let (pan_l, pan_r) = pan_gains(track.pan_at(t));
+                track_targets.push((track.id.clone(), (tg * pan_l, tg * pan_r)));
+                // Bus-Effekt-Kette der Spur abgleichen (gleicher Code wie
+                // Clip-FX; Parameter in Sequenzzeit nachgeführt).
+                if track.has_audio_effects() {
+                    let refs: Vec<&EffectInstance> = track.effects.iter().collect();
+                    match self.track_fx.get_mut(&track.id) {
+                        Some(chain) if chain.matches(&refs) => chain.retune(&refs, t),
+                        _ => match AudioFxChain::build(&refs, AUDIO_RATE, AUDIO_CHANNELS, t) {
+                            Some(c) => {
+                                self.track_fx.insert(track.id.clone(), c);
+                            }
+                            None => {
+                                self.track_fx.remove(&track.id);
+                            }
+                        },
+                    }
+                } else {
+                    self.track_fx.remove(&track.id);
+                }
                 for clip in state
                     .timeline
                     .clips
@@ -866,10 +912,10 @@ impl PlayerEngine {
                                     crate::core::transitions::audio_gain(*equal_power, *fade_in, p);
                             }
                         }
-                        // Clip-Gain + animierte Lautstärke (Keyframes) — wird
-                        // pro Tick neu ausgewertet, Fades laufen also live.
-                        let gain = track_gain
-                            * db_to_linear(clip.gain_db + clip.fx.volume_db.eval(media_time))
+                        // NUR der Clip-Anteil (Clip-Gain + Lautstärke-Keyframes
+                        // + Fade). Spur-Gain/Pan greift erst NACH den Bus-FX im
+                        // Per-Spur-Buffer (mono → beide Seiten gleich).
+                        let gain = db_to_linear(clip.gain_db + clip.fx.volume_db.eval(media_time))
                             * fade_gain as f32;
                         wants.push(Want {
                             clip_id: clip.id.clone(),
@@ -877,8 +923,8 @@ impl PlayerEngine {
                             path: asset.path.clone(),
                             media_time,
                             speed: clip.eff_speed(),
-                            gain_l: gain * pan_l,
-                            gain_r: gain * pan_r,
+                            gain_l: gain,
+                            gain_r: gain,
                             effects: clip
                                 .effects
                                 .iter()
@@ -890,6 +936,11 @@ impl PlayerEngine {
                 }
             }
         }
+        // Stale Bus-FX-/Glättungszustände nicht (mehr) aktiver Spuren verwerfen.
+        self.track_fx.retain(|id, _| active_track_ids.contains(id));
+        self.track_gain_smooth
+            .retain(|id, _| active_track_ids.contains(id));
+
         // Quelle: ungeregelt (Spur-/Master-Fader gelten nur fürs Programm).
         if state.playback.source.playing && (state.playback.source.rate - 1.0).abs() < 0.01 {
             if let Some(asset) = state
@@ -981,18 +1032,60 @@ impl PlayerEngine {
             self.mix_buf.clear();
             self.mix_buf.resize(AUDIO_CHUNK_FRAMES * AUDIO_CHANNELS, 0.0);
             let mut any_frames = false;
-            for dec in self.audio_decoders.iter_mut() {
-                let (frames, peak_l, peak_r) = dec.mix_into(&mut self.mix_buf);
-                if frames == 0 {
+
+            // Programm: Clips je Spur in den Per-Spur-Buffer summieren, dann
+            // Bus-FX → Spur-Gain/Pan (geglättet) → in den Master summieren.
+            // So wirken die Spur-Effekte auf die SUMME der Spur — nicht pro
+            // Clip — exakt wie im Export.
+            for (track_id, target) in &track_targets {
+                self.track_buf.clear();
+                self.track_buf.resize(AUDIO_CHUNK_FRAMES * AUDIO_CHANNELS, 0.0);
+                let mut track_any = false;
+                for dec in self.audio_decoders.iter_mut() {
+                    if dec.track_id.as_deref() != Some(track_id.as_str()) {
+                        continue;
+                    }
+                    let (frames, _, _) = dec.mix_into(&mut self.track_buf);
+                    if frames > 0 {
+                        track_any = true;
+                    }
+                }
+                if !track_any {
                     continue;
                 }
                 any_frames = true;
-                if let Some(track_id) = dec.track_id.as_ref() {
-                    let entry = tick_tracks.entry(track_id.clone()).or_insert([0.0, 0.0]);
-                    entry[0] = entry[0].max(peak_l);
-                    entry[1] = entry[1].max(peak_r);
+                // Bus-Effekt-Kette (Insert) auf die Spur-Summe.
+                if let Some(chain) = self.track_fx.get_mut(track_id) {
+                    chain.process(&mut self.track_buf);
+                }
+                // Spur-Gain/Pan über den Block rampen (zipper-frei bei Fader-/
+                // Automations-Sprüngen); Peak NACH dem Fader für die Meter.
+                let prev = self
+                    .track_gain_smooth
+                    .get(track_id)
+                    .copied()
+                    .unwrap_or(*target);
+                let (peak_l, peak_r) = apply_stereo_ramp(&mut self.track_buf, prev, *target);
+                self.track_gain_smooth.insert(track_id.clone(), *target);
+                let entry = tick_tracks.entry(track_id.clone()).or_insert([0.0, 0.0]);
+                entry[0] = entry[0].max(peak_l);
+                entry[1] = entry[1].max(peak_r);
+                for i in 0..self.mix_buf.len() {
+                    self.mix_buf[i] += self.track_buf[i];
                 }
             }
+
+            // Quelle (track_id None): ungeregelt direkt in den Master.
+            for dec in self.audio_decoders.iter_mut() {
+                if dec.track_id.is_some() {
+                    continue;
+                }
+                let (frames, _, _) = dec.mix_into(&mut self.mix_buf);
+                if frames > 0 {
+                    any_frames = true;
+                }
+            }
+
             if !any_frames {
                 self.debug_starved += 1;
                 break;
@@ -1019,6 +1112,23 @@ impl PlayerEngine {
         if wrote_any {
             state.audio.track_levels = tick_tracks;
             state.audio.master_level = tick_master;
+            // Live-Gain-Reduktion der Dynamikstufen (Clip- + Spur-Ketten)
+            // für die GR-Meter im Effekteinstellungen-Panel sammeln.
+            let mut fx_gr: std::collections::HashMap<String, f32> =
+                std::collections::HashMap::new();
+            for dec in &self.audio_decoders {
+                if let Some(chain) = &dec.fx_chain {
+                    for (id, gr) in chain.dynamic_gain_reductions() {
+                        fx_gr.insert(id, gr);
+                    }
+                }
+            }
+            for chain in self.track_fx.values() {
+                for (id, gr) in chain.dynamic_gain_reductions() {
+                    fx_gr.insert(id, gr);
+                }
+            }
+            state.audio.fx_gain_reduction = fx_gr;
         }
 
         self.debug_ticks += 1;

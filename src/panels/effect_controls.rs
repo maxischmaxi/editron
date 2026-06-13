@@ -11,8 +11,9 @@
 //! Lautstärke + Audio-Effekte des Partners.
 
 use crate::core::animation::{AnimatedParam, Keyframe, ParamId, ParamRef, KF_TIME_EPS};
+use crate::core::audio_fx;
 use crate::core::compose;
-use crate::core::effects::ParamUi;
+use crate::core::effects::{EffectKind, ParamUi};
 use crate::core::timeline::{TimelineClip, TimelineStore, TrackKind};
 use crate::overlays::context_menu::{CustomAction, MenuEntry, MenuItem};
 use crate::panels::color::section_header;
@@ -34,6 +35,10 @@ const ROW_H: f32 = 26.0;
 const SECTION_H: f32 = 32.0;
 const EFFECT_H: f32 = 30.0;
 const RULER_H: f32 = 22.0;
+/// Höhe der Effekt-Visualisierung (EQ-Kurve, Kompressor-Kennlinie).
+const VIZ_H: f32 = 132.0;
+/// Audio-Mixdown-Rate (für die EQ-Kurve, identisch zur Engine).
+const VIZ_RATE: u32 = 48000;
 /// Breite der linken Parameter-Spalte; rechts beginnen die Keyframe-Spuren.
 const LEFT_W: f32 = 300.0;
 const KEY_R: f32 = 5.0;
@@ -70,6 +75,15 @@ struct ValueDrag {
     start_x: f32,
     step: f64,
     history_pushed: bool,
+}
+
+/// Laufendes Umsortieren einer Effekt-Instanz im Stapel (Label ziehen).
+struct FxReorder {
+    /// Index in `clips` (Video/Audio-Partner werden getrennt sortiert).
+    clip: usize,
+    fx_id: String,
+    start_y: f32,
+    moved: bool,
 }
 
 /// Anzeige-Metadaten eines Parameters (eingebaut oder Effekt-Spec).
@@ -148,6 +162,12 @@ enum Row {
         fx_idx: usize,
         p_idx: usize,
     },
+    /// Visualisierung eines Audio-Effekts (EQ-Frequenzgang bzw. Kompressor-
+    /// Kennlinie + GR-Meter) — oberhalb der Parameter der Instanz.
+    FxViz {
+        clip: usize,
+        fx_idx: usize,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -169,6 +189,8 @@ pub struct EffectControlsPanel {
     selected_keys: Vec<SelKey>,
     key_drag: Option<KeyDrag>,
     value_drag: Option<ValueDrag>,
+    /// Laufendes Drag-to-Reorder einer Effekt-Instanz.
+    fx_reorder: Option<FxReorder>,
     /// Inline-Eingabe eines Werts: (Clip, Parameter, Feld).
     edit: Option<(String, ParamRef, TextInputState)>,
     /// Box-Auswahl: Startpunkt in Bildschirmkoordinaten.
@@ -188,6 +210,7 @@ impl Default for EffectControlsPanel {
             selected_keys: Vec::new(),
             key_drag: None,
             value_drag: None,
+            fx_reorder: None,
             edit: None,
             box_select: None,
             ruler_drag: false,
@@ -210,6 +233,110 @@ fn parse_value(s: &str) -> Option<f64> {
 fn draw_diamond(ui: &mut Ui, cx: f32, cy: f32, r: f32, fill: raylib::color::Color, line: raylib::color::Color) {
     ui.d.draw_poly(v2(cx, cy), 4, r, 0.0, fill);
     ui.d.draw_poly_lines(v2(cx, cy), 4, r, 0.0, line);
+}
+
+/// EQ-Frequenzgang (20 Hz–20 kHz, ±18 dB) zeichnen. Nutzt dieselben Filter-
+/// Koeffizienten wie der DSP-Pfad (`audio_fx::eq_response_db`) — die Kurve
+/// zeigt also exakt, was zu hören ist. `values` = 12 EQ-Parameter.
+fn draw_eq_curve(ui: &mut Ui, area: Rect, values: &[f64]) {
+    const FMIN: f64 = 20.0;
+    const FMAX: f64 = 20000.0;
+    const DB: f64 = 18.0;
+    let (lf0, lf1) = (FMIN.log10(), FMAX.log10());
+    let x_of = |f: f64| area.x + ((f.log10() - lf0) / (lf1 - lf0)) as f32 * area.w;
+    let y_of = |db: f64| area.y + area.h * 0.5 - (db / DB) as f32 * (area.h * 0.5);
+    for db in [-12.0, -6.0, 0.0, 6.0, 12.0] {
+        let yy = y_of(db);
+        let col = if db.abs() < 0.01 {
+            theme::LINE_STRONG
+        } else {
+            theme::with_alpha(theme::LINE, 90)
+        };
+        ui.hline(area.x, yy, area.w, col);
+    }
+    for (f, lbl) in [(100.0, "100"), (1000.0, "1k"), (10000.0, "10k")] {
+        let xx = x_of(f);
+        ui.vline(xx, area.y, area.h, theme::with_alpha(theme::LINE, 70));
+        ui.text_left(
+            lbl,
+            Rect::new(xx + 2.0, area.bottom() - 13.0, 26.0, 12.0),
+            theme::TEXT_3,
+            FontKind::Mono11,
+        );
+    }
+    let n = (area.w as usize).clamp(24, 480);
+    let mut prev: Option<Vector2> = None;
+    for i in 0..=n {
+        let frac = i as f64 / n as f64;
+        let f = 10f64.powf(lf0 + frac * (lf1 - lf0));
+        let db = audio_fx::eq_response_db(values, VIZ_RATE, f).clamp(-DB, DB);
+        let p = v2(area.x + frac as f32 * area.w, y_of(db));
+        if let Some(pp) = prev {
+            ui.d.draw_line_ex(pp, p, 1.6, theme::ACCENT);
+        }
+        prev = Some(p);
+    }
+    // Band-Mittelpunkte als Punkte (Frequenz/Gain je Band).
+    for b in 0..4 {
+        let f = values.get(b * 3).copied().unwrap_or(0.0);
+        let g = values.get(b * 3 + 1).copied().unwrap_or(0.0).clamp(-DB, DB);
+        if f <= 0.0 {
+            continue;
+        }
+        let p = v2(x_of(f), y_of(g));
+        ui.d.draw_circle(p.x as i32, p.y as i32, 3.5, theme::ACCENT_HOVER);
+    }
+}
+
+/// Kompressor-Kennlinie (Eingang→Ausgang, dB) + Live-Gain-Reduktions-Meter.
+/// `values` = [Threshold, Ratio, Attack, Release, Makeup].
+fn draw_comp_curve(ui: &mut Ui, area: Rect, values: &[f64], gr_db: f32) {
+    const LO: f64 = -54.0;
+    const HI: f64 = 0.0;
+    let thr = values.first().copied().unwrap_or(-18.0);
+    let ratio = values.get(1).copied().unwrap_or(4.0).max(1.0);
+    let makeup = values.get(4).copied().unwrap_or(0.0);
+    let meter_w = 26.0;
+    let plot = Rect::new(area.x, area.y, (area.w - meter_w - 6.0).max(20.0), area.h);
+    let x_of = |din: f64| plot.x + ((din - LO) / (HI - LO)) as f32 * plot.w;
+    let y_of = |dout: f64| plot.bottom() - ((dout.clamp(LO, HI) - LO) / (HI - LO)) as f32 * plot.h;
+    // 1:1-Referenz.
+    ui.d.draw_line_ex(
+        v2(x_of(LO), y_of(LO)),
+        v2(x_of(HI), y_of(HI)),
+        1.0,
+        theme::with_alpha(theme::LINE, 120),
+    );
+    // Threshold-Markierung.
+    let tx = x_of(thr.clamp(LO, HI));
+    ui.vline(tx, plot.y, plot.h, theme::with_alpha(theme::WARNING, 150));
+    // Kennlinie (Knie hart, Makeup eingerechnet).
+    let n = (plot.w as usize).clamp(16, 320);
+    let mut prev: Option<Vector2> = None;
+    for i in 0..=n {
+        let din = LO + (i as f64 / n as f64) * (HI - LO);
+        let dout = if din <= thr {
+            din
+        } else {
+            thr + (din - thr) / ratio
+        } + makeup;
+        let p = v2(x_of(din), y_of(dout));
+        if let Some(pp) = prev {
+            ui.d.draw_line_ex(pp, p, 1.6, theme::ACCENT);
+        }
+        prev = Some(p);
+    }
+    // Live-GR-Meter (0..24 dB, von oben nach unten).
+    let meter = Rect::new(area.right() - meter_w, area.y + 2.0, meter_w - 4.0, area.h - 16.0);
+    ui.fill(meter, theme::SURFACE_2);
+    let gr = (gr_db / 24.0).clamp(0.0, 1.0);
+    ui.fill(Rect::new(meter.x, meter.y, meter.w, gr * meter.h), theme::WARNING);
+    ui.text_centered(
+        "GR",
+        Rect::new(meter.x, area.bottom() - 12.0, meter.w, 11.0),
+        theme::TEXT_3,
+        FontKind::Mono11,
+    );
 }
 
 /// Medienzeit ↔ x-Position in der Keyframe-Spur (Clip-lokal): läuft über
@@ -260,6 +387,10 @@ impl EffectControlsPanel {
             rows.push(Row::EffectHeader { clip: clip_idx, fx_idx });
             if self.collapsed_fx.contains(&inst.id) {
                 continue;
+            }
+            // Visualisierung über den Reglern: EQ-Kurve bzw. Kompressor-Kennlinie.
+            if matches!(inst.kind, EffectKind::Equalizer | EffectKind::Compressor) {
+                rows.push(Row::FxViz { clip: clip_idx, fx_idx });
             }
             let specs = inst.kind.specs();
             let mut i = 0;
@@ -431,6 +562,7 @@ impl Panel for EffectControlsPanel {
             .map(|r| match r {
                 Row::Section { .. } => SECTION_H,
                 Row::EffectHeader { .. } => EFFECT_H,
+                Row::FxViz { .. } => VIZ_H,
                 _ => ROW_H,
             })
             .sum::<f32>()
@@ -457,6 +589,7 @@ impl Panel for EffectControlsPanel {
             OpenKeyMenu { key: SelKey },
             EffectToggle(String, String),
             EffectMove(String, String, i32),
+            EffectReorder(String, String, usize),
             EffectRemove(String, String),
             EffectReset(String, String),
             EffectCollapse(String),
@@ -464,6 +597,9 @@ impl Panel for EffectControlsPanel {
         }
         let mut acts: Vec<Act> = Vec::new();
         let mut hover_any_key = false;
+        // Effekt-Header-Positionen (Clip-Index, fx_idx, fx_id, y-oben) für
+        // Drag-to-Reorder.
+        let mut fx_spans: Vec<(usize, usize, String, f32)> = Vec::new();
         // Sichtbare Keys für die Box-Auswahl: (SelKey, Position).
         let mut key_positions: Vec<(SelKey, Vector2)> = Vec::new();
 
@@ -570,7 +706,28 @@ impl Panel for EffectControlsPanel {
                         if inst.enabled { theme::TEXT_1 } else { theme::TEXT_3 },
                         FontKind::Sans12Medium,
                     );
-                    if it.clicked {
+                    // Drag-to-Reorder: Label-Zelle ist die Greifzone (Buttons
+                    // ausgespart). Beginn der Geste hier, Auswertung nach der
+                    // Schleife (Borrow-Trennung).
+                    fx_spans.push((*clip, *fx_idx, inst.id.clone(), y));
+                    if ui.input.left_pressed
+                        && ui.mouse_in(label_cell)
+                        && self.fx_reorder.is_none()
+                        && self.value_drag.is_none()
+                        && self.key_drag.is_none()
+                    {
+                        self.fx_reorder = Some(FxReorder {
+                            clip: *clip,
+                            fx_id: inst.id.clone(),
+                            start_y: ui.input.mouse.y,
+                            moved: false,
+                        });
+                    }
+                    let reordering_this = self
+                        .fx_reorder
+                        .as_ref()
+                        .is_some_and(|r| r.fx_id == inst.id && r.moved);
+                    if it.clicked && !reordering_this {
                         acts.push(Act::EffectCollapse(inst.id.clone()));
                     }
                     if it.right_clicked {
@@ -583,6 +740,32 @@ impl Panel for EffectControlsPanel {
                     }
                     ui.hline(x, y + EFFECT_H - 1.0, rect.w - 12.0, theme::with_alpha(theme::LINE, 140));
                     y += EFFECT_H;
+                }
+                Row::FxViz { clip, fx_idx } => {
+                    let clip_ref = &clips[*clip];
+                    let Some(inst) = clip_ref.effects.get(*fx_idx) else {
+                        y += VIZ_H;
+                        continue;
+                    };
+                    let media_t = Self::playhead_media_t(clip_ref, playhead);
+                    let values = inst.eval(media_t).values;
+                    let area_box = Rect::new(x + 10.0, y + 6.0, (rect.w - 28.0).max(80.0), VIZ_H - 16.0);
+                    ui.fill_rounded(area_box, theme::RADIUS_SM, theme::SURFACE_0);
+                    ui.stroke_rounded(area_box, theme::RADIUS_SM, 1.0, theme::LINE);
+                    match inst.kind {
+                        EffectKind::Equalizer => draw_eq_curve(ui, area_box, &values),
+                        EffectKind::Compressor => {
+                            let gr = app
+                                .audio
+                                .fx_gain_reduction
+                                .get(&inst.id)
+                                .copied()
+                                .unwrap_or(0.0);
+                            draw_comp_curve(ui, area_box, &values, gr);
+                        }
+                        _ => {}
+                    }
+                    y += VIZ_H;
                 }
                 Row::UniformToggle { clip } => {
                     let clip_ref = &clips[*clip];
@@ -1086,6 +1269,47 @@ impl Panel for EffectControlsPanel {
             }
         }
 
+        // ---- Drag-to-Reorder des Effekt-Stapels ----
+        if let Some(mut re) = self.fx_reorder.take() {
+            let my = ui.input.mouse.y;
+            if (my - re.start_y).abs() > DRAG_THRESHOLD {
+                re.moved = true;
+            }
+            // Zielindex = Anzahl der ANDEREN Header derselben Spur oberhalb.
+            let dest = fx_spans
+                .iter()
+                .filter(|(c, _, fid, yy)| {
+                    *c == re.clip && *fid != re.fx_id && *yy + EFFECT_H / 2.0 < my
+                })
+                .count();
+            if ui.input.left_down {
+                if re.moved {
+                    ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_NS);
+                    // Einfügelinie an der Lücke zwischen den anderen Headern.
+                    let mut others: Vec<f32> = fx_spans
+                        .iter()
+                        .filter(|(c, _, fid, _)| *c == re.clip && *fid != re.fx_id)
+                        .map(|(_, _, _, yy)| *yy)
+                        .collect();
+                    others.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let line_y = if dest < others.len() {
+                        others[dest]
+                    } else {
+                        others.last().map(|t| t + EFFECT_H).unwrap_or(my)
+                    };
+                    ui.fill(Rect::new(x, line_y - 1.0, left_w - 8.0, 2.0), theme::ACCENT);
+                }
+                self.fx_reorder = Some(re);
+            } else {
+                // Loslassen: bei Bewegung umsortieren (ein Undo-Schritt).
+                if re.moved {
+                    if let Some(clip) = clips.get(re.clip) {
+                        acts.push(Act::EffectReorder(clip.id.clone(), re.fx_id.clone(), dest));
+                    }
+                }
+            }
+        }
+
         // ---- Drop-Ziel: Effekt aus dem Effekte-Panel ----
         if let Some(DragPayload::Effect(_)) = ui.drag_over(rect) {
             ui.stroke(rect.inset_xy(1.0, 1.0), 2.0, theme::ACCENT);
@@ -1192,6 +1416,9 @@ impl Panel for EffectControlsPanel {
                 }
                 Act::EffectMove(clip_id, fx_id, delta) => {
                     app.timeline.effects_move(&clip_id, &fx_id, delta);
+                }
+                Act::EffectReorder(clip_id, fx_id, dest) => {
+                    app.timeline.effects_reorder(&clip_id, &fx_id, dest);
                 }
                 Act::EffectRemove(clip_id, fx_id) => {
                     app.timeline.effects_remove(&clip_id, &fx_id);

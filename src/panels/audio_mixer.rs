@@ -4,7 +4,9 @@
 //! zeigen die echten Spitzenpegel aus `state.audio` (dBFS-Skala, −60..0,
 //! mit Peak-Hold und Übersteuerungs-LED).
 
+use crate::core::effects::EffectKind;
 use crate::core::timeline::{track_name, TrackFlag, TrackKind};
+use crate::overlays::context_menu::{CustomAction, MenuEntry, MenuItem};
 use crate::panels::Panel;
 use crate::services::Services;
 use crate::state::AppState;
@@ -12,13 +14,16 @@ use crate::theme;
 use crate::ui::geom::Rect;
 use crate::ui::widgets::scroll::ScrollState;
 use crate::ui::widgets::slider;
-use crate::ui::{FontKind, Ui};
+use crate::ui::{DragPayload, FontKind, Ui};
 use raylib::consts::MouseCursor;
 use std::collections::HashMap;
 
 const STRIP_W: f32 = 64.0;
-const STRIP_H: f32 = 308.0;
+/// Inkl. Insert-Rack unter Mute/Solo (bis zu 4 sichtbare Bus-Effekte).
+const STRIP_H: f32 = 430.0;
 const METER_H: f32 = 160.0;
+/// Maximal sichtbare Insert-Effekte je Kanalzug.
+const MAX_INSERTS: usize = 4;
 /// Sichtbarer dB-Bereich der Meter (−60..0 dBFS).
 const METER_RANGE_DB: f32 = 60.0;
 /// Nachleuchtdauer der Übersteuerungs-LED (Sekunden).
@@ -89,6 +94,10 @@ struct StripData {
     muted: bool,
     solo: bool,
     level: [f32; 2],
+    /// Bus-Effekte (fx_id, Art, aktiv) der Spur (Audio-Inserts).
+    inserts: Vec<(String, EffectKind, bool)>,
+    /// Spur hat aktive Lautstärke-/Pan-Automation.
+    automated: bool,
 }
 
 enum StripEdit {
@@ -126,6 +135,13 @@ impl Panel for AudioMixerPanel {
                     .get(&track.id)
                     .copied()
                     .unwrap_or([0.0, 0.0]),
+                inserts: track
+                    .effects
+                    .iter()
+                    .filter(|e| e.kind.is_audio())
+                    .map(|e| (e.id.clone(), e.kind, e.enabled))
+                    .collect(),
+                automated: track.has_automation(),
             });
         }
         strips.push(StripData {
@@ -136,6 +152,8 @@ impl Panel for AudioMixerPanel {
             muted: false,
             solo: false,
             level: app.audio.master_level,
+            inserts: Vec::new(),
+            automated: false,
         });
 
         // Meter-Zustände verwaister Spuren aufräumen.
@@ -368,6 +386,146 @@ impl Panel for AudioMixerPanel {
                         } else {
                             StripEdit::ToggleSolo(track_id.clone())
                         });
+                    }
+                }
+
+                // ---- Insert-Rack: Bus-Effekte der Spur (Drag&Drop aus dem
+                // Effekte-Panel, Klick = Bypass, Rechtsklick = Menü) ----
+                cy += 28.0;
+                let hdr = if strip.automated { "Inserts · Auto" } else { "Inserts" };
+                let hdr_col = if strip.automated { theme::ACCENT } else { theme::TEXT_3 };
+                ui.text_centered(hdr, Rect::new(card.x, cy, card.w, 12.0), hdr_col, FontKind::Mono11);
+                cy += 14.0;
+                let rack_x = card.x + 6.0;
+                let rack_w = card.w - 12.0;
+                for (slot, (fx_id, kind, enabled)) in strip.inserts.iter().take(MAX_INSERTS).enumerate() {
+                    let row = Rect::new(rack_x, cy, rack_w, 18.0);
+                    let row_id = ui.id(("mixer.ins", i, slot));
+                    let it = ui.interact(row_id, row);
+                    ui.fill_rounded(
+                        row,
+                        theme::RADIUS_XS,
+                        if it.hovered { theme::SURFACE_3 } else { theme::SURFACE_1 },
+                    );
+                    let (icol, tcol) = if *enabled {
+                        (theme::ACCENT, theme::TEXT_2)
+                    } else {
+                        let dim = theme::with_alpha(theme::TEXT_3, 140);
+                        (dim, dim)
+                    };
+                    ui.icon(kind.icon(), Rect::new(row.x + 2.0, row.y + 3.0, 12.0, 12.0), 12.0, icol);
+                    let label = ui.font(FontKind::Mono11).ellipsize(kind.label(), rack_w - 18.0);
+                    ui.text_left(
+                        &label,
+                        Rect::new(row.x + 16.0, row.y, rack_w - 18.0, 18.0),
+                        tcol,
+                        FontKind::Mono11,
+                    );
+                    if it.hovered {
+                        ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                    }
+                    if it.clicked {
+                        app.timeline.track_effects_toggle_enabled(track_id, fx_id);
+                    }
+                    if it.right_clicked {
+                        let (tid, fid) = (track_id.clone(), fx_id.clone());
+                        app.context_menu.show(
+                            ui.input.mouse.x,
+                            ui.input.mouse.y,
+                            vec![
+                                MenuEntry::Item(
+                                    MenuItem::custom(
+                                        if *enabled { "Bypass" } else { "Aktivieren" },
+                                        CustomAction::TrackEffectsToggle { track_id: tid.clone(), fx_id: fid.clone() },
+                                    )
+                                    .with_icon("zap"),
+                                ),
+                                MenuEntry::Item(
+                                    MenuItem::custom(
+                                        "Nach oben",
+                                        CustomAction::TrackEffectsMove { track_id: tid.clone(), fx_id: fid.clone(), delta: -1 },
+                                    )
+                                    .with_icon("chevron-up"),
+                                ),
+                                MenuEntry::Item(
+                                    MenuItem::custom(
+                                        "Nach unten",
+                                        CustomAction::TrackEffectsMove { track_id: tid.clone(), fx_id: fid.clone(), delta: 1 },
+                                    )
+                                    .with_icon("chevron-down"),
+                                ),
+                                MenuEntry::Item(
+                                    MenuItem::custom(
+                                        "Zurücksetzen",
+                                        CustomAction::TrackEffectsReset { track_id: tid.clone(), fx_id: fid.clone() },
+                                    )
+                                    .with_icon("rotate-ccw"),
+                                ),
+                                MenuEntry::Separator,
+                                MenuEntry::Item(
+                                    MenuItem::custom(
+                                        "Entfernen",
+                                        CustomAction::TrackEffectsRemove { track_id: tid, fx_id: fid },
+                                    )
+                                    .with_icon("trash-2"),
+                                ),
+                            ],
+                        );
+                    }
+                    cy += 20.0;
+                }
+                if strip.inserts.len() > MAX_INSERTS {
+                    ui.text_centered(
+                        &format!("+{} weitere", strip.inserts.len() - MAX_INSERTS),
+                        Rect::new(card.x, cy, card.w, 12.0),
+                        theme::TEXT_3,
+                        FontKind::Mono11,
+                    );
+                    cy += 14.0;
+                }
+                let add = Rect::new(rack_x, cy, rack_w, 18.0);
+                let add_id = ui.id(("mixer.insadd", i));
+                let ait = ui.interact(add_id, add);
+                ui.stroke_rounded(
+                    add,
+                    theme::RADIUS_XS,
+                    1.0,
+                    if ait.hovered { theme::LINE_STRONG } else { theme::LINE },
+                );
+                ui.text_centered(
+                    "+ Effekt",
+                    add,
+                    if ait.hovered { theme::TEXT_1 } else { theme::TEXT_3 },
+                    FontKind::Mono11,
+                );
+                if ait.hovered {
+                    ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                }
+                if ait.clicked {
+                    let tid = track_id.clone();
+                    let items: Vec<MenuEntry> = EffectKind::ALL
+                        .iter()
+                        .filter(|k| k.is_audio())
+                        .map(|k| {
+                            MenuEntry::Item(
+                                MenuItem::custom(
+                                    k.label(),
+                                    CustomAction::TrackEffectsAdd { track_id: tid.clone(), kind: *k },
+                                )
+                                .with_icon(k.icon()),
+                            )
+                        })
+                        .collect();
+                    app.context_menu.show(ui.input.mouse.x, ui.input.mouse.y, items);
+                }
+
+                // Drop-Ziel: Audio-Effekt aus dem Effekte-Panel auf den Kanalzug.
+                if matches!(ui.drag_over(card), Some(DragPayload::Effect(k)) if k.is_audio()) {
+                    ui.stroke_rounded(card, theme::RADIUS_SM, 2.0, theme::ACCENT);
+                }
+                if let Some(DragPayload::Effect(kind)) = ui.accept_drop(card) {
+                    if kind.is_audio() {
+                        app.timeline.track_effects_add(track_id, kind);
                     }
                 }
             }

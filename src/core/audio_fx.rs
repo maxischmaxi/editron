@@ -1,23 +1,39 @@
-//! Audio-Effekt-DSP: verarbeitet dekodierte f32-Samples pro Clip — im
-//! Player-Mixdown (`core/player.rs`, vor Gain/Pan) und im Export-Audio-Mix
-//! (`core/export.rs`) mit IDENTISCHEM Code, damit Vorschau und Export gleich
-//! klingen. Eine [`AudioFxChain`] wird aus den aktiven Audio-Effekten eines
-//! Clips gebaut; Filterzustände leben über Blockgrenzen hinweg. Animierte
-//! Parameter werden blockweise über [`AudioFxChain::retune`] nachgeführt
-//! (Block-Rate-Automation), ohne die Zustände zu verwerfen.
+//! Audio-Effekt-DSP: verarbeitet dekodierte f32-Samples blockweise — im
+//! Player-Mixdown (`core/player.rs`, vor Spur-Gain/Pan) und im Export-Audio-
+//! Mix (`core/export.rs`) mit IDENTISCHEM Code, damit Vorschau und Export
+//! gleich klingen. Eine [`AudioFxChain`] wird aus den aktiven Audio-Effekten
+//! eines Clips ODER einer Spur gebaut; Filterzustände leben über
+//! Blockgrenzen hinweg (deshalb ist das Ergebnis blockgrößen-unabhängig —
+//! die Grundlage der Wiedergabe/Export-Parität). Animierte Parameter werden
+//! blockweise über [`AudioFxChain::retune`] nachgeführt (Block-Rate-
+//! Automation), ohne die Zustände zu verwerfen. Zipper-anfällige Stufen
+//! (Gain, Limiter) glätten ihre Wirkung pro Sample.
 
 use crate::core::effects::{EffectInstance, EffectKind};
 
-/// dB → linearer Faktor.
+/// dB → linearer Faktor; ≤ −60 dB gilt als −∞ (stumm). Gemeinsame Definition
+/// für Player, Export und DSP — so klingen alle Pfade gleich.
 #[inline]
-fn db_to_linear(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
+pub fn db_to_linear(db: f64) -> f32 {
+    if db <= -60.0 {
+        0.0
+    } else {
+        10f32.powf(db as f32 / 20.0)
+    }
 }
 
 /// Linear → dB (Untergrenze −120 dB).
 #[inline]
 fn linear_to_db(v: f32) -> f32 {
     20.0 * v.max(1e-6).log10()
+}
+
+/// Stereo-Balance (−1 = ganz links, +1 = ganz rechts): dämpft die abgewandte
+/// Seite. Gemeinsame Definition für Player und Export.
+#[inline]
+pub fn pan_gains(pan: f64) -> (f32, f32) {
+    let p = pan.clamp(-1.0, 1.0) as f32;
+    (1.0 - p.max(0.0), 1.0 + p.min(0.0))
 }
 
 /// Einpol-Glättungskoeffizient für eine Zeitkonstante in Millisekunden.
@@ -29,7 +45,7 @@ fn smoothing_coef(ms: f64, rate: u32) -> f32 {
 
 // ------------------------------------------------------------------ Biquad
 
-/// RBJ-Biquad (Audio EQ Cookbook), Direct Form 1.
+/// RBJ-Biquad (Audio EQ Cookbook), Direct Form 1. `a0` ist auf 1 normiert.
 #[derive(Clone, Copy, Default)]
 struct Biquad {
     b0: f32,
@@ -44,12 +60,14 @@ struct Biquad {
 }
 
 impl Biquad {
-    fn set_low_shelf(&mut self, rate: u32, freq: f64, gain_db: f64) {
+    /// Low-Shelf mit Steilheits-Parameter `slope` (≈ Güte; 1 = maximal steil
+    /// ohne Überschwingen, < 1 flacher).
+    fn set_low_shelf(&mut self, rate: u32, freq: f64, gain_db: f64, slope: f64) {
         let a = 10f64.powf(gain_db / 40.0);
-        let w0 = 2.0 * std::f64::consts::PI * freq / rate as f64;
+        let w0 = 2.0 * std::f64::consts::PI * freq.clamp(1.0, rate as f64 / 2.0) / rate as f64;
         let (sin, cos) = w0.sin_cos();
-        // Shelf-Steilheit S = 1.
-        let alpha = sin / 2.0 * (2.0f64).sqrt();
+        let s = slope.clamp(0.05, 5.0);
+        let alpha = sin / 2.0 * ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).max(0.0).sqrt();
         let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
         let a0 = (a + 1.0) + (a - 1.0) * cos + two_sqrt_a_alpha;
         self.b0 = ((a * ((a + 1.0) - (a - 1.0) * cos + two_sqrt_a_alpha)) / a0) as f32;
@@ -59,11 +77,12 @@ impl Biquad {
         self.a2 = (((a + 1.0) + (a - 1.0) * cos - two_sqrt_a_alpha) / a0) as f32;
     }
 
-    fn set_high_shelf(&mut self, rate: u32, freq: f64, gain_db: f64) {
+    fn set_high_shelf(&mut self, rate: u32, freq: f64, gain_db: f64, slope: f64) {
         let a = 10f64.powf(gain_db / 40.0);
-        let w0 = 2.0 * std::f64::consts::PI * freq / rate as f64;
+        let w0 = 2.0 * std::f64::consts::PI * freq.clamp(1.0, rate as f64 / 2.0) / rate as f64;
         let (sin, cos) = w0.sin_cos();
-        let alpha = sin / 2.0 * (2.0f64).sqrt();
+        let s = slope.clamp(0.05, 5.0);
+        let alpha = sin / 2.0 * ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).max(0.0).sqrt();
         let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
         let a0 = (a + 1.0) - (a - 1.0) * cos + two_sqrt_a_alpha;
         self.b0 = ((a * ((a + 1.0) + (a - 1.0) * cos + two_sqrt_a_alpha)) / a0) as f32;
@@ -75,15 +94,39 @@ impl Biquad {
 
     fn set_peaking(&mut self, rate: u32, freq: f64, gain_db: f64, q: f64) {
         let a = 10f64.powf(gain_db / 40.0);
-        let w0 = 2.0 * std::f64::consts::PI * freq / rate as f64;
+        let w0 = 2.0 * std::f64::consts::PI * freq.clamp(1.0, rate as f64 / 2.0) / rate as f64;
         let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * q);
+        let alpha = sin / (2.0 * q.max(0.01));
         let a0 = 1.0 + alpha / a;
         self.b0 = ((1.0 + alpha * a) / a0) as f32;
         self.b1 = ((-2.0 * cos) / a0) as f32;
         self.b2 = ((1.0 - alpha * a) / a0) as f32;
         self.a1 = ((-2.0 * cos) / a0) as f32;
         self.a2 = ((1.0 - alpha / a) / a0) as f32;
+    }
+
+    fn set_highpass(&mut self, rate: u32, freq: f64, q: f64) {
+        let w0 = 2.0 * std::f64::consts::PI * freq.clamp(1.0, rate as f64 / 2.0 - 1.0) / rate as f64;
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / (2.0 * q.max(0.01));
+        let a0 = 1.0 + alpha;
+        self.b0 = (((1.0 + cos) / 2.0) / a0) as f32;
+        self.b1 = ((-(1.0 + cos)) / a0) as f32;
+        self.b2 = (((1.0 + cos) / 2.0) / a0) as f32;
+        self.a1 = ((-2.0 * cos) / a0) as f32;
+        self.a2 = ((1.0 - alpha) / a0) as f32;
+    }
+
+    fn set_lowpass(&mut self, rate: u32, freq: f64, q: f64) {
+        let w0 = 2.0 * std::f64::consts::PI * freq.clamp(1.0, rate as f64 / 2.0 - 1.0) / rate as f64;
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / (2.0 * q.max(0.01));
+        let a0 = 1.0 + alpha;
+        self.b0 = (((1.0 - cos) / 2.0) / a0) as f32;
+        self.b1 = ((1.0 - cos) / a0) as f32;
+        self.b2 = (((1.0 - cos) / 2.0) / a0) as f32;
+        self.a1 = ((-2.0 * cos) / a0) as f32;
+        self.a2 = ((1.0 - alpha) / a0) as f32;
     }
 
     #[inline]
@@ -97,6 +140,48 @@ impl Biquad {
         self.y1 = y;
         y
     }
+
+    /// Betrag des Frequenzgangs |H(e^jω)| bei `freq` (linear). Grundlage der
+    /// EQ-Kurvenvisualisierung und der Frequenzgang-Tests.
+    fn magnitude(&self, freq: f64, rate: u32) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * freq / rate as f64;
+        let (s1, c1) = w.sin_cos();
+        let (s2, c2) = (2.0 * w).sin_cos();
+        // Zähler: b0 + b1 e^{-jw} + b2 e^{-2jw}
+        let nr = self.b0 as f64 + self.b1 as f64 * c1 + self.b2 as f64 * c2;
+        let ni = -(self.b1 as f64 * s1) - self.b2 as f64 * s2;
+        // Nenner: 1 + a1 e^{-jw} + a2 e^{-2jw}
+        let dr = 1.0 + self.a1 as f64 * c1 + self.a2 as f64 * c2;
+        let di = -(self.a1 as f64 * s1) - self.a2 as f64 * s2;
+        let num = (nr * nr + ni * ni).sqrt();
+        let den = (dr * dr + di * di).sqrt().max(1e-12);
+        num / den
+    }
+}
+
+// ----------------------------------------------------------- EQ-Frequenzgang
+
+/// Die vier EQ-Bänder eines [`EffectKind::Equalizer`] aus den ausgewerteten
+/// Parameterwerten lesen. Reihenfolge: (Frequenz, Gain dB, Q/Slope) je Band.
+/// Band 0 = Low-Shelf, 1+2 = Glocken, 3 = High-Shelf.
+fn eq_band_biquads(values: &[f64], rate: u32) -> [Biquad; 4] {
+    let v = |i: usize| values.get(i).copied().unwrap_or(0.0);
+    let mut b = [Biquad::default(); 4];
+    b[0].set_low_shelf(rate, v(0), v(1), v(2));
+    b[1].set_peaking(rate, v(3), v(4), v(5));
+    b[2].set_peaking(rate, v(6), v(7), v(8));
+    b[3].set_high_shelf(rate, v(9), v(10), v(11));
+    b
+}
+
+/// Kombinierter EQ-Frequenzgang in dB bei `freq` für die 12 EQ-Werte
+/// (gleiche Filter wie der DSP-Pfad → die Kurve zeigt exakt, was zu hören
+/// ist). Genutzt von der Kurvenvisualisierung und den Frequenzgang-Tests.
+pub fn eq_response_db(values: &[f64], rate: u32, freq: f64) -> f64 {
+    eq_band_biquads(values, rate)
+        .iter()
+        .map(|b| 20.0 * b.magnitude(freq, rate).max(1e-9).log10())
+        .sum()
 }
 
 // ----------------------------------------------------------------- Stages
@@ -162,10 +247,9 @@ const ALLPASS_LENS: [usize; 2] = [556, 441];
 const STEREO_SPREAD: usize = 23;
 
 enum Stage {
+    /// 4-Band parametrischer EQ: Low-Shelf, 2× Glocke, High-Shelf.
     Eq {
-        low: [Biquad; MAX_CHANNELS],
-        mid: [Biquad; MAX_CHANNELS],
-        high: [Biquad; MAX_CHANNELS],
+        bands: [[Biquad; MAX_CHANNELS]; 4],
     },
     Compressor {
         threshold_db: f32,
@@ -176,6 +260,26 @@ enum Stage {
         /// Geglätteter Pegel (linear) und geglättete Gain-Reduktion (dB).
         env: f32,
         gr_db: f32,
+    },
+    /// Brick-Wall-Limiter ohne Lookahead (Latenz unverändert): sofortiger
+    /// Attack hält den Pegel unter der Ceiling, sanfter Release vermeidet
+    /// Pumpen. Master-tauglich.
+    Limiter {
+        ceiling: f32,
+        release: f32,
+        gain: f32,
+        gr_db: f32,
+    },
+    Highpass {
+        bq: [Biquad; MAX_CHANNELS],
+    },
+    Lowpass {
+        bq: [Biquad; MAX_CHANNELS],
+    },
+    /// Verstärkung mit Parameter-Glättung (zipper-frei).
+    Gain {
+        target: f32,
+        current: f32,
     },
     Reverb {
         combs: Vec<Vec<Comb>>,
@@ -207,7 +311,7 @@ struct ChainStage {
     stage: Stage,
 }
 
-/// DSP-Kette eines Clips (Reihenfolge = Effekt-Stapel).
+/// DSP-Kette eines Clips oder einer Spur (Reihenfolge = Effekt-Stapel).
 pub struct AudioFxChain {
     rate: u32,
     channels: usize,
@@ -260,21 +364,43 @@ impl AudioFxChain {
                 .all(|(inst, st)| inst.id == st.fx_id && inst.kind == st.kind)
     }
 
-    /// Parameter zur Medienzeit nachführen (Filterzustände bleiben).
-    pub fn retune(&mut self, effects: &[&EffectInstance], media_t: f64) {
+    /// (fx_id, Gain-Reduktion dB) aller Dynamikstufen (Kompressor/Limiter) —
+    /// der Player sammelt sie nach jedem Block für die Live-Meter.
+    pub fn dynamic_gain_reductions(&self) -> Vec<(String, f32)> {
+        self.stages
+            .iter()
+            .filter_map(|s| match &s.stage {
+                Stage::Compressor { gr_db, .. } => Some((s.fx_id.clone(), *gr_db)),
+                Stage::Limiter { gr_db, .. } => Some((s.fx_id.clone(), *gr_db)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Parameter zur (Medien- bzw. Sequenz-)Zeit nachführen (Filterzustände
+    /// bleiben). Für Clip-Effekte ist `t` die Medienzeit, für Spur-Effekte
+    /// die Sequenzzeit.
+    pub fn retune(&mut self, effects: &[&EffectInstance], t: f64) {
         let rate = self.rate;
         for stage in &mut self.stages {
             let Some(inst) = effects.iter().find(|e| e.id == stage.fx_id) else {
                 continue;
             };
-            let r = inst.eval(media_t);
+            let r = inst.eval(t);
             let v = |i: usize| r.values.get(i).copied().unwrap_or(0.0);
             match &mut stage.stage {
-                Stage::Eq { low, mid, high } => {
+                Stage::Eq { bands } => {
+                    let bq = eq_band_biquads(&r.values, rate);
                     for ch in 0..MAX_CHANNELS {
-                        low[ch].set_low_shelf(rate, 120.0, v(0));
-                        mid[ch].set_peaking(rate, v(2).clamp(40.0, 16000.0), v(1), 0.9);
-                        high[ch].set_high_shelf(rate, 8000.0, v(3));
+                        for (i, b) in bq.iter().enumerate() {
+                            // Koeffizienten übernehmen, Zustand behalten.
+                            let st = &mut bands[i][ch];
+                            st.b0 = b.b0;
+                            st.b1 = b.b1;
+                            st.b2 = b.b2;
+                            st.a1 = b.a1;
+                            st.a2 = b.a2;
+                        }
                     }
                 }
                 Stage::Compressor {
@@ -289,7 +415,26 @@ impl AudioFxChain {
                     *ratio = (v(1).max(1.0)) as f32;
                     *attack = smoothing_coef(v(2), rate);
                     *release = smoothing_coef(v(3), rate);
-                    *makeup = db_to_linear(v(4) as f32);
+                    *makeup = db_to_linear(v(4));
+                }
+                Stage::Limiter {
+                    ceiling, release, ..
+                } => {
+                    *ceiling = db_to_linear(v(0)).max(1e-4);
+                    *release = smoothing_coef(v(1), rate);
+                }
+                Stage::Highpass { bq } => {
+                    for b in bq.iter_mut() {
+                        b.set_highpass(rate, v(0), v(1));
+                    }
+                }
+                Stage::Lowpass { bq } => {
+                    for b in bq.iter_mut() {
+                        b.set_lowpass(rate, v(0), v(1));
+                    }
+                }
+                Stage::Gain { target, .. } => {
+                    *target = db_to_linear(v(0));
                 }
                 Stage::Reverb {
                     feedback,
@@ -335,12 +480,14 @@ impl AudioFxChain {
         }
         for stage in &mut self.stages {
             match &mut stage.stage {
-                Stage::Eq { low, mid, high } => {
+                Stage::Eq { bands } => {
                     for frame in samples.chunks_exact_mut(ch) {
                         for (c, s) in frame.iter_mut().enumerate() {
-                            let y = low[c].process(*s);
-                            let y = mid[c].process(y);
-                            *s = high[c].process(y);
+                            let mut y = *s;
+                            for band in bands.iter_mut() {
+                                y = band[c].process(y);
+                            }
+                            *s = y;
                         }
                     }
                 }
@@ -363,9 +510,59 @@ impl AudioFxChain {
                         let target_gr = over * (1.0 - 1.0 / *ratio);
                         let coef = if target_gr > *gr_db { *attack } else { *release };
                         *gr_db = target_gr + (*gr_db - target_gr) * coef;
-                        let gain = db_to_linear(-*gr_db) * *makeup;
+                        let gain = db_to_linear(-*gr_db as f64) * *makeup;
                         for s in frame.iter_mut() {
                             *s *= gain;
+                        }
+                    }
+                }
+                Stage::Limiter {
+                    ceiling,
+                    release,
+                    gain,
+                    gr_db,
+                } => {
+                    for frame in samples.chunks_exact_mut(ch) {
+                        let level = frame.iter().fold(0f32, |m, s| m.max(s.abs()));
+                        // Nötige Verstärkung, um unter der Ceiling zu bleiben.
+                        let target = if level * *gain > *ceiling {
+                            (*ceiling / level.max(1e-9)).min(1.0)
+                        } else {
+                            1.0
+                        };
+                        // Sofortiger Attack (Gain fällt), sanfter Release.
+                        if target < *gain {
+                            *gain = target;
+                        } else {
+                            *gain = target + (*gain - target) * *release;
+                        }
+                        *gr_db = -linear_to_db(*gain);
+                        for s in frame.iter_mut() {
+                            *s = (*s * *gain).clamp(-*ceiling, *ceiling);
+                        }
+                    }
+                }
+                Stage::Highpass { bq } => {
+                    for frame in samples.chunks_exact_mut(ch) {
+                        for (c, s) in frame.iter_mut().enumerate() {
+                            *s = bq[c].process(*s);
+                        }
+                    }
+                }
+                Stage::Lowpass { bq } => {
+                    for frame in samples.chunks_exact_mut(ch) {
+                        for (c, s) in frame.iter_mut().enumerate() {
+                            *s = bq[c].process(*s);
+                        }
+                    }
+                }
+                Stage::Gain { target, current } => {
+                    // Pro Sample zum Ziel gleiten — kein Zipper bei Sprüngen.
+                    let coef = smoothing_coef(5.0, self.rate);
+                    for frame in samples.chunks_exact_mut(ch) {
+                        *current = *target + (*current - *target) * coef;
+                        for s in frame.iter_mut() {
+                            *s *= *current;
                         }
                     }
                 }
@@ -443,9 +640,7 @@ fn new_stage(kind: EffectKind, rate: u32, channels: usize) -> Stage {
     let scaled = |base: usize, spread: usize| ((base + spread) as f64 * scale) as usize;
     match kind {
         EffectKind::Equalizer => Stage::Eq {
-            low: Default::default(),
-            mid: Default::default(),
-            high: Default::default(),
+            bands: Default::default(),
         },
         EffectKind::Compressor => Stage::Compressor {
             threshold_db: -18.0,
@@ -455,6 +650,22 @@ fn new_stage(kind: EffectKind, rate: u32, channels: usize) -> Stage {
             makeup: 1.0,
             env: 0.0,
             gr_db: 0.0,
+        },
+        EffectKind::Limiter => Stage::Limiter {
+            ceiling: db_to_linear(-1.0),
+            release: smoothing_coef(50.0, rate),
+            gain: 1.0,
+            gr_db: 0.0,
+        },
+        EffectKind::Highpass => Stage::Highpass {
+            bq: Default::default(),
+        },
+        EffectKind::Lowpass => Stage::Lowpass {
+            bq: Default::default(),
+        },
+        EffectKind::Gain => Stage::Gain {
+            target: 1.0,
+            current: 1.0,
         },
         EffectKind::Reverb => Stage::Reverb {
             combs: (0..channels)
@@ -494,12 +705,9 @@ fn new_stage(kind: EffectKind, rate: u32, channels: usize) -> Stage {
             wet: 0.4,
         },
         // Video-Effekte landen nie in der Audio-Kette.
-        _ => Stage::Gate {
-            threshold_db: -200.0,
-            attack: 0.0,
-            release: 0.0,
-            env: 1.0,
-            gain: 1.0,
+        _ => Stage::Gain {
+            target: 1.0,
+            current: 1.0,
         },
     }
 }
@@ -526,6 +734,14 @@ mod tests {
         (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
     }
 
+    /// Gemessene Verstärkung eines reinen Sinus durch die Kette (Faktor).
+    fn measured_gain(chain: &mut AudioFxChain, freq: f64) -> f32 {
+        let mut buf = sine(freq, RATE as usize);
+        chain.process(&mut buf);
+        // Zweite Hälfte (Einschwingen vorbei).
+        rms(&buf[RATE as usize..]) / (1.0 / 2f32.sqrt())
+    }
+
     fn instance(kind: EffectKind, values: &[(usize, f64)]) -> EffectInstance {
         let mut inst = EffectInstance::new(kind);
         for (i, v) in values {
@@ -534,25 +750,112 @@ mod tests {
         inst
     }
 
-    #[test]
-    fn eq_low_shelf_boosts_bass_not_treble() {
-        let inst = instance(EffectKind::Equalizer, &[(0, 12.0)]);
-        let fx = [&inst];
-        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
-        let mut low = sine(80.0, 48000);
-        chain.process(&mut low);
-        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
-        let mut high = sine(10000.0, 48000);
-        chain.process(&mut high);
-        // Einschwingphase überspringen.
-        let low_gain = rms(&low[24000..]) / 0.7071;
-        let high_gain = rms(&high[24000..]) / 0.7071;
-        assert!(low_gain > 3.0, "Bass ~+12 dB: {low_gain}");
-        assert!((0.8..1.2).contains(&high_gain), "Höhen neutral: {high_gain}");
+    fn eq(values: &[(usize, f64)]) -> EffectInstance {
+        instance(EffectKind::Equalizer, values)
     }
 
     #[test]
-    fn compressor_reduces_loud_signal() {
+    fn eq_low_shelf_boosts_bass_not_treble() {
+        // Low-Shelf 100 Hz, +12 dB (Indizes: 0=freq,1=gain,2=Q).
+        let inst = eq(&[(0, 100.0), (1, 12.0)]);
+        let fx = [&inst];
+        let mut bass = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let low_gain = measured_gain(&mut bass, 50.0);
+        let mut treble = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let high_gain = measured_gain(&mut treble, 10000.0);
+        assert!(low_gain > 3.0, "Bass deutlich angehoben: {low_gain}");
+        assert!((0.9..1.1).contains(&high_gain), "Höhen neutral: {high_gain}");
+    }
+
+    #[test]
+    fn eq_bell_boosts_center_frequency() {
+        // Glocke 1 (Indizes 3=freq,4=gain,5=Q) auf 1 kHz, +12 dB, Q=2.
+        let inst = eq(&[(3, 1000.0), (4, 12.0), (5, 2.0)]);
+        let fx = [&inst];
+        let mut at1k = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let g1k = measured_gain(&mut at1k, 1000.0);
+        let mut at100 = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let g100 = measured_gain(&mut at100, 100.0);
+        assert!(g1k > 3.0, "1 kHz angehoben: {g1k}");
+        assert!((0.9..1.1).contains(&g100), "100 Hz unberührt: {g100}");
+    }
+
+    #[test]
+    fn eq_response_matches_measured_gain() {
+        // Die Visualisierungskurve muss dem gemessenen DSP-Gang entsprechen.
+        let values: Vec<f64> = {
+            let inst = eq(&[(0, 120.0), (1, 6.0), (6, 3000.0), (7, -9.0), (8, 3.0)]);
+            inst.eval(0.0).values
+        };
+        for f in [60.0, 500.0, 3000.0, 12000.0] {
+            let inst = eq(&[(0, 120.0), (1, 6.0), (6, 3000.0), (7, -9.0), (8, 3.0)]);
+            let fx = [&inst];
+            let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+            let measured_db = 20.0 * measured_gain(&mut chain, f).log10();
+            let predicted_db = eq_response_db(&values, RATE, f);
+            assert!(
+                (measured_db as f64 - predicted_db).abs() < 1.0,
+                "{f} Hz: gemessen {measured_db:.2} dB vs. Kurve {predicted_db:.2} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn highpass_attenuates_low_passes_high() {
+        let inst = instance(EffectKind::Highpass, &[(0, 1000.0), (1, 0.71)]);
+        let fx = [&inst];
+        let mut low = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let glow = measured_gain(&mut low, 100.0);
+        let mut high = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let ghigh = measured_gain(&mut high, 8000.0);
+        assert!(glow < 0.2, "100 Hz stark gedämpft: {glow}");
+        assert!(ghigh > 0.85, "8 kHz passiert: {ghigh}");
+    }
+
+    #[test]
+    fn lowpass_passes_low_attenuates_high() {
+        let inst = instance(EffectKind::Lowpass, &[(0, 1000.0), (1, 0.71)]);
+        let fx = [&inst];
+        let mut low = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let glow = measured_gain(&mut low, 100.0);
+        let mut high = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let ghigh = measured_gain(&mut high, 8000.0);
+        assert!(glow > 0.85, "100 Hz passiert: {glow}");
+        assert!(ghigh < 0.2, "8 kHz stark gedämpft: {ghigh}");
+    }
+
+    #[test]
+    fn gain_scales_by_db() {
+        let inst = instance(EffectKind::Gain, &[(0, 6.0)]);
+        let fx = [&inst];
+        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let g = measured_gain(&mut chain, 440.0);
+        // +6 dB ≈ Faktor 1,995.
+        assert!((g - 1.995).abs() < 0.05, "+6 dB: {g}");
+    }
+
+    #[test]
+    fn limiter_keeps_output_below_ceiling() {
+        // Ceiling −6 dB (Faktor ≈ 0,501).
+        let inst = instance(EffectKind::Limiter, &[(0, -6.0), (1, 50.0)]);
+        let fx = [&inst];
+        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        // 0-dBFS-Sinus → muss unter der Ceiling bleiben.
+        let mut buf = sine(220.0, RATE as usize);
+        chain.process(&mut buf);
+        let ceiling = db_to_linear(-6.0);
+        let peak = buf[RATE as usize / 2..]
+            .iter()
+            .fold(0f32, |m, s| m.max(s.abs()));
+        assert!(
+            peak <= ceiling + 1e-3,
+            "Peak {peak} ≤ Ceiling {ceiling}"
+        );
+        assert!(peak > ceiling * 0.5, "aber nicht übermäßig gedämpft: {peak}");
+    }
+
+    #[test]
+    fn compressor_reduces_loud_signal_and_reports_gr() {
         let inst = instance(
             EffectKind::Compressor,
             &[(0, -30.0), (1, 10.0), (2, 1.0), (3, 50.0)],
@@ -563,6 +866,13 @@ mod tests {
         chain.process(&mut loud);
         let out = rms(&loud[24000..]);
         assert!(out < 0.3, "0 dBFS-Sinus stark komprimiert: {out}");
+        let gr = chain
+            .dynamic_gain_reductions()
+            .iter()
+            .find(|(id, _)| id == &inst.id)
+            .map(|(_, g)| *g)
+            .unwrap();
+        assert!(gr > 3.0, "Gain-Reduktion gemeldet: {gr}");
     }
 
     #[test]
@@ -607,8 +917,43 @@ mod tests {
     }
 
     #[test]
+    fn block_size_invariance_guarantees_player_export_parity() {
+        // Wiedergabe (große Blöcke) und Export (kleine Blöcke) nutzen dieselbe
+        // Kette — bei statischen Parametern muss das Ergebnis identisch sein,
+        // egal wie die Samples in Blöcke zerschnitten werden.
+        let inst = eq(&[(1, 6.0), (4, -4.0), (10, 3.0)]);
+        let comp = instance(EffectKind::Compressor, &[(0, -24.0), (1, 4.0)]);
+        let fx = [&inst, &comp];
+        let signal = sine(440.0, 10000);
+
+        let mut whole = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let mut a = signal.clone();
+        whole.process(&mut a);
+
+        let mut chunked = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let mut b = signal.clone();
+        // In ungleichmäßige Blöcke zerlegen (Frames → Samples ×2).
+        let mut off = 0;
+        for block in [37, 256, 1, 999, 4096] {
+            let n = (block * 2).min(b.len() - off);
+            if n == 0 {
+                break;
+            }
+            chunked.process(&mut b[off..off + n]);
+            off += n;
+        }
+        if off < b.len() {
+            chunked.process(&mut b[off..]);
+        }
+
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-5, "Blockgrößen-Invarianz: {x} vs {y}");
+        }
+    }
+
+    #[test]
     fn chain_matches_and_retunes_without_rebuild() {
-        let inst = instance(EffectKind::Equalizer, &[(0, 6.0)]);
+        let inst = eq(&[(1, 6.0)]);
         let fx = [&inst];
         let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
         assert!(chain.matches(&fx));

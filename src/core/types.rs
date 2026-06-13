@@ -67,6 +67,10 @@ pub struct MediaAsset {
     /// Quelldatei aktuell nicht auffindbar (wird beim Projektladen geprüft).
     #[serde(default)]
     pub offline: bool,
+    /// Asset-/Quell-Marker in Quell-Sekunden (Quellmonitor). Werden beim
+    /// Einfügen in die Timeline in Clip-Marker übernommen (Formatversion 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::core::marker::Marker>,
 }
 
 /// Einfacher eindeutiger ID-Generator (crypto.randomUUID()-Ersatz).

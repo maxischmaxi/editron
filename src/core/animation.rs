@@ -86,6 +86,12 @@ impl AnimatedParam {
         !self.keyframes.is_empty()
     }
 
+    /// Statischer Nullwert ohne Keyframes — für `skip_serializing_if` von
+    /// Offset-Parametern (Spur-Automation), die im Normalfall nicht wirken.
+    pub fn is_static_zero(&self) -> bool {
+        self.keyframes.is_empty() && self.value == 0.0
+    }
+
     /// Kurvenwert zur Medienzeit `t` (reine Interpolations-Mathematik):
     /// vor dem ersten/nach dem letzten Keyframe wird der Randwert gehalten.
     pub fn eval(&self, t: f64) -> f64 {

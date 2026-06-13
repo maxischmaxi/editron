@@ -1,11 +1,14 @@
 //! Command-Registry + when-Klausel-Evaluator + alle Builtin-Commands:
 //! Jede Aktion läuft über die Registry und ist frei mit Shortcuts belegbar.
 
+use crate::core::marker::MarkerScope;
 use crate::core::playback::{self, PlaybackCmd};
 use crate::core::timeline::{TrackKind, TrimEdge};
 use crate::services::Services;
 use crate::state::{set_active_workspace, AppState};
-use crate::stores::{tool_command_title, workspace_name, DialogId, TOOLS, WORKSPACE_IDS};
+use crate::stores::{
+    tool_command_title, workspace_name, DialogId, MarkerEditTarget, TOOLS, WORKSPACE_IDS,
+};
 use serde_json::Value;
 
 pub struct CommandCtx<'a> {
@@ -185,6 +188,63 @@ fn cycle_workspace(ctx: &mut CommandCtx, offset: i32) {
 fn status(ctx: &mut CommandCtx, msg: &str) {
     let now = ctx.now;
     ctx.state.app.set_status_message(Some(msg.to_string()), now);
+}
+
+// -------------------------------------------------------------- Marker
+
+/// Asset-ID, wenn die Marker-Aktionen auf den Quellmonitor wirken sollen
+/// (fokussierter Quellmonitor mit geladenem Asset); sonst None ⇒ Sequenz.
+fn source_marker_target(state: &AppState) -> Option<String> {
+    if state.app.focused_panel != "source" {
+        return None;
+    }
+    state
+        .playback
+        .source_asset_id
+        .as_ref()
+        .filter(|id| state.media.asset(id).is_some())
+        .cloned()
+}
+
+/// Marker-Bearbeiten-Dialog auf ein Ziel öffnen.
+fn open_marker_dialog(state: &mut AppState, scope: MarkerScope, marker_id: String) {
+    state.app.marker_editor = Some(MarkerEditTarget { scope, marker_id });
+    state.app.open_dialog = Some(DialogId::Marker);
+}
+
+/// Quellmonitor-Position auf den nächsten/vorherigen Asset-Marker setzen.
+fn source_marker_step(state: &mut AppState, asset_id: &str, dir: i32) {
+    let pos = state.playback.source.position;
+    let Some(asset) = state.media.asset(asset_id) else { return };
+    let target = if dir >= 0 {
+        asset
+            .markers
+            .iter()
+            .map(|m| m.time)
+            .filter(|t| *t > pos + 1e-4)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    } else {
+        asset
+            .markers
+            .iter()
+            .map(|m| m.time)
+            .filter(|t| *t < pos - 1e-4)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    if let Some(t) = target {
+        state.playback.source.position = t.max(0.0);
+        state.playback.source.playing = false;
+    }
+}
+
+/// Alle Asset-Marker eines Assets entfernen.
+fn clear_asset_markers(state: &mut AppState, asset_id: &str) {
+    if let Some(asset) = state.media.assets.iter_mut().find(|a| a.id == asset_id) {
+        if !asset.markers.is_empty() {
+            asset.markers.clear();
+            state.media.revision += 1;
+        }
+    }
 }
 
 /// Projekt öffnen + Statusmeldung; defekte Recent-Einträge aufräumen.
@@ -714,11 +774,104 @@ pub fn build_registry() -> CommandRegistry {
             status(ctx, msg);
         },
     ));
+    // ------------------------------------------------------- Marker
+    // Kontextabhängig: bei fokussiertem Quellmonitor wirken die Marker-
+    // Aktionen auf das geladene Asset (Quellzeit), sonst auf die Sequenz.
+    // Bewusst OHNE allow_repeat: ein Tastendruck = ein Marker (sonst würde
+    // gehaltenes M während der Wiedergabe die Timeline mit Markern fluten).
     commands.push(cmd(
-        "timeline.addMarker",
-        "Marker hinzufügen",
-        "Timeline",
-        |ctx, _| status(ctx, "Marker folgen in einer späteren Version"),
+        "marker.add",
+        "Marker am Playhead",
+        "Marker",
+        |ctx, _| {
+            if let Some(aid) = source_marker_target(ctx.state) {
+                let pos = ctx.state.playback.source.position;
+                ctx.state.media.add_asset_marker(&aid, pos);
+                status(ctx, "Quell-Marker gesetzt");
+            } else {
+                let t = ctx.state.timeline.playhead_sec;
+                ctx.state.timeline.add_marker_at(t);
+            }
+        },
+    ));
+    commands.push(cmd(
+        "marker.addDialog",
+        "Marker hinzufügen + bearbeiten…",
+        "Marker",
+        |ctx, _| {
+            if let Some(aid) = source_marker_target(ctx.state) {
+                let pos = ctx.state.playback.source.position;
+                if let Some(mid) = ctx.state.media.add_asset_marker(&aid, pos) {
+                    open_marker_dialog(ctx.state, MarkerScope::Asset(aid), mid);
+                }
+            } else {
+                let t = ctx.state.timeline.playhead_sec;
+                let id = ctx.state.timeline.add_marker_at(t);
+                open_marker_dialog(ctx.state, MarkerScope::Sequence, id);
+            }
+        },
+    ));
+    commands.push(with_repeat(cmd(
+        "marker.next",
+        "Zum nächsten Marker",
+        "Marker",
+        |ctx, _| {
+            if let Some(aid) = source_marker_target(ctx.state) {
+                source_marker_step(ctx.state, &aid, 1);
+            } else if !ctx.state.timeline.go_to_next_marker() {
+                status(ctx, "Kein weiterer Marker");
+            }
+        },
+    )));
+    commands.push(with_repeat(cmd(
+        "marker.prev",
+        "Zum vorherigen Marker",
+        "Marker",
+        |ctx, _| {
+            if let Some(aid) = source_marker_target(ctx.state) {
+                source_marker_step(ctx.state, &aid, -1);
+            } else if !ctx.state.timeline.go_to_prev_marker() {
+                status(ctx, "Kein vorheriger Marker");
+            }
+        },
+    )));
+    commands.push(cmd(
+        "marker.deleteAtPlayhead",
+        "Marker am Playhead löschen",
+        "Marker",
+        |ctx, _| {
+            if let Some(aid) = source_marker_target(ctx.state) {
+                let pos = ctx.state.playback.source.position;
+                if let Some(mid) = ctx.state.media.asset_marker_at(&aid, pos) {
+                    ctx.state.media.remove_asset_marker(&aid, &mid);
+                    status(ctx, "Quell-Marker gelöscht");
+                }
+            } else if ctx.state.timeline.remove_marker_at_playhead() {
+                status(ctx, "Marker gelöscht");
+            } else {
+                status(ctx, "Kein Marker am Playhead");
+            }
+        },
+    ));
+    commands.push(cmd(
+        "marker.clearAll",
+        "Alle Marker löschen",
+        "Marker",
+        |ctx, _| {
+            if let Some(aid) = source_marker_target(ctx.state) {
+                clear_asset_markers(ctx.state, &aid);
+                status(ctx, "Alle Quell-Marker gelöscht");
+            } else {
+                ctx.state.timeline.clear_markers();
+                status(ctx, "Alle Marker gelöscht");
+            }
+        },
+    ));
+    commands.push(cmd(
+        "markers.openPanel",
+        "Marker-Panel öffnen",
+        "Marker",
+        |ctx, _| ctx.state.dock.open_panel("markers"),
     ));
 
     // -------------------------------------------- Timeline: Bearbeitung
@@ -767,6 +920,72 @@ pub fn build_registry() -> CommandRegistry {
         ),
         "timelineClipSelected",
     ));
+    // ----------------------------------------- Three-Point-Editing
+    // Einfügen (Komma) und Überschreiben (Punkt) wie Premiere: das im
+    // Quellmonitor geladene Material (mit In/Out) bzw. ein einzeln im Bin
+    // gewähltes Asset wird gemäß Source-Patching in die Timeline geschnitten.
+    // Bewusst ohne `when`, damit der Schnitt rein tastaturgetrieben
+    // unabhängig vom fokussierten Panel funktioniert.
+    commands.push(cmd(
+        "timeline.insert",
+        "Einfügen (Insert)",
+        "Timeline",
+        |ctx, _| {
+            if let Some(msg) =
+                crate::core::edit::perform_source_edit(ctx.state, crate::core::edit::EditMode::Insert)
+            {
+                status(ctx, &msg);
+            }
+        },
+    ));
+    commands.push(cmd(
+        "timeline.overwrite",
+        "Überschreiben (Overwrite)",
+        "Timeline",
+        |ctx, _| {
+            if let Some(msg) = crate::core::edit::perform_source_edit(
+                ctx.state,
+                crate::core::edit::EditMode::Overwrite,
+            ) {
+                status(ctx, &msg);
+            }
+        },
+    ));
+    commands.push(with_when(
+        cmd("timeline.liftRange", "Heben (Lift)", "Timeline", |ctx, _| {
+            if !ctx.state.timeline.lift_range() {
+                status(ctx, "Nichts zum Heben (In/Out + Zielspur nötig)");
+            }
+        }),
+        "timelineInOutSet",
+    ));
+    commands.push(with_when(
+        cmd(
+            "timeline.extractRange",
+            "Entnehmen (Extract)",
+            "Timeline",
+            |ctx, _| {
+                if !ctx.state.timeline.extract_range() {
+                    status(ctx, "Nichts zum Entnehmen (In/Out + Zielspur nötig)");
+                }
+            },
+        ),
+        "timelineInOutSet",
+    ));
+    commands.push(with_when(
+        cmd(
+            "timeline.matchFrame",
+            "Frame abgleichen (Match Frame)",
+            "Timeline",
+            |ctx, _| {
+                if let Some(msg) = crate::core::edit::match_frame(ctx.state) {
+                    status(ctx, &msg);
+                }
+            },
+        ),
+        "timelineHasClips",
+    ));
+
     commands.push(with_when(
         cmd("timeline.copy", "Clips kopieren", "Timeline", |ctx, _| {
             ctx.state.timeline.copy_selection()
@@ -860,6 +1079,12 @@ pub fn build_registry() -> CommandRegistry {
             |ctx, _| ctx.state.timeline.reset_selected_clip_gain(),
         ),
         "timelineClipSelected",
+    ));
+    commands.push(cmd(
+        "timeline.clearTrackAutomation",
+        "Spur-Automation entfernen",
+        "Timeline",
+        |ctx, _| ctx.state.timeline.clear_track_automation_targeted(),
     ));
     // ------------------------------------------- Clip: Geschwindigkeit/Dauer
     commands.push(with_when(

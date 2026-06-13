@@ -84,6 +84,8 @@ struct MonitorChrome<'a> {
     loop_button: Option<bool>,
     empty_hint: &'a str,
     stage: StageContent<'a>,
+    /// Marker auf dem Scrubber (Quellzeit/Sequenzzeit, Farbe).
+    markers: Vec<(f64, crate::core::marker::MarkerColor)>,
 }
 
 enum MonitorAction {
@@ -98,6 +100,10 @@ enum MonitorAction {
     ClearMarks,
     ToggleLoop,
     SetScale(f64),
+    /// Quellmonitor: Three-Point-Insert (Ripple) in die Timeline.
+    Insert,
+    /// Quellmonitor: Three-Point-Overwrite in die Timeline.
+    Overwrite,
 }
 
 fn render_monitor(
@@ -203,6 +209,18 @@ fn render_monitor(
                     scrubber.h,
                 ),
                 theme::with_alpha(theme::ACCENT, 77),
+            );
+        }
+        // Marker-Ticks (vor dem Playhead, damit dieser sichtbar bleibt).
+        for (t, color) in &chrome.markers {
+            if *t < 0.0 || *t > chrome.duration {
+                continue;
+            }
+            let mx = scrubber.x + (*t / chrome.duration) as f32 * scrubber.w;
+            let (r, g, b) = color.rgb();
+            ui.fill(
+                Rect::new(mx - 1.0, scrubber.y, 2.0, scrubber.h),
+                raylib::prelude::Color::new(r, g, b, 255),
             );
         }
         let ph = (chrome.time / chrome.duration).min(1.0) as f32;
@@ -330,6 +348,25 @@ fn render_monitor(
             action_id: 9,
         });
     }
+    // Quellmonitor: Three-Point-Edit-Buttons (Insert/Overwrite in die Timeline).
+    if chrome.monitor == "source" {
+        let has_source = matches!(chrome.stage, StageContent::Asset(_));
+        buttons.push(Btn { icon: "", tip: "", enabled: false, active: false, action_id: 0 });
+        buttons.push(Btn {
+            icon: "chevrons-left-right",
+            tip: "Einfügen (Insert) — Komma",
+            enabled: has_source,
+            active: false,
+            action_id: 10,
+        });
+        buttons.push(Btn {
+            icon: "stretch-horizontal",
+            tip: "Überschreiben (Overwrite) — Punkt",
+            enabled: has_source,
+            active: false,
+            action_id: 11,
+        });
+    }
 
     let total_w: f32 = buttons
         .iter()
@@ -383,6 +420,8 @@ fn render_monitor(
                 7 => MonitorAction::MarkOut,
                 8 => MonitorAction::ClearMarks,
                 9 => MonitorAction::ToggleLoop,
+                10 => MonitorAction::Insert,
+                11 => MonitorAction::Overwrite,
                 _ => MonitorAction::None,
             };
         }
@@ -467,6 +506,10 @@ impl Panel for SourceMonitorPanel {
                 Some(a) => StageContent::Asset(a),
                 None => StageContent::Empty,
             },
+            markers: asset
+                .as_ref()
+                .map(|a| a.markers.iter().map(|m| (m.time, m.color)).collect())
+                .unwrap_or_default(),
         };
         let scale = app.monitor.source_scale;
         let action = render_monitor(ui, &chrome, &mut self.scrub_active, scale, rect);
@@ -510,6 +553,8 @@ impl Panel for SourceMonitorPanel {
             }
             MonitorAction::ToggleLoop => s.looping = !s.looping,
             MonitorAction::SetScale(v) => app.monitor.source_scale = v,
+            MonitorAction::Insert => ui.run_command("timeline.insert"),
+            MonitorAction::Overwrite => ui.run_command("timeline.overwrite"),
         }
 
         // Fokus-Tracking für die Wiedergabe-Command-Weiche
@@ -799,6 +844,12 @@ impl Panel for ProgramMonitorPanel {
             } else {
                 StageContent::Empty
             },
+            markers: app
+                .timeline
+                .markers
+                .iter()
+                .map(|m| (m.time, m.color))
+                .collect(),
         };
         let scale = app.monitor.program_scale;
         let action = render_monitor(ui, &chrome, &mut self.scrub_active, scale, rect);
@@ -891,6 +942,8 @@ impl Panel for ProgramMonitorPanel {
             MonitorAction::ClearMarks => app.timeline.clear_in_out(),
             MonitorAction::ToggleLoop => {}
             MonitorAction::SetScale(v) => app.monitor.program_scale = v,
+            // Insert/Overwrite gibt es nur im Quellmonitor.
+            MonitorAction::Insert | MonitorAction::Overwrite => {}
         }
 
         if ui.mouse_in(rect) && (ui.input.left_pressed || ui.input.right_pressed) {

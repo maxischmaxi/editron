@@ -568,6 +568,7 @@ mod tests {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         }
     }
 

@@ -24,7 +24,21 @@ pub const PROJECT_FORMAT: &str = "editron-project";
 /// App-Versionen würden die Felder ignorieren und Clips mit falschem
 /// Tempo abspielen, deshalb der Versionssprung; v4-Dateien laden
 /// unverändert (Default: 100 % vorwärts).
-pub const PROJECT_VERSION: u32 = 5;
+/// v6: Marker (`timeline.markers`, `clips[].markers`, `media[].markers`) —
+/// Sequenz-, Clip- und Asset-Marker mit Farbe/Name/Notiz. Ältere App-
+/// Versionen ignorieren die neuen Felder; v5-Dateien laden unverändert
+/// (Default: keine Marker).
+/// v7: Spur-Targeting/Source-Patching/Sync-Lock (`tracks[].sourcePatched`,
+/// `tracks[].targeted`, `tracks[].syncLock`) für Insert-/Three-Point-Editing.
+/// Ältere App-Versionen ignorieren die neuen Felder. v6-und-älter-Dateien
+/// laden unverändert; beim Laden wird je Art ein Patch-/Target-Standard
+/// gesetzt (V1/A1), falls keiner vorhanden ist.
+/// v8: Spur-Audio-Effekte (`tracks[].effects`, Bus-Insert) und Spur-
+/// Automation (`tracks[].volumeAuto`, `tracks[].panAuto` — Lautstärke/Pan
+/// als Keyframe-Kurven in Sequenzzeit). Ältere App-Versionen ignorieren die
+/// neuen Felder; v7-und-älter-Dateien laden unverändert (Default: keine
+/// Spur-Effekte, keine Automation).
+pub const PROJECT_VERSION: u32 = 8;
 const RECENT_LIMIT: usize = 10;
 
 // ------------------------------------------------------------------- Format
@@ -66,6 +80,10 @@ pub struct TimelineDoc {
     /// (ohne Feld) lesbar; ältere App-Versionen ignorieren das Feld.
     #[serde(default)]
     pub transitions: Vec<Transition>,
+    /// Sequenz-Marker — `default` hält ältere Projektdateien (ohne Feld)
+    /// lesbar; ältere App-Versionen ignorieren das Feld.
+    #[serde(default)]
+    pub markers: Vec<crate::core::marker::Marker>,
     #[serde(default)]
     pub playhead_sec: f64,
     #[serde(default)]
@@ -229,6 +247,7 @@ pub fn collect(state: &AppState) -> ProjectFile {
             tracks: state.timeline.tracks.clone(),
             clips: state.timeline.clips.clone(),
             transitions: state.timeline.transitions.clone(),
+            markers: state.timeline.markers.clone(),
             playhead_sec: state.timeline.playhead_sec,
             in_point: state.timeline.in_point,
             out_point: state.timeline.out_point,
@@ -343,6 +362,7 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
         t.tracks,
         t.clips,
         t.transitions,
+        t.markers,
         t.playhead_sec,
         t.in_point,
         t.out_point,
@@ -358,6 +378,12 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
         let (w, h) = crate::core::export::suggested_resolution(&state.timeline, &state.media);
         state.timeline.settings.width = w;
         state.timeline.settings.height = h;
+    }
+    // Vor Formatv7 gab es kein Patching/Targeting — je Art einen Standard
+    // (V1/A1) setzen, damit Three-Point-Edits sofort funktionieren. Ab v7
+    // werden die gespeicherten Flags unverändert übernommen.
+    if file.version < 7 {
+        state.timeline.ensure_patch_target_defaults();
     }
     // Clips verwaister Assets entfernen (Asset aus der Datei gelöscht o. ä.).
     // Titel-/Untertitel-Clips sind Generatoren ohne Asset und bleiben immer.
@@ -488,6 +514,7 @@ mod tests {
             thumbnail_path: None,
             imported_at: 0.0,
             offline: false,
+            markers: Vec::new(),
         };
         state.media.add_asset(asset);
         let track_id = state.timeline.tracks[0].id.clone();
@@ -538,6 +565,7 @@ mod tests {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         });
         // Standbild mit unendlicher Quelldauer (Infinity-Roundtrip).
         let track_id = state.timeline.tracks[1].id.clone();
@@ -562,6 +590,7 @@ mod tests {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         });
         // Rückwärts-Clip mit 37 % muss den Roundtrip exakt überleben.
         let track_id = state.timeline.tracks[0].id.clone();
@@ -586,6 +615,7 @@ mod tests {
             speed: 0.37,
             reverse: true,
             freeze: false,
+            markers: Vec::new(),
         });
         // Übergang (Einblenden auf clip-1) muss den Roundtrip überleben.
         state.timeline.transitions.push({
@@ -611,6 +641,27 @@ mod tests {
             height: 720,
             drop_frame: true,
         };
+        // Marker (Sequenz/Clip/Asset) müssen den Roundtrip überleben.
+        {
+            use crate::core::marker::{Marker, MarkerColor};
+            let mut m = Marker::new(2.0);
+            m.name = "Intro".into();
+            m.note = "Schnittidee".into();
+            m.color = MarkerColor::Red;
+            state.timeline.markers.push(m);
+            let mut range = Marker::new(8.0);
+            range.duration = 1.0; // Bereichsmarker
+            range.color = MarkerColor::Cyan;
+            state.timeline.markers.push(range);
+            if let Some(c) = state.timeline.clips.iter_mut().find(|c| c.id == "clip-1") {
+                let mut cm = Marker::new(1.5);
+                cm.name = "Beat".into();
+                c.markers.push(cm);
+            }
+            if let Some(a) = state.media.assets.iter_mut().find(|a| a.id == "asset-1") {
+                a.markers.push(Marker::new(4.0));
+            }
+        }
         state
     }
 
@@ -673,6 +724,18 @@ mod tests {
         assert_eq!((seq.width, seq.height), (1280, 720));
         assert!(seq.drop_frame);
 
+        // Marker (Sequenz/Clip/Asset) vollständig erhalten.
+        use crate::core::marker::MarkerColor;
+        assert_eq!(file.timeline.markers.len(), 2);
+        let intro = file.timeline.markers.iter().find(|m| m.name == "Intro").unwrap();
+        assert_eq!(intro.color, MarkerColor::Red);
+        assert_eq!(intro.note, "Schnittidee");
+        assert!(file.timeline.markers.iter().any(|m| (m.duration - 1.0).abs() < 1e-9));
+        let c1 = file.timeline.clips.iter().find(|c| c.id == "clip-1").unwrap();
+        assert_eq!(c1.markers.len(), 1);
+        assert_eq!(c1.markers[0].name, "Beat");
+        assert_eq!(file.media[0].markers.len(), 1);
+
         let mut target = AppState::default();
         let offline = apply(&mut target, file, Some(path.clone()));
         // Quelldatei existiert nicht → offline erkannt.
@@ -687,6 +750,11 @@ mod tests {
         assert_eq!(target.timeline.transitions.len(), 1, "Übergang geladen");
         assert_eq!(target.timeline.master_gain_db, -4.5);
         assert_eq!(target.timeline.tracks[2].pan, -0.5);
+        // Marker nach dem Laden vorhanden (sortiert, Clip-/Asset-Marker).
+        assert_eq!(target.timeline.markers.len(), 2);
+        assert!(target.timeline.markers[0].time < target.timeline.markers[1].time);
+        assert_eq!(target.timeline.clip("clip-1").unwrap().markers.len(), 1);
+        assert_eq!(target.media.assets[0].markers.len(), 1);
         assert!(!target.project.dirty);
         assert_eq!(target.project.display_name(), "test");
 
@@ -765,6 +833,7 @@ mod tests {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         };
         let mut orphan = good.clone();
         orphan.id = "orphan".into();
@@ -779,6 +848,7 @@ mod tests {
             None,
             vec![track],
             vec![good, orphan, broken, tiny],
+            Vec::new(),
             Vec::new(),
             f64::NAN,
             None,
@@ -854,8 +924,40 @@ mod tests {
             (state.timeline.settings.width, state.timeline.settings.height),
             (3840, 2160)
         );
+        // Altprojekt ohne Patch-Flags (v1 < v7): die einzige Videospur wird
+        // automatisch Patch- und Targeting-Ziel.
+        assert!(state.timeline.tracks[0].source_patched);
+        assert!(state.timeline.tracks[0].targeted);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn track_patching_and_targeting_survive_roundtrip() {
+        isolate_config();
+        let mut state = sample_state();
+        // Patch von V1 (idx 1) auf V2 (idx 0) verschieben, V2 zusätzlich
+        // anvisieren + sync-locken (Nicht-Standard-Zustand).
+        let v2 = state.timeline.tracks[0].id.clone();
+        state.timeline.toggle_source_patch(&v2);
+        state.timeline.tracks[0].targeted = true;
+        state.timeline.tracks[0].sync_lock = true;
+        let dir = std::env::temp_dir().join(format!("editron-proj-patch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("patch.etron");
+        save_to(&mut state, &path).unwrap();
+
+        let file = load_from(&path).expect("load");
+        assert_eq!(file.version, PROJECT_VERSION);
+        let mut target = AppState::default();
+        apply(&mut target, file, Some(path.clone()));
+        // v7-Datei: gespeicherte Flags werden unverändert übernommen.
+        assert!(target.timeline.tracks[0].source_patched, "V2 gepatcht");
+        assert!(!target.timeline.tracks[1].source_patched, "V1 nicht mehr gepatcht");
+        assert!(target.timeline.tracks[0].targeted);
+        assert!(target.timeline.tracks[0].sync_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn title_clips_survive_roundtrip_and_orphan_cleanup() {
         isolate_config();
@@ -893,6 +995,7 @@ mod tests {
             speed: 1.0,
             reverse: false,
             freeze: false,
+            markers: Vec::new(),
         });
 
         let dir = std::env::temp_dir().join(format!("editron-proj-title-{}", std::process::id()));

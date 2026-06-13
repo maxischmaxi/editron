@@ -312,6 +312,14 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::when("timeline.rippleDelete", "Shift+Backspace", "panel == 'timeline'"),
         Keybinding::when("timeline.selectAll", "Mod+A", "panel == 'timeline'"),
         Keybinding::when("timeline.deselectAll", "Mod+Shift+A", "panel == 'timeline'"),
+        // Three-Point-Editing wie Premiere (alle Presets): Einfügen = Komma,
+        // Überschreiben = Punkt, Lift = Semikolon, Extract = Apostroph,
+        // Match Frame = F. Bewusst global (tastaturgetrieben, panel-unabhängig).
+        Keybinding::new("timeline.insert", ","),
+        Keybinding::new("timeline.overwrite", "."),
+        Keybinding::new("timeline.liftRange", ";"),
+        Keybinding::new("timeline.extractRange", "'"),
+        Keybinding::new("timeline.matchFrame", "F"),
         Keybinding::when("timeline.copy", "Mod+C", "panel == 'timeline'"),
         Keybinding::when("timeline.cut", "Mod+X", "panel == 'timeline'"),
         Keybinding::when("timeline.paste", "Mod+V", "panel == 'timeline'"),
@@ -325,6 +333,15 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::when("timeline.nextEdit", "ArrowDown", "panel == 'timeline'"),
         Keybinding::when("clip.prevKeyframe", "Shift+ArrowUp", "panel == 'timeline'"),
         Keybinding::when("clip.nextKeyframe", "Shift+ArrowDown", "panel == 'timeline'"),
+        // Marker — in allen Presets gleich: M setzt latenzfrei am Playhead
+        // (Logging-Workflow), Shift+M öffnet den Bearbeiten-Dialog,
+        // Shift+Bild↓/↑ springt zum nächsten/vorherigen Marker.
+        Keybinding::new("marker.add", "M"),
+        Keybinding::new("marker.addDialog", "Shift+M"),
+        Keybinding::new("marker.next", "Shift+PageDown"),
+        Keybinding::new("marker.prev", "Shift+PageUp"),
+        Keybinding::when("marker.deleteAtPlayhead", "Mod+Alt+M", "panel == 'timeline'"),
+        Keybinding::new("markers.openPanel", "Mod+Shift+M"),
     ]
 }
 
@@ -375,7 +392,6 @@ fn editron_preset() -> KeymapPreset {
         Keybinding::new("timeline.zoomIn", "="),
         Keybinding::new("timeline.zoomOut", "-"),
         Keybinding::new("timeline.zoomFit", "Shift+Z"),
-        Keybinding::new("timeline.addMarker", "M"),
         Keybinding::new("timeline.toggleSnapping", "S"),
         // Bearbeitung — Schneiden bewusst auf Mod+B (nicht Mod+K):
         // Mod+K ist Präfix der Sequenz "Mod+K Mod+S".
@@ -402,7 +418,6 @@ fn editron_preset() -> KeymapPreset {
     bindings.extend([
         // Medien
         Keybinding::new("media.import", "Mod+I"),
-        Keybinding::new("media.addSelectionToTimeline", "."),
         Keybinding::when("media.removeSelected", "Delete", "panel == 'media'"),
         // Anwendung
         Keybinding::new("app.export", "Mod+E"),
@@ -446,7 +461,6 @@ fn premiere_preset() -> KeymapPreset {
         // Premiere: "Zoom to Sequence" = \ — Shift+Z zusätzlich.
         Keybinding::new("timeline.zoomFit", "\\"),
         Keybinding::new("timeline.zoomFit", "Shift+Z"),
-        Keybinding::new("timeline.addMarker", "M"),
         Keybinding::new("timeline.toggleSnapping", "S"),
         Keybinding::new("edit.undo", "Mod+Z"),
         Keybinding::new("edit.redo", "Mod+Shift+Z"),
@@ -461,7 +475,6 @@ fn premiere_preset() -> KeymapPreset {
     bindings.extend(project_bindings());
     bindings.extend([
         Keybinding::new("media.import", "Mod+I"),
-        Keybinding::new("media.addSelectionToTimeline", "."),
         Keybinding::when("media.removeSelected", "Delete", "panel == 'media'"),
         Keybinding::when("media.removeSelected", "Backspace", "panel == 'media'"),
         // Premiere: Medien exportieren = Ctrl/Cmd+M, Tastaturbefehle = Ctrl+Alt+K
@@ -500,7 +513,6 @@ fn resolve_preset() -> KeymapPreset {
         Keybinding::new("timeline.zoomIn", "Mod++"),
         Keybinding::new("timeline.zoomOut", "Mod+-"),
         Keybinding::new("timeline.zoomFit", "Shift+Z"),
-        Keybinding::new("timeline.addMarker", "M"),
         Keybinding::new("timeline.toggleSnapping", "N"),
         Keybinding::new("edit.undo", "Mod+Z"),
         Keybinding::new("edit.redo", "Mod+Shift+Z"),

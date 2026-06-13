@@ -4,18 +4,23 @@
 //! Kontextmenüs. Alle Editier-Operationen laufen über den TimelineStore
 //! (mit Undo); während einer Drag-Geste rendert das Panel eine Vorschau.
 
+use crate::core::animation::{Keyframe, KF_TIME_EPS};
 use crate::core::timecode::{format_duration, format_sequence_timecode};
 use crate::core::timeline::{
     apply_trim, expand_links, plan_asset_placements, sequence_end, track_name, trim_range,
-    PlannedPlacement, TimelineClip, TimelineTrack, TrackFlag, TrackKind, TrimEdge,
+    PlannedPlacement, TimelineClip, TimelineTrack, TrackAutoParam, TrackFlag, TrackKind, TrimEdge,
     MIN_CLIP_DURATION, SelectMode,
 };
+use std::collections::HashSet;
 use crate::core::transitions::{
     self, Transition, TransitionAlignment, TransitionDirection, TransitionKind,
     DEFAULT_TRANSITION_DURATION,
 };
 use crate::ui::widgets::text_input::TextInputState;
 use crate::overlays::context_menu::{CustomAction, MenuEntry, MenuItem};
+use crate::overlays::marker_dialog::marker_color;
+use crate::core::marker::MarkerScope;
+use crate::stores::{DialogId, MarkerEditTarget};
 use crate::panels::Panel;
 use crate::services::Services;
 use crate::state::AppState;
@@ -25,15 +30,18 @@ use crate::ui::widgets::scroll::scrollbar;
 use crate::ui::widgets::IconButton;
 use crate::ui::{DragPayload, FontKind, Ui};
 use raylib::consts::MouseCursor;
+use raylib::math::Vector2;
 use raylib::prelude::RaylibDraw;
 
-const TRACK_HEADER_W: f32 = 96.0; // w-24
+const TRACK_HEADER_W: f32 = 144.0; // Platz für Patch-Chip + Target + Toggles
 const TOOLBAR_W: f32 = 36.0; // w-9
 const HEADER_H: f32 = 36.0; // h-9
 const RULER_H: f32 = 28.0; // h-7
 const VIDEO_H: f32 = 48.0; // h-12
 const AUDIO_H: f32 = 40.0; // h-10
 const SUBTITLE_H: f32 = 28.0; // h-7 — kompakte Untertitel-Spuren
+/// Höhe des Marker-Bandes am unteren Linealrand.
+const MARKER_BAND_H: f32 = 11.0;
 /// Einrast-Radius in Pixeln (zoomunabhängig).
 const SNAP_PX: f64 = 8.0;
 /// Kantenzone der Clips für Trim-Erkennung in Pixeln.
@@ -120,6 +128,8 @@ enum RulerDrag {
     Scrub,
     Range { origin_t: f64 },
     Edge { is_in: bool },
+    /// Sequenz-Marker verschieben (Differenz Mausklick ↔ Markerzeit).
+    Marker { id: String, grab_dt: f64, began: bool },
 }
 
 pub struct TimelinePanel {
@@ -136,6 +146,23 @@ pub struct TimelinePanel {
     drop_preview: Option<(Vec<PlannedPlacement>, Option<f64>)>,
     /// Offene Dauer-Eingabe eines Übergangs (Doppelklick/Kontextmenü).
     trans_editor: Option<(String, TextInputState)>,
+    /// Laufendes Verschieben eines Automations-Punkts (Spur-Gummiband).
+    auto_drag: Option<AutoDrag>,
+    /// Audio-Spuren, deren Gummiband Pan statt Lautstärke bearbeitet (Vol/Pan-
+    /// Umschalter im Lane-Eck).
+    auto_pan: HashSet<String>,
+}
+
+/// Laufendes Ziehen eines Automations-Punkts auf einer Audiospur.
+struct AutoDrag {
+    track_id: String,
+    param: TrackAutoParam,
+    /// Ursprüngliche Zeit des gezogenen Punkts (Identität in `orig_keys`).
+    orig_t: f64,
+    /// Kurve bei Gestenbeginn (alle anderen Punkte bleiben stehen).
+    orig_keys: Vec<Keyframe>,
+    /// Undo-Snapshot bereits angelegt? (Add legt ihn vorab an.)
+    pushed: bool,
 }
 
 impl Default for TimelinePanel {
@@ -152,7 +179,18 @@ impl Default for TimelinePanel {
             sb_drag_h: None,
             drop_preview: None,
             trans_editor: None,
+            auto_drag: None,
+            auto_pan: HashSet::new(),
         }
+    }
+}
+
+/// Wertebereich der Automations-Kurve je Parameter (für die y-Abbildung):
+/// Lautstärke ±18 dB Offset, Pan ±1.
+fn auto_range(param: TrackAutoParam) -> f64 {
+    match param {
+        TrackAutoParam::Volume => 18.0,
+        TrackAutoParam::Pan => 1.0,
     }
 }
 
@@ -573,6 +611,8 @@ impl Panel for TimelinePanel {
         // ---------------- Spuren + Clips -------------------------------------
         let mut row_y = viewport.y + RULER_H - scroll_y;
         let mut lane_rects: Vec<(TimelineTrack, Rect)> = Vec::new();
+        // Automations-Geste hat in diesem Frame den Klick verbraucht?
+        let mut auto_input = self.auto_drag.is_some();
         for track in &tracks {
             let h = track_height(track);
             let row = Rect::new(viewport.x, row_y, viewport.w.max(content_w), h);
@@ -603,6 +643,17 @@ impl Panel for TimelinePanel {
                     selected.contains(&clip.id),
                     track.locked,
                 );
+            }
+            // Spur-Automation (Lautstärke/Pan) als Premiere-artiges Gummiband
+            // direkt auf der Audiospur: Mod+Klick setzt Punkte, Ziehen
+            // verschiebt sie, Rechts-/Alt-Klick löscht.
+            if track.kind == TrackKind::Audio {
+                let lane_clip =
+                    Rect::new(lane_x0, row_y, (viewport.right() - lane_x0).max(0.0), h);
+                if self.handle_track_automation(ui, app, track, lane_clip, zoom, lane_x0, scroll_x)
+                {
+                    auto_input = true;
+                }
             }
             lane_rects.push((track.clone(), Rect::new(lane.x, row_y, lane.w, h)));
             row_y += h;
@@ -727,6 +778,8 @@ impl Panel for TimelinePanel {
 
         // ---------------- Interaktion: Klicks auf Clips/Spuren ---------------
         if self.drag.is_none()
+            && self.auto_drag.is_none()
+            && !auto_input
             && self.ruler_drag.is_none()
             && self.trans_editor.is_none()
             && ui.mouse_in(viewport)
@@ -1178,6 +1231,24 @@ impl TimelinePanel {
             FontKind::Sans12,
         );
 
+        // Clip-Marker als kleine Kerben am unteren Clip-Rand (Medienzeit →
+        // Sequenzposition über die Clip-Abbildung).
+        if !clip.markers.is_empty() && clip.duration > EPS {
+            let notch_y = rect.bottom() - 4.0;
+            for (st, m) in clip.visible_markers() {
+                let frac = ((st - clip.start) / clip.duration).clamp(0.0, 1.0) as f32;
+                let x = rect.x + frac * rect.w;
+                let col = theme::with_alpha(marker_color(m.color), alpha);
+                ui.fill(Rect::new(x - 0.5, rect.y, 1.0, rect.h), theme::with_alpha(col, 70_u8.min(alpha)));
+                ui.d.draw_triangle(
+                    v2(x - 3.5, rect.bottom()),
+                    v2(x, notch_y),
+                    v2(x + 3.5, rect.bottom()),
+                    col,
+                );
+            }
+        }
+
         // Trim-Griffe bei Hover (visuell)
         let hovered = ui.mouse_in(rect);
         if hovered && !locked && rect.w > 24.0 {
@@ -1217,9 +1288,9 @@ impl TimelinePanel {
         let name = track_name(track, &app.timeline.tracks);
         let mut inner = head.inset_xy(8.0, 0.0);
 
-        // Buttons rechts (size-3.5-Icons): Mute/Solo/Lock — Untertitel-
-        // Spuren haben statt Mute/Solo einen Sichtbarkeits-Schalter (Auge);
-        // `muted` dient dort als „ausgeblendet“.
+        // Buttons rechts (size-3.5-Icons). Untertitel-Spuren haben statt
+        // Mute/Solo/Sync nur einen Sichtbarkeits-Schalter (Auge); `muted`
+        // dient dort als „ausgeblendet“.
         let buttons: Vec<(&str, bool, TrackFlag, raylib::color::Color, raylib::color::Color)> =
             if track.kind == TrackKind::Subtitle {
                 vec![
@@ -1234,6 +1305,15 @@ impl TimelinePanel {
                 ]
             } else {
                 vec![
+                    // Sync-Lock (rippelt bei Insert/Extract mit) — eigene Farbe
+                    // (Lila), klar getrennt von der Spur-Sperre (Blau).
+                    (
+                        "arrow-left-right",
+                        track.sync_lock,
+                        TrackFlag::SyncLock,
+                        theme::GRAPHIC,
+                        theme::with_alpha(theme::GRAPHIC, 51),
+                    ),
                     (
                         "volume-2",
                         track.muted,
@@ -1270,6 +1350,7 @@ impl TimelinePanel {
             ui.icon(icon, btn, 14.0, color);
             if it.hovered {
                 ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                ui.tooltip(id, btn, track_flag_tip(*flag, track.kind));
             }
             if it.clicked {
                 app.timeline.toggle_track_flag(&track.id, *flag);
@@ -1277,9 +1358,59 @@ impl TimelinePanel {
             bx -= 4.0;
         }
 
-        inner.w = (bx - inner.x).max(0.0);
-        let display = ui.font(FontKind::Sans12Medium).ellipsize(&name, inner.w);
-        ui.text_left(&display, inner, theme::TEXT_2, FontKind::Sans12Medium);
+        if track.kind == TrackKind::Subtitle {
+            // Untertitel: schlichtes Namens-Label links wie zuvor.
+            inner.w = (bx - inner.x).max(0.0);
+            let display = ui.font(FontKind::Sans12Medium).ellipsize(&name, inner.w);
+            ui.text_left(&display, inner, theme::TEXT_2, FontKind::Sans12Medium);
+        } else {
+            // Video/Audio: Patch-Chip (zeigt den Spurnamen + Source-Patch-Ziel)
+            // und Target-Toggle links — die Source-/Ziel-Zone wie in Premiere.
+            let chip = Rect::new(inner.x, head.y + (head.h - 18.0) / 2.0, 30.0, 18.0);
+            let chip_id = ui.id(("tl.track.patch", track.id.as_str()));
+            let chip_it = ui.interact(chip_id, chip);
+            let patched = track.source_patched;
+            let chip_bg = if patched {
+                theme::ACCENT_SOFT
+            } else if chip_it.hovered {
+                theme::SURFACE_4
+            } else {
+                theme::SURFACE_1
+            };
+            ui.fill_rounded(chip, theme::RADIUS_SM, chip_bg);
+            let chip_fg = if patched { theme::ACCENT } else { theme::TEXT_2 };
+            let display = ui.font(FontKind::Sans12Medium).ellipsize(&name, chip.w - 6.0);
+            ui.text_centered(&display, chip, chip_fg, FontKind::Sans12Medium);
+            if chip_it.hovered {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                ui.tooltip(chip_id, chip, "Source-Patch: Ziel für Insert/Überschreiben");
+            }
+            if chip_it.clicked {
+                app.timeline.toggle_source_patch(&track.id);
+            }
+
+            let tgt = Rect::new(chip.right() + 4.0, head.y + (head.h - 16.0) / 2.0, 16.0, 16.0);
+            let tgt_id = ui.id(("tl.track.target", track.id.as_str()));
+            let tgt_it = ui.interact(tgt_id, tgt);
+            if track.targeted {
+                ui.fill_rounded(tgt, theme::RADIUS_SM, theme::ACCENT_SOFT);
+            }
+            let tgt_col = if track.targeted {
+                theme::ACCENT
+            } else if tgt_it.hovered {
+                theme::TEXT_1
+            } else {
+                theme::TEXT_3
+            };
+            ui.icon("focus", tgt, 14.0, tgt_col);
+            if tgt_it.hovered {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                ui.tooltip(tgt_id, tgt, "Spur anvisieren (Lift/Extract/Match Frame)");
+            }
+            if tgt_it.clicked {
+                app.timeline.toggle_track_flag(&track.id, TrackFlag::Targeted);
+            }
+        }
 
         // Rechtsklick: Spur-Menü
         if ui.mouse_in(head) && ui.input.right_pressed {
@@ -1287,6 +1418,170 @@ impl TimelinePanel {
             app.context_menu
                 .show(ui.input.mouse.x, ui.input.mouse.y, items);
         }
+    }
+
+    /// Lautstärke-/Pan-Gummiband einer Audiospur zeichnen und bearbeiten
+    /// (Mod+Klick = Punkt setzen, Ziehen = verschieben, Rechts-/Alt-Klick =
+    /// löschen). Liefert true, wenn der Klick verbraucht wurde (Clip-Input
+    /// dann überspringen). Automation in SEQUENZZEIT; `track` ist eine Kopie
+    /// (Stand Frame-Beginn), Edits laufen über `app.timeline` mit Undo.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_track_automation(
+        &mut self,
+        ui: &mut Ui,
+        app: &mut AppState,
+        track: &TimelineTrack,
+        lane_clip: Rect,
+        zoom: f64,
+        lane_x0: f32,
+        scroll_x: f32,
+    ) -> bool {
+        if lane_clip.w <= 4.0 || lane_clip.h < 18.0 {
+            return false;
+        }
+        let param = if self.auto_pan.contains(&track.id) {
+            TrackAutoParam::Pan
+        } else {
+            TrackAutoParam::Volume
+        };
+        let range = auto_range(param);
+        let pad = 5.0f32;
+        let mid = lane_clip.y + lane_clip.h * 0.5;
+        let half = (lane_clip.h * 0.5 - pad).max(1.0);
+        let y_of = |v: f64| mid - (v.clamp(-range, range) / range) as f32 * half;
+        let v_of = |y: f32| (-((y - mid) / half) as f64 * range).clamp(-range, range);
+        let time_x = |t: f64| lane_x0 + (t * zoom) as f32 - scroll_x;
+        let pointer_time = |x: f32| ((x - lane_x0 + scroll_x) as f64 / zoom).max(0.0);
+
+        // ---- Zeichnen ----
+        ui.push_clip(lane_clip);
+        ui.hline(lane_clip.x, mid, lane_clip.w, theme::with_alpha(theme::LINE, 90));
+        let ap = track.auto_param(param);
+        let animated = ap.is_animated();
+        let line_col = if animated {
+            theme::with_alpha(theme::ACCENT, 220)
+        } else {
+            theme::with_alpha(theme::ACCENT, 80)
+        };
+        let mut prev: Option<Vector2> = None;
+        let mut xx = lane_clip.x;
+        while xx <= lane_clip.right() {
+            let v = ap.eval(pointer_time(xx));
+            let p = v2(xx, y_of(v));
+            if let Some(pp) = prev {
+                ui.d.draw_line_ex(pp, p, 1.5, line_col);
+            }
+            prev = Some(p);
+            xx += 3.0;
+        }
+        let mut hit_point: Option<f64> = None;
+        for k in &ap.keyframes {
+            let px = time_x(k.t);
+            if px < lane_clip.x - 6.0 || px > lane_clip.right() + 6.0 {
+                continue;
+            }
+            let py = y_of(k.value);
+            let hov = ui.mouse_in(Rect::new(px - 5.0, py - 5.0, 10.0, 10.0));
+            ui.d.draw_circle(px as i32, py as i32, 4.0, if hov { theme::TEXT_1 } else { theme::ACCENT });
+            ui.d.draw_circle_lines(px as i32, py as i32, 4.0, theme::SURFACE_0);
+            if hov {
+                hit_point = Some(k.t);
+            }
+        }
+        ui.pop_clip();
+
+        // ---- Vol/Pan-Umschalter (Lane-Eck oben links) ----
+        let chip = Rect::new(lane_clip.x + 2.0, lane_clip.y + 2.0, 30.0, 13.0);
+        let chip_id = ui.id(("tl.auto.chip", &track.id));
+        let cit = ui.interact(chip_id, chip);
+        ui.fill_rounded(chip, theme::RADIUS_XS, theme::with_alpha(theme::SURFACE_0, 200));
+        ui.text_centered(
+            if param == TrackAutoParam::Pan { "Pan" } else { "Vol" },
+            chip,
+            if cit.hovered { theme::TEXT_1 } else { theme::TEXT_3 },
+            FontKind::Mono11,
+        );
+        if cit.hovered {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+        }
+        if cit.clicked {
+            if !self.auto_pan.insert(track.id.clone()) {
+                self.auto_pan.remove(&track.id);
+            }
+            return true;
+        }
+
+        // ---- Laufende Geste fortführen ----
+        let mouse = ui.input.mouse;
+        if self
+            .auto_drag
+            .as_ref()
+            .is_some_and(|d| d.track_id == track.id)
+        {
+            if ui.input.left_down {
+                let nt = pointer_time(mouse.x);
+                let nv = v_of(mouse.y);
+                let d = self.auto_drag.as_mut().expect("auto_drag");
+                if !d.pushed {
+                    app.timeline.begin_mix_edit();
+                    d.pushed = true;
+                }
+                let mut keys = d.orig_keys.clone();
+                if let Some(kf) = keys.iter_mut().find(|k| (k.t - d.orig_t).abs() < KF_TIME_EPS) {
+                    kf.t = nt;
+                    kf.value = nv;
+                }
+                app.timeline.track_auto_replace_live(&track.id, d.param, keys);
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_ALL);
+            } else {
+                self.auto_drag = None;
+            }
+            return true;
+        }
+
+        // ---- Neue Geste starten ----
+        if !ui.mouse_in(lane_clip) || cit.hovered {
+            return false;
+        }
+        if let Some(t) = hit_point {
+            // Löschen: Rechts- oder Alt-Klick auf einen Punkt.
+            if ui.input.right_pressed || (ui.input.left_pressed && ui.input.alt) {
+                app.timeline.track_auto_remove_point(&track.id, param, t);
+                return true;
+            }
+            // Vorhandenen Punkt ziehen.
+            if ui.input.left_pressed {
+                self.auto_drag = Some(AutoDrag {
+                    track_id: track.id.clone(),
+                    param,
+                    orig_t: t,
+                    orig_keys: ap.keyframes.clone(),
+                    pushed: false,
+                });
+                return true;
+            }
+        } else if ui.input.left_pressed && (ui.input.ctrl || ui.input.meta) {
+            // Mod+Klick: neuen Punkt setzen und sofort ziehen.
+            let t = pointer_time(mouse.x);
+            let v = v_of(mouse.y);
+            app.timeline.track_auto_add_point(&track.id, param, t, v);
+            let keys = app
+                .timeline
+                .tracks
+                .iter()
+                .find(|tr| tr.id == track.id)
+                .map(|tr| tr.auto_param(param).keyframes.clone())
+                .unwrap_or_default();
+            self.auto_drag = Some(AutoDrag {
+                track_id: track.id.clone(),
+                param,
+                orig_t: t,
+                orig_keys: keys,
+                pushed: true, // add_point hat bereits einen Snapshot gelegt
+            });
+            return true;
+        }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2016,57 +2311,104 @@ impl TimelinePanel {
                 ui.fill(Rect::new(x, ruler.bottom() - 6.0, 1.0, 6.0), theme::LINE);
             }
         }
+
+        // ---- Sequenz-Marker (farbige Symbole + Bereichsbalken) ----
+        // Hit-Daten (Symbol-Rechteck in Bildschirmkoordinaten) für die
+        // Interaktion einsammeln. Band am unteren Linealrand.
+        let band_top = ruler.bottom() - MARKER_BAND_H;
+        let mut marker_hits: Vec<(String, Rect, f64, String)> = Vec::new();
+        for m in &app.timeline.markers {
+            let x = time_x(m.time);
+            let col = marker_color(m.color);
+            if m.duration > 0.0 {
+                let x2 = time_x(m.end());
+                ui.fill(
+                    Rect::new(x, band_top + 1.0, (x2 - x).max(1.0), MARKER_BAND_H - 2.0),
+                    theme::with_alpha(col, 70),
+                );
+                ui.fill(Rect::new(x2 - 1.0, band_top, 1.0, MARKER_BAND_H), theme::with_alpha(col, 200));
+            }
+            draw_marker_symbol(ui, x, band_top, col);
+            let label = marker_tooltip(&m.name, &m.note, &format_sequence_timecode(m.time, &app.timeline.settings));
+            marker_hits.push((m.id.clone(), Rect::new(x - 6.0, band_top, 12.0, MARKER_BAND_H), m.time, label));
+        }
         ui.pop_clip();
 
-        // Interaktion: Scrub / Alt+Range / Kanten ziehen / Kontextmenü
+        // Interaktion: Marker > Scrub / Alt+Range / Kanten / Kontextmenü
         let edge_sec = EDGE_PX as f64 / zoom;
-        if ui.mouse_in(time_area) {
-            ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_EW);
-            let ruler_id = ui.id("tl.ruler");
-            ui.set_hot(ruler_id);
-            ui.tooltip(
-                ruler_id,
-                Rect::new(ui.input.mouse.x, time_area.y, 1.0, time_area.h),
-                "Ziehen: Playhead • Alt+Ziehen: Loop-Bereich",
-            );
-
-            if ui.input.right_pressed {
-                let t = pointer_time(ui.input.mouse.x).max(0.0);
-                let has_loop =
-                    app.timeline.in_point.is_some() || app.timeline.out_point.is_some();
-                app.context_menu.show(
-                    ui.input.mouse.x,
-                    ui.input.mouse.y,
-                    ruler_context_menu(t, has_loop),
+        let mouse = ui.input.mouse;
+        let over_marker = marker_hits
+            .iter()
+            .rev()
+            .find(|(_, r, _, _)| r.contains(mouse))
+            .cloned();
+        if ui.mouse_in(time_area) && self.ruler_drag.is_none() {
+            if let Some((id, _, _, tip)) = &over_marker {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                let mid = ui.id(("tl.marker", id.as_str()));
+                ui.set_hot(mid);
+                ui.tooltip(mid, Rect::new(mouse.x, band_top, 1.0, MARKER_BAND_H), tip);
+                if ui.input.right_pressed {
+                    app.app.focused_panel = "timeline".into();
+                    let menu = crate::panels::markers::marker_menu(id);
+                    app.context_menu.show(mouse.x, mouse.y, menu);
+                    return;
+                }
+                if ui.input.left_pressed {
+                    app.app.focused_panel = "timeline".into();
+                    if ui.input.double_click {
+                        open_marker_dialog(app, id.clone());
+                    } else {
+                        let t = pointer_time(mouse.x).max(0.0);
+                        let grab_dt = t - app.timeline.markers.iter().find(|m| &m.id == id).map(|m| m.time).unwrap_or(t);
+                        self.ruler_drag = Some(RulerDrag::Marker { id: id.clone(), grab_dt, began: false });
+                    }
+                    return;
+                }
+            } else {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_EW);
+                let ruler_id = ui.id("tl.ruler");
+                ui.set_hot(ruler_id);
+                ui.tooltip(
+                    ruler_id,
+                    Rect::new(mouse.x, time_area.y, 1.0, time_area.h),
+                    "Ziehen: Playhead • Alt+Ziehen: Loop-Bereich • M: Marker",
                 );
-                return;
-            }
-            if ui.input.left_pressed {
-                app.app.focused_panel = "timeline".into();
-                let t = pointer_time(ui.input.mouse.x).max(0.0);
-                if ui.input.alt {
-                    self.ruler_drag = Some(RulerDrag::Range { origin_t: t });
-                } else if app
-                    .timeline
-                    .in_point
-                    .is_some_and(|i| (t - i).abs() <= edge_sec)
-                {
-                    self.ruler_drag = Some(RulerDrag::Edge { is_in: true });
-                } else if app
-                    .timeline
-                    .out_point
-                    .is_some_and(|o| (t - o).abs() <= edge_sec)
-                {
-                    self.ruler_drag = Some(RulerDrag::Edge { is_in: false });
-                } else {
-                    self.ruler_drag = Some(RulerDrag::Scrub);
-                    app.timeline.set_playhead(t);
+
+                if ui.input.right_pressed {
+                    let t = pointer_time(mouse.x).max(0.0);
+                    let has_loop =
+                        app.timeline.in_point.is_some() || app.timeline.out_point.is_some();
+                    app.context_menu.show(mouse.x, mouse.y, ruler_context_menu(t, has_loop));
+                    return;
+                }
+                if ui.input.left_pressed {
+                    app.app.focused_panel = "timeline".into();
+                    let t = pointer_time(mouse.x).max(0.0);
+                    if ui.input.alt {
+                        self.ruler_drag = Some(RulerDrag::Range { origin_t: t });
+                    } else if app
+                        .timeline
+                        .in_point
+                        .is_some_and(|i| (t - i).abs() <= edge_sec)
+                    {
+                        self.ruler_drag = Some(RulerDrag::Edge { is_in: true });
+                    } else if app
+                        .timeline
+                        .out_point
+                        .is_some_and(|o| (t - o).abs() <= edge_sec)
+                    {
+                        self.ruler_drag = Some(RulerDrag::Edge { is_in: false });
+                    } else {
+                        self.ruler_drag = Some(RulerDrag::Scrub);
+                        app.timeline.set_playhead(t);
+                    }
                 }
             }
         }
 
-        if let Some(rd) = &self.ruler_drag {
-            let t = pointer_time(ui.input.mouse.x).max(0.0);
+        if let Some(rd) = &mut self.ruler_drag {
+            let t = pointer_time(mouse.x).max(0.0);
             match rd {
                 RulerDrag::Scrub => app.timeline.set_playhead(t),
                 RulerDrag::Range { origin_t } => {
@@ -2080,8 +2422,20 @@ impl TimelinePanel {
                     let limit = app.timeline.in_point.unwrap_or(0.0) + MIN_CLIP_DURATION;
                     app.timeline.set_out_point(Some(t.max(limit)));
                 }
+                RulerDrag::Marker { id, grab_dt, began } => {
+                    ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                    let target = app.timeline.snap_to_frame((t - *grab_dt).max(0.0));
+                    if !*began {
+                        app.timeline.begin_marker_edit();
+                        *began = true;
+                    }
+                    let id = id.clone();
+                    app.timeline.marker_update_live(&id, |m| m.time = target);
+                }
             }
-            ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_EW);
+            if !matches!(self.ruler_drag, Some(RulerDrag::Marker { .. })) {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_EW);
+            }
             if ui.input.left_released || !ui.input.left_down {
                 self.ruler_drag = None;
             }
@@ -2434,6 +2788,17 @@ fn clip_context_menu(app: &AppState, clip: &TimelineClip, t: f64) -> Vec<MenuEnt
         ),
         MenuEntry::Item(MenuItem::command("timeline.splitAtPlayhead")),
         MenuEntry::Separator,
+        MenuEntry::Item(
+            MenuItem::custom(
+                "Clip-Marker hier hinzufügen",
+                CustomAction::MarkerAddClipAt {
+                    clip_id: clip.id.clone(),
+                    t,
+                },
+            )
+            .with_icon("bookmark"),
+        ),
+        MenuEntry::Separator,
         MenuEntry::Item(MenuItem::command("clip.speedDuration").with_icon("gauge")),
         MenuEntry::Item(MenuItem::command("clip.freezeFrame").with_icon("pause")),
         MenuEntry::Separator,
@@ -2561,6 +2926,23 @@ fn lane_context_menu(app: &AppState, track: Option<&TimelineTrack>, t: f64) -> V
     items
 }
 
+/// Tooltip-Text der Spur-Header-Toggles.
+fn track_flag_tip(flag: TrackFlag, kind: TrackKind) -> &'static str {
+    match flag {
+        TrackFlag::Muted => {
+            if kind == TrackKind::Subtitle {
+                "Spur ausblenden"
+            } else {
+                "Stummschalten"
+            }
+        }
+        TrackFlag::Solo => "Solo",
+        TrackFlag::Locked => "Spur sperren",
+        TrackFlag::SyncLock => "Sync-Lock — rippelt bei Insert/Extract mit",
+        TrackFlag::Targeted => "Spur anvisieren (Lift/Extract/Match Frame)",
+    }
+}
+
 fn track_header_menu(track: &TimelineTrack, name: &str) -> Vec<MenuEntry> {
     let mut items: Vec<MenuEntry> = Vec::new();
     if track.kind == TrackKind::Subtitle {
@@ -2595,6 +2977,37 @@ fn track_header_menu(track: &TimelineTrack, name: &str) -> Vec<MenuEntry> {
             )
             .with_checked(track.solo),
         ));
+        items.push(MenuEntry::Separator);
+        items.push(MenuEntry::Item(
+            MenuItem::custom(
+                "Source-Patch (Insert/Überschreiben-Ziel)",
+                CustomAction::TimelineToggleSourcePatch {
+                    track_id: track.id.clone(),
+                },
+            )
+            .with_checked(track.source_patched),
+        ));
+        items.push(MenuEntry::Item(
+            MenuItem::custom(
+                "Anvisieren (Lift/Extract/Match)",
+                CustomAction::TimelineToggleTrackFlag {
+                    track_id: track.id.clone(),
+                    flag: TrackFlag::Targeted,
+                },
+            )
+            .with_checked(track.targeted),
+        ));
+        items.push(MenuEntry::Item(
+            MenuItem::custom(
+                "Sync-Lock",
+                CustomAction::TimelineToggleTrackFlag {
+                    track_id: track.id.clone(),
+                    flag: TrackFlag::SyncLock,
+                },
+            )
+            .with_checked(track.sync_lock),
+        ));
+        items.push(MenuEntry::Separator);
     }
     items.push(MenuEntry::Item(
         MenuItem::custom(
@@ -2632,6 +3045,12 @@ fn track_header_menu(track: &TimelineTrack, name: &str) -> Vec<MenuEntry> {
 fn ruler_context_menu(t: f64, has_loop: bool) -> Vec<MenuEntry> {
     vec![
         MenuEntry::Item(
+            MenuItem::custom("Marker hier hinzufügen", CustomAction::MarkerAddAt { t })
+                .with_icon("bookmark"),
+        ),
+        MenuEntry::Item(MenuItem::command("marker.add").with_icon("bookmark-plus")),
+        MenuEntry::Separator,
+        MenuEntry::Item(
             MenuItem::custom("In-Punkt hier setzen", CustomAction::TimelineSetInAt { t })
                 .with_icon("arrow-right-from-line"),
         ),
@@ -2646,4 +3065,44 @@ fn ruler_context_menu(t: f64, has_loop: bool) -> Vec<MenuEntry> {
                 .with_disabled(!has_loop),
         ),
     ]
+}
+
+/// Marker-Symbol (Pentagon) zeichnen: oben flach, unten spitz — wie
+/// in Premiere; `band_top` ist die Oberkante des Marker-Bandes.
+fn draw_marker_symbol(ui: &mut Ui, x: f32, band_top: f32, col: raylib::prelude::Color) {
+    let hw = 4.0;
+    let body_h = 6.0;
+    ui.fill(Rect::new(x - hw, band_top, hw * 2.0, body_h), col);
+    // Spitze nach unten.
+    ui.d.draw_triangle(
+        v2(x - hw, band_top + body_h),
+        v2(x, band_top + body_h + 4.5),
+        v2(x + hw, band_top + body_h),
+        col,
+    );
+    // Dünner dunkler Rahmen oben für Kontrast auf hellen Farben.
+    ui.fill(Rect::new(x - hw, band_top, hw * 2.0, 1.0), theme::with_alpha(theme::BLACK, 60));
+}
+
+/// Tooltip-Text eines Markers: Name (oder Timecode) + optionale Notiz.
+fn marker_tooltip(name: &str, note: &str, tc: &str) -> String {
+    let head = if name.trim().is_empty() {
+        format!("Marker • {tc}")
+    } else {
+        format!("{} • {tc}", name.trim())
+    };
+    if note.trim().is_empty() {
+        head
+    } else {
+        format!("{head}\n{}", note.trim())
+    }
+}
+
+/// Marker-Bearbeiten-Dialog für einen Sequenz-Marker öffnen.
+fn open_marker_dialog(app: &mut AppState, marker_id: String) {
+    app.app.marker_editor = Some(MarkerEditTarget {
+        scope: MarkerScope::Sequence,
+        marker_id,
+    });
+    app.app.open_dialog = Some(DialogId::Marker);
 }

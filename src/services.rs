@@ -636,6 +636,7 @@ fn import_one(path: &str) -> Result<MediaAsset, String> {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0),
         offline: false,
+        markers: Vec::new(),
     })
 }
 
