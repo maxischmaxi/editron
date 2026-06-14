@@ -225,6 +225,11 @@ mod tests {
                     fps: 25.0,
                     pix_fmt: None,
                     bitrate: None,
+                    bit_depth: 8,
+                    color_transfer: None,
+                    color_primaries: None,
+                    color_space: None,
+                    color_range: None,
                 }],
                 audio: if with_audio {
                     vec![AudioStreamInfo {
@@ -237,11 +242,17 @@ mod tests {
                 } else {
                     vec![]
                 },
+                recorded_at: None,
             },
             thumbnail_path: None,
             imported_at: 0.0,
+            bin_id: crate::core::bin::ROOT_BIN_ID.to_string(),
+            label: None,
             offline: false,
             markers: vec![],
+            proxy_path: None,
+            proxy_src_mtime: None,
+            proxy_offline: false,
         }
     }
 
@@ -358,6 +369,8 @@ mod tests {
                 reverse: false,
                 freeze: false,
                 markers: vec![],
+                nest_seq: None,
+                multicam: None,
             };
             c.name = "alt".into();
             c
@@ -409,6 +422,8 @@ mod tests {
             reverse: false,
             freeze: false,
             markers: vec![],
+            nest_seq: None,
+            multicam: None,
         });
         s.timeline.set_playhead(6.0); // Medienzeit 2 + (6−4) = 4
         assert!(match_frame(&mut s).is_none());
@@ -466,5 +481,7 @@ fn source_clip(
         reverse: false,
         freeze: false,
         markers,
+        nest_seq: None,
+        multicam: None,
     }
 }

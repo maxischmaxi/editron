@@ -37,6 +37,11 @@ pub type WidgetId = u64;
 pub enum DragPayload {
     /// Asset-IDs aus dem Medien-Browser (MIME "editron/assets").
     Assets(Vec<String>),
+    /// Sequenz-IDs aus dem Medien-Browser (Drag in eine andere Timeline =
+    /// Nesting).
+    Sequences(Vec<String>),
+    /// Bin-IDs aus dem Medien-Browser (Ordner zwischen Bins verschieben).
+    Bins(Vec<String>),
     /// Dock-Tab wird gezogen.
     Tab { panel: String },
     /// Effekt aus dem Effekte-Panel (Ziel: Timeline-Clip oder
@@ -82,6 +87,17 @@ pub struct Dispatch {
     pub arg: Option<serde_json::Value>,
 }
 
+/// Anforderung eines Hover-Scrub-Vorschaubilds (Medien-Browser): erzeugt im
+/// Hintergrund ein Standbild des Assets zur Zeit `time` und legt es unter
+/// `bucket` ab. `bucket` quantisiert die Scrub-Position für den Cache.
+#[derive(Clone, Debug)]
+pub struct ScrubRequest {
+    pub asset_id: String,
+    pub path: String,
+    pub time: f64,
+    pub bucket: u32,
+}
+
 pub struct Ui<'f, 'rl> {
     pub d: &'f mut RaylibDrawHandle<'rl>,
     pub input: InputState,
@@ -94,7 +110,13 @@ pub struct Ui<'f, 'rl> {
     pub texture_requests: Vec<String>,
     pub time: f64,
     pub frame_time: f32,
+    /// Logische Zeichenfläche (Framebuffer-Pixel ÷ [`Ui::scale`]). Das gesamte
+    /// Layout rechnet in diesem logischen Raum.
     pub screen: Rect,
+    /// HiDPI-Faktor: bildet Layout-Logikpixel auf Framebuffer-Pixel ab. Alle
+    /// Zeichen-/Hit-Test-Helfer übersetzen zentral mit diesem Faktor — Panels
+    /// rechnen ausschließlich logisch und werden NICHT angefasst.
+    pub scale: f32,
     /// Farbkorrektur-Shader für den Programmmonitor (None ⇒ ungegradete
     /// Vorschau, z. B. wenn die Kompilierung fehlschlug). Wird in main()
     /// nach `Ui::new` gesetzt.
@@ -105,6 +127,9 @@ pub struct Ui<'f, 'rl> {
     /// Effekt-Jobs für den nächsten Frame (Pendant zu `texture_requests`;
     /// der Mainloop verarbeitet sie zwischen den Frames).
     pub effect_requests: Vec<fx_shader::EffectJob>,
+    /// Hover-Scrub-Anforderungen des Medien-Browsers (Pendant zu
+    /// `texture_requests`); der Mainloop löst sie nach dem Frame asynchron auf.
+    pub scrub_requests: Vec<ScrubRequest>,
     clip_stack: Vec<Rect>,
     cursor: MouseCursor,
     tooltip: Option<TooltipRequest>,
@@ -124,6 +149,7 @@ impl<'f, 'rl> Ui<'f, 'rl> {
         time: f64,
         frame_time: f32,
         screen: Rect,
+        scale: f32,
     ) -> Self {
         persist.hot = persist.hot_this_frame;
         persist.hot_this_frame = 0;
@@ -139,9 +165,11 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             time,
             frame_time,
             screen,
+            scale,
             grade_shader: None,
             fx_outputs: None,
             effect_requests: Vec::new(),
+            scrub_requests: Vec::new(),
             clip_stack: Vec::new(),
             cursor: MouseCursor::MOUSE_CURSOR_DEFAULT,
             tooltip: None,
@@ -327,9 +355,21 @@ impl<'f, 'rl> Ui<'f, 'rl> {
         });
     }
 
+    /// Hover-Scrub-Vorschaubild anfordern (vom Medien-Browser).
+    pub fn request_scrub(&mut self, asset_id: &str, path: &str, time: f64, bucket: u32) {
+        self.scrub_requests.push(ScrubRequest {
+            asset_id: asset_id.to_string(),
+            path: path.to_string(),
+            time,
+            bucket,
+        });
+    }
+
     // ----- Clipping ----------------------------------------------------------
 
     pub fn push_clip(&mut self, rect: Rect) {
+        // Clip-Stack hält LOGISCHE Rechtecke (Hit-Test gegen logische Maus);
+        // die Scissor-Box wird beim Setzen in Framebuffer-Pixel übersetzt.
         let clipped = match self.clip_stack.last() {
             Some(top) => top.intersect(rect),
             None => rect,
@@ -337,27 +377,17 @@ impl<'f, 'rl> Ui<'f, 'rl> {
         self.clip_stack.push(clipped);
         unsafe {
             ffi::EndScissorMode();
-            ffi::BeginScissorMode(
-                clipped.x as i32,
-                clipped.y as i32,
-                clipped.w.ceil() as i32,
-                clipped.h.ceil() as i32,
-            );
         }
+        self.begin_scissor(clipped);
     }
 
     pub fn pop_clip(&mut self) {
         self.clip_stack.pop();
         unsafe {
             ffi::EndScissorMode();
-            if let Some(top) = self.clip_stack.last() {
-                ffi::BeginScissorMode(
-                    top.x as i32,
-                    top.y as i32,
-                    top.w.ceil() as i32,
-                    top.h.ceil() as i32,
-                );
-            }
+        }
+        if let Some(top) = self.clip_stack.last().copied() {
+            self.begin_scissor(top);
         }
     }
 
@@ -415,10 +445,62 @@ impl<'f, 'rl> Ui<'f, 'rl> {
         );
     }
 
+    // ----- HiDPI-Übersetzung (logisch → Framebuffer-Pixel) -------------------
+
+    /// Skalar logisch → physikalisch.
+    #[inline]
+    fn sx(&self, v: f32) -> f32 {
+        v * self.scale
+    }
+
+    /// Punkt logisch → physikalisch (ohne Snapping; für glatt animierte
+    /// Geometrie wie Transform-Gizmo/Kurven).
+    #[inline]
+    fn pv(&self, p: Vector2) -> Vector2 {
+        v2(p.x * self.scale, p.y * self.scale)
+    }
+
+    /// Rechteck logisch → physikalisch, auf ganze Framebuffer-Pixel gesnappt.
+    /// Beide Kanten werden gerundet (statt Position+Breite separat), damit
+    /// aneinandergrenzende Flächen nahtlos bleiben und 1-px-Linien gestochen
+    /// scharf auf dem Pixelraster sitzen — kein 1,5-px-Verschmieren.
+    #[inline]
+    fn rp(&self, r: Rect) -> Rect {
+        let s = self.scale;
+        let x0 = (r.x * s).round();
+        let y0 = (r.y * s).round();
+        let x1 = (r.right() * s).round();
+        let y1 = (r.bottom() * s).round();
+        Rect::new(x0, y0, x1 - x0, y1 - y0)
+    }
+
+    /// Rechteck logisch → physikalisch ohne Snapping (Texturen: glatte
+    /// Sub-Pixel-Bewegung, kein Zittern bei animierten Layern).
+    #[inline]
+    fn rpf(&self, r: Rect) -> Rect {
+        let s = self.scale;
+        Rect::new(r.x * s, r.y * s, r.w * s, r.h * s)
+    }
+
+    /// Scissor (Framebuffer-Pixel) für ein logisches Clip-Rechteck setzen.
+    /// Außenkanten großzügig (floor/ceil), damit kein Inhalt am Rand
+    /// angeschnitten wird.
+    fn begin_scissor(&self, r: Rect) {
+        let s = self.scale;
+        let x0 = (r.x * s).floor() as i32;
+        let y0 = (r.y * s).floor() as i32;
+        let x1 = (r.right() * s).ceil() as i32;
+        let y1 = (r.bottom() * s).ceil() as i32;
+        unsafe {
+            ffi::BeginScissorMode(x0, y0, (x1 - x0).max(0), (y1 - y0).max(0));
+        }
+    }
+
     // ----- Zeichen-Helfer ----------------------------------------------------
 
     pub fn fill(&mut self, rect: Rect, color: Color) {
-        self.d.draw_rectangle_rec(rect, color);
+        let r = self.rp(rect);
+        self.d.draw_rectangle_rec(r, color);
     }
 
     pub fn fill_rounded(&mut self, rect: Rect, radius: f32, color: Color) {
@@ -426,8 +508,11 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             self.fill(rect, color);
             return;
         }
+        // Rundungsanteil aus den LOGISCHEN Maßen — auf das physikalische
+        // Rechteck angewandt skaliert der Radius automatisch korrekt mit.
         let roundness = (radius / (rect.w.min(rect.h) / 2.0)).min(1.0);
-        self.d.draw_rectangle_rounded(rect, roundness, 6, color);
+        let pr = self.rp(rect);
+        self.d.draw_rectangle_rounded(pr, roundness, 6, color);
     }
 
     pub fn stroke_rounded(&mut self, rect: Rect, radius: f32, thickness: f32, color: Color) {
@@ -436,8 +521,10 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             return;
         }
         let roundness = (radius / (rect.w.min(rect.h) / 2.0)).min(1.0);
+        let pr = self.rp(rect);
+        let t = self.sx(thickness);
         self.d
-            .draw_rectangle_rounded_lines_ex(rect, roundness, 6, thickness, color);
+            .draw_rectangle_rounded_lines_ex(pr, roundness, 6, t, color);
     }
 
     /// 1px-scharfe Rechteck-Kontur (nicht gerundet).
@@ -477,14 +564,13 @@ impl<'f, 'rl> Ui<'f, 'rl> {
 
     pub fn text(&mut self, text: &str, pos: Vector2, color: Color, kind: FontKind) {
         let font = self.font(kind);
-        self.d.draw_text_ex(
-            font.raw(),
-            text,
-            v2(pos.x.round(), pos.y.round()),
-            font.size,
-            0.0,
-            color,
-        );
+        let s = self.scale;
+        // Auf das PHYSIKALISCHE Pixelraster runden (scharfe Grundlinie), mit
+        // dem physikalischen `render_size` zeichnen (Atlas ist physikalisch
+        // gerastert).
+        let p = v2((pos.x * s).round(), (pos.y * s).round());
+        self.d
+            .draw_text_ex(font.raw(), text, p, font.render_size, 0.0, color);
     }
 
     /// Text vertikal zentriert in `rect`, linksbündig ab `rect.x`.
@@ -520,7 +606,8 @@ impl<'f, 'rl> Ui<'f, 'rl> {
     }
 
     pub fn icon(&mut self, name: &str, rect: Rect, size: f32, color: Color) {
-        self.icons.draw(self.d, name, rect, size, color);
+        let scale = self.scale;
+        self.icons.draw(self.d, name, rect, size, color, scale);
     }
 
     /// Bild (z. B. Thumbnail) als object-cover in `rect`; lädt lazy über den
@@ -535,10 +622,11 @@ impl<'f, 'rl> Ui<'f, 'rl> {
                 let scale = (rect.w / tw).max(rect.h / th);
                 let (sw, sh) = (rect.w / scale, rect.h / scale);
                 let src = Rect::new((tw - sw) / 2.0, (th - sh) / 2.0, sw, sh);
+                let dest = self.rpf(rect);
                 self.d.draw_texture_pro(
                     tex,
                     src,
-                    rect,
+                    dest,
                     v2(0.0, 0.0),
                     0.0,
                     Color::WHITE,
@@ -546,6 +634,29 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             }
             None => self.texture_requests.push(path.to_string()),
         }
+    }
+
+    /// Gecachte Texture (Schlüssel) in ein explizites LOGISCHES Ziel-Rechteck
+    /// zeichnen (Teil-`src` in Texturpixeln, frei wählbarer Tint). Für Panels,
+    /// die object-fit-frei platzieren (z. B. Timeline-Thumbnails). Skaliert das
+    /// Ziel zentral auf Framebuffer-Pixel.
+    pub fn draw_texture_in(&mut self, key: &str, src: Rect, dest: Rect, tint: Color) {
+        let raw = match self.textures.get(key) {
+            Some(tex) => *tex.as_ref(),
+            None => {
+                self.texture_requests.push(key.to_string());
+                return;
+            }
+        };
+        struct RawTex(ffi::Texture2D);
+        impl AsRef<ffi::Texture2D> for RawTex {
+            fn as_ref(&self) -> &ffi::Texture2D {
+                &self.0
+            }
+        }
+        let d = self.rpf(dest);
+        self.d
+            .draw_texture_pro(RawTex(raw), src, d, v2(0.0, 0.0), 0.0, tint);
     }
 
     /// Texture als transformierten Layer zeichnen: zentriert auf (cx, cy),
@@ -563,11 +674,13 @@ impl<'f, 'rl> Ui<'f, 'rl> {
     ) -> bool {
         match self.textures.get(key) {
             Some(tex) => {
+                let dst = self.rpf(Rect::new(cx, cy, w, h));
+                let origin = self.pv(v2(w / 2.0, h / 2.0));
                 self.d.draw_texture_pro(
                     tex,
                     Rect::new(0.0, 0.0, tex.width as f32, tex.height as f32),
-                    Rect::new(cx, cy, w, h),
-                    v2(w / 2.0, h / 2.0),
+                    dst,
+                    origin,
                     rot_deg,
                     Color::new(255, 255, 255, alpha),
                 );
@@ -623,8 +736,8 @@ impl<'f, 'rl> Ui<'f, 'rl> {
                 }
             }
         };
-        let dst = Rect::new(cx, cy, w, h);
-        let origin = v2(w / 2.0, h / 2.0);
+        let dst = self.rpf(Rect::new(cx, cy, w, h));
+        let origin = self.pv(v2(w / 2.0, h / 2.0));
         let tint = Color::new(255, 255, 255, alpha);
         match self.grade_shader.as_mut().filter(|_| !grade.is_identity()) {
             Some(gs) => {
@@ -661,7 +774,7 @@ impl<'f, 'rl> Ui<'f, 'rl> {
     pub fn draw_texture_contain(&mut self, path: &str, rect: Rect) {
         match self.textures.get(path) {
             Some(tex) => {
-                let target = rect.fit_contain(tex.width as f32, tex.height as f32);
+                let target = self.rpf(rect.fit_contain(tex.width as f32, tex.height as f32));
                 self.d.draw_texture_pro(
                     tex,
                     Rect::new(0.0, 0.0, tex.width as f32, tex.height as f32),
@@ -673,6 +786,69 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             }
             None => self.texture_requests.push(path.to_string()),
         }
+    }
+
+    // ----- Skalierte Vektor-Primitive (für Panels: Gizmo, Scopes, Kurven) -----
+    // Alle Methoden nehmen LOGISCHE Koordinaten und übersetzen zentral auf
+    // Framebuffer-Pixel — Panels rufen ausschließlich diese statt `ui.d.*`.
+
+    /// Linie mit Strichstärke (logisch); Endpunkte + Dicke werden skaliert.
+    pub fn line(&mut self, a: Vector2, b: Vector2, thickness: f32, color: Color) {
+        let (pa, pb, t) = (self.pv(a), self.pv(b), self.sx(thickness));
+        self.d.draw_line_ex(pa, pb, t, color);
+    }
+
+    /// Dünne 1-px-Linie (Graticule/Fadenkreuz) — Endpunkte skaliert, raylib
+    /// rastert exakt 1 Framebuffer-Pixel (scharf).
+    pub fn line_thin(&mut self, a: Vector2, b: Vector2, color: Color) {
+        let (pa, pb) = (self.pv(a), self.pv(b));
+        self.d.draw_line_v(pa, pb, color);
+    }
+
+    /// Gefüllter Kreis (Zentrum + Radius logisch).
+    pub fn circle(&mut self, center: Vector2, radius: f32, color: Color) {
+        let (c, r) = (self.pv(center), self.sx(radius));
+        self.d.draw_circle_v(c, r, color);
+    }
+
+    /// Kreis-Kontur (1-px-Linie, Zentrum + Radius logisch).
+    pub fn circle_outline(&mut self, center: Vector2, radius: f32, color: Color) {
+        let c = self.pv(center);
+        self.d
+            .draw_circle_lines(c.x as i32, c.y as i32, self.sx(radius), color);
+    }
+
+    /// Kreissektor (Farbring im Color-Panel).
+    pub fn circle_sector(
+        &mut self,
+        center: Vector2,
+        radius: f32,
+        start_deg: f32,
+        end_deg: f32,
+        segments: i32,
+        color: Color,
+    ) {
+        let (c, r) = (self.pv(center), self.sx(radius));
+        self.d
+            .draw_circle_sector(c, r, start_deg, end_deg, segments, color);
+    }
+
+    /// Gefülltes Dreieck (Playhead-Griff, Marker-Kerben).
+    pub fn triangle(&mut self, a: Vector2, b: Vector2, c: Vector2, color: Color) {
+        let (pa, pb, pc) = (self.pv(a), self.pv(b), self.pv(c));
+        self.d.draw_triangle(pa, pb, pc, color);
+    }
+
+    /// Reguläres Polygon gefüllt (Keyframe-Raute = 4 Seiten, 0°).
+    pub fn poly(&mut self, center: Vector2, sides: i32, radius: f32, rot: f32, color: Color) {
+        let (c, r) = (self.pv(center), self.sx(radius));
+        self.d.draw_poly(c, sides, r, rot, color);
+    }
+
+    /// Reguläres Polygon als Kontur.
+    pub fn poly_lines(&mut self, center: Vector2, sides: i32, radius: f32, rot: f32, color: Color) {
+        let (c, r) = (self.pv(center), self.sx(radius));
+        self.d.draw_poly_lines(c, sides, r, rot, color);
     }
 }
 

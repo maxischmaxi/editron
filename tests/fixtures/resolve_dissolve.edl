@@ -1,0 +1,7 @@
+TITLE: Resolve Dissolve 25p
+FCM: NON-DROP FRAME
+
+001  SHOTA    V     C        00:00:00:00 00:00:04:00 00:00:00:00 00:00:04:00
+* FROM CLIP NAME: shotA.mov
+002  SHOTB    V     D    025 00:00:10:00 00:00:14:00 00:00:04:00 00:00:08:00
+* FROM CLIP NAME: shotB.mov

@@ -28,7 +28,6 @@ use crate::ui::widgets::IconButton;
 use crate::ui::{DragPayload, FontKind, Ui};
 use raylib::consts::{KeyboardKey, MouseCursor};
 use raylib::math::Vector2;
-use raylib::prelude::RaylibDraw;
 use std::collections::HashSet;
 
 const ROW_H: f32 = 26.0;
@@ -231,8 +230,8 @@ fn parse_value(s: &str) -> Option<f64> {
 /// Rotationswinkel — 0° ergibt die Raute (Spitzen auf den Achsen), 45° wäre
 /// das achsparallele Quadrat.
 fn draw_diamond(ui: &mut Ui, cx: f32, cy: f32, r: f32, fill: raylib::color::Color, line: raylib::color::Color) {
-    ui.d.draw_poly(v2(cx, cy), 4, r, 0.0, fill);
-    ui.d.draw_poly_lines(v2(cx, cy), 4, r, 0.0, line);
+    ui.poly(v2(cx, cy), 4, r, 0.0, fill);
+    ui.poly_lines(v2(cx, cy), 4, r, 0.0, line);
 }
 
 /// EQ-Frequenzgang (20 Hz–20 kHz, ±18 dB) zeichnen. Nutzt dieselben Filter-
@@ -272,7 +271,7 @@ fn draw_eq_curve(ui: &mut Ui, area: Rect, values: &[f64]) {
         let db = audio_fx::eq_response_db(values, VIZ_RATE, f).clamp(-DB, DB);
         let p = v2(area.x + frac as f32 * area.w, y_of(db));
         if let Some(pp) = prev {
-            ui.d.draw_line_ex(pp, p, 1.6, theme::ACCENT);
+            ui.line(pp, p, 1.6, theme::ACCENT);
         }
         prev = Some(p);
     }
@@ -284,7 +283,7 @@ fn draw_eq_curve(ui: &mut Ui, area: Rect, values: &[f64]) {
             continue;
         }
         let p = v2(x_of(f), y_of(g));
-        ui.d.draw_circle(p.x as i32, p.y as i32, 3.5, theme::ACCENT_HOVER);
+        ui.circle(p, 3.5, theme::ACCENT_HOVER);
     }
 }
 
@@ -301,7 +300,7 @@ fn draw_comp_curve(ui: &mut Ui, area: Rect, values: &[f64], gr_db: f32) {
     let x_of = |din: f64| plot.x + ((din - LO) / (HI - LO)) as f32 * plot.w;
     let y_of = |dout: f64| plot.bottom() - ((dout.clamp(LO, HI) - LO) / (HI - LO)) as f32 * plot.h;
     // 1:1-Referenz.
-    ui.d.draw_line_ex(
+    ui.line(
         v2(x_of(LO), y_of(LO)),
         v2(x_of(HI), y_of(HI)),
         1.0,
@@ -322,7 +321,7 @@ fn draw_comp_curve(ui: &mut Ui, area: Rect, values: &[f64], gr_db: f32) {
         } + makeup;
         let p = v2(x_of(din), y_of(dout));
         if let Some(pp) = prev {
-            ui.d.draw_line_ex(pp, p, 1.6, theme::ACCENT);
+            ui.line(pp, p, 1.6, theme::ACCENT);
         }
         prev = Some(p);
     }
@@ -1213,7 +1212,7 @@ impl Panel for EffectControlsPanel {
             let px = ruler.x + local * ruler.w;
             ui.fill(Rect::new(px - 0.5, ruler.y, 1.5, ruler.h + lanes_full.h), theme::ACCENT);
             // Griff im Lineal
-            ui.d.draw_triangle(
+            ui.triangle(
                 v2(px - 5.0, ruler.y),
                 v2(px + 5.0, ruler.y),
                 v2(px, ruler.y + 7.0),

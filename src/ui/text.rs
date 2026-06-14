@@ -3,6 +3,12 @@
 //! (Schnitt, Größe)-Kombination als eigenen Atlas. Atlanten werden mit 2-facher
 //! Pixelgröße gerastert und bilinear herunterskaliert (sauberes Antialiasing
 //! mit Subpixel-Positionierung).
+//!
+//! HiDPI: Der Atlas wird in PHYSIKALISCHER Auflösung gerastert — Pixelgröße =
+//! `logische_größe × ui_scale × OVERSAMPLE`. `measure()` liefert weiterhin
+//! logische Maße (Layout bleibt skalierungsunabhängig), gezeichnet wird mit
+//! `render_size = logische_größe × ui_scale` (physikalisch). Beim Scale-Wechsel
+//! (Monitorwechsel/Override) baut der Mainloop die Atlanten neu auf.
 
 use crate::core::text_raster::fc_match;
 use raylib::consts::TextureFilter;
@@ -63,9 +69,11 @@ const OVERSAMPLE: f32 = 2.0;
 
 pub struct FontHandle {
     font: Font,
-    /// Logische Pixelgröße (CSS px), mit der gezeichnet wird.
+    /// Logische Pixelgröße (CSS px) — Bezug für `measure()` und das Layout.
     pub size: f32,
-    /// Zeilenhöhe (CSS line-height der Tailwind-Stufe).
+    /// Physikalische Pixelgröße für `draw_text_ex` (= `size × ui_scale`).
+    pub render_size: f32,
+    /// Zeilenhöhe (CSS line-height der Tailwind-Stufe, logisch).
     pub line_height: f32,
 }
 
@@ -76,16 +84,15 @@ impl FontHandle {
         path: &str,
         size: f32,
         line_height: f32,
+        scale: f32,
         chars: &[char],
     ) -> FontHandle {
         let chars_string: String = chars.iter().collect();
+        // Atlas in physikalischer Auflösung rastern: logische Größe × UI-Scale ×
+        // Supersampling. So bleiben Glyphen auf HiDPI-Displays gestochen scharf.
+        let base = ((size * scale * OVERSAMPLE).round() as i32).max(1);
         let font = rl
-            .load_font_ex(
-                thread,
-                path,
-                (size * OVERSAMPLE) as i32,
-                Some(&chars_string),
-            )
+            .load_font_ex(thread, path, base, Some(&chars_string))
             .unwrap_or_else(|e| panic!("Font {path} ({size}px) konnte nicht geladen werden: {e}"));
         unsafe {
             ffi::SetTextureFilter(
@@ -96,6 +103,7 @@ impl FontHandle {
         FontHandle {
             font,
             size,
+            render_size: size * scale,
             line_height,
         }
     }
@@ -149,7 +157,10 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    pub fn load(rl: &mut RaylibHandle, thread: &RaylibThread) -> Fonts {
+    /// Lädt alle Atlanten in physikalischer Auflösung für den gegebenen
+    /// UI-Scale. Bei einem Scale-Wechsel (Monitorwechsel/Override) ruft der
+    /// Mainloop dies erneut auf und ersetzt den `Fonts`-Wert.
+    pub fn load(rl: &mut RaylibHandle, thread: &RaylibThread, scale: f32) -> Fonts {
         let chars = codepoints();
         let sans_reg = resolve_font(SANS_STACK, FC_REGULAR).expect("kein Sans-Font gefunden");
         let sans_med = resolve_font(SANS_STACK, FC_MEDIUM).unwrap_or_else(|| sans_reg.clone());
@@ -158,15 +169,15 @@ impl Fonts {
         let mono_reg = resolve_font(MONO_STACK, FC_REGULAR).unwrap_or_else(|| sans_reg.clone());
 
         Fonts {
-            sans_12: FontHandle::load(rl, thread, &sans_reg, 12.0, 16.0, &chars),
-            sans_12_medium: FontHandle::load(rl, thread, &sans_med, 12.0, 16.0, &chars),
-            sans_12_bold: FontHandle::load(rl, thread, &sans_bold, 12.0, 16.0, &chars),
-            sans_14: FontHandle::load(rl, thread, &sans_reg, 14.0, 20.0, &chars),
-            sans_14_semibold: FontHandle::load(rl, thread, &sans_semi, 14.0, 20.0, &chars),
-            sans_16: FontHandle::load(rl, thread, &sans_reg, 16.0, 24.0, &chars),
-            sans_16_semibold: FontHandle::load(rl, thread, &sans_semi, 16.0, 24.0, &chars),
-            mono_12: FontHandle::load(rl, thread, &mono_reg, 12.0, 16.0, &chars),
-            mono_11: FontHandle::load(rl, thread, &mono_reg, 11.0, 14.0, &chars),
+            sans_12: FontHandle::load(rl, thread, &sans_reg, 12.0, 16.0, scale, &chars),
+            sans_12_medium: FontHandle::load(rl, thread, &sans_med, 12.0, 16.0, scale, &chars),
+            sans_12_bold: FontHandle::load(rl, thread, &sans_bold, 12.0, 16.0, scale, &chars),
+            sans_14: FontHandle::load(rl, thread, &sans_reg, 14.0, 20.0, scale, &chars),
+            sans_14_semibold: FontHandle::load(rl, thread, &sans_semi, 14.0, 20.0, scale, &chars),
+            sans_16: FontHandle::load(rl, thread, &sans_reg, 16.0, 24.0, scale, &chars),
+            sans_16_semibold: FontHandle::load(rl, thread, &sans_semi, 16.0, 24.0, scale, &chars),
+            mono_12: FontHandle::load(rl, thread, &mono_reg, 12.0, 16.0, scale, &chars),
+            mono_11: FontHandle::load(rl, thread, &mono_reg, 11.0, 14.0, scale, &chars),
         }
     }
 }

@@ -104,6 +104,8 @@ enum MonitorAction {
     Insert,
     /// Quellmonitor: Three-Point-Overwrite in die Timeline.
     Overwrite,
+    /// Programmmonitor: aktuellen Frame als Bild exportieren (Kamera-Icon).
+    ExportFrame,
 }
 
 fn render_monitor(
@@ -348,6 +350,18 @@ fn render_monitor(
             action_id: 9,
         });
     }
+    // Programmmonitor: aktuellen Frame als Bild exportieren (wie Premieres
+    // Kamera-Icon — PNG/JPEG/TIFF des komponierten Frames am Playhead).
+    if chrome.monitor == "program" {
+        buttons.push(Btn { icon: "", tip: "", enabled: false, active: false, action_id: 0 });
+        buttons.push(Btn {
+            icon: "image",
+            tip: "Frame exportieren (PNG/JPEG/TIFF)",
+            enabled: has,
+            active: false,
+            action_id: 12,
+        });
+    }
     // Quellmonitor: Three-Point-Edit-Buttons (Insert/Overwrite in die Timeline).
     if chrome.monitor == "source" {
         let has_source = matches!(chrome.stage, StageContent::Asset(_));
@@ -422,6 +436,7 @@ fn render_monitor(
                 9 => MonitorAction::ToggleLoop,
                 10 => MonitorAction::Insert,
                 11 => MonitorAction::Overwrite,
+                12 => MonitorAction::ExportFrame,
                 _ => MonitorAction::None,
             };
         }
@@ -555,6 +570,7 @@ impl Panel for SourceMonitorPanel {
             MonitorAction::SetScale(v) => app.monitor.source_scale = v,
             MonitorAction::Insert => ui.run_command("timeline.insert"),
             MonitorAction::Overwrite => ui.run_command("timeline.overwrite"),
+            MonitorAction::ExportFrame => {} // nur Programmmonitor
         }
 
         // Fokus-Tracking für die Wiedergabe-Command-Weiche
@@ -640,6 +656,32 @@ fn resolve_program_layers(
                 // Quad-Basis ist das volle Frame — NICHT die Texturmaße
                 // (Überabtastung/Erweiterung stecken in der Textur).
                 (key, (canvas.w, canvas.h))
+            } else if let Some(inner_id) = &clip.nest_seq {
+                // Verschachtelte Sequenz: der Player komponiert sie in eine
+                // Clip-Textur (innere Auflösung); natürliche Größe = innere
+                // Sequenzgröße (contain-fit ins äußere Frame). Grade/Effekte
+                // des Nest-Clips wendet die GPU-Pipeline unten an.
+                let key = clip_texture_key(&clip.id);
+                ui.texture_size(&key)?; // erst zeichnen, wenn der Player geliefert hat
+                let (iw, ih) = app
+                    .timeline
+                    .timeline_of(inner_id)
+                    .map(|t| (t.settings.width as f32, t.settings.height as f32))
+                    .unwrap_or((canvas.w, canvas.h));
+                (key, (iw, ih))
+            } else if let Some(mc) = &clip.multicam {
+                // Multicam: der Player liefert den aktiven Winkel als Clip-Textur;
+                // natürliche Größe = Winkel-Auflösung (contain-fit ins Frame).
+                let key = clip_texture_key(&clip.id);
+                ui.texture_size(&key)?;
+                let (aw, ah) = app
+                    .timeline
+                    .timeline_of(&mc.source)
+                    .and_then(|t| t.multicam.as_ref())
+                    .and_then(|s| s.angle(mc.angle))
+                    .map(|a| (a.width.max(1) as f32, a.height.max(1) as f32))
+                    .unwrap_or((canvas.w, canvas.h));
+                (key, (aw, ah))
             } else {
                 let asset = app.media.asset(&clip.asset_id)?;
                 if asset.offline {
@@ -710,6 +752,94 @@ fn resolve_program_layers(
             }))
         })
         .collect()
+}
+
+/// Einen Rahmen der Stärke `th` um `r` zeichnen (vier dünne Flächen).
+fn draw_border(ui: &mut Ui, r: Rect, color: raylib::color::Color, th: f32) {
+    ui.fill(Rect::new(r.x, r.y, r.w, th), color);
+    ui.fill(Rect::new(r.x, r.bottom() - th, r.w, th), color);
+    ui.fill(Rect::new(r.x, r.y, th, r.h), color);
+    ui.fill(Rect::new(r.right() - th, r.y, th, r.h), color);
+}
+
+/// Multicam-Raster zeichnen: alle Winkel der am Playhead aktiven Multicam-Quelle
+/// synchron als Kacheln (2×2, 3×3 …), der aktive Winkel mit Akzent-Rahmen.
+/// Klick auf eine Kachel schaltet den Winkel um (bei Wiedergabe Live-Schnitt).
+/// Die Decoder je Winkel liefert der Player (siehe `program_video_targets`).
+fn draw_multicam_grid(ui: &mut Ui, app: &mut AppState, canvas: Rect, t: f64) {
+    use crate::core::player::{active_multicam_clip, mc_angle_id};
+    // Hintergrund (überdeckt das Programmbild vollständig).
+    ui.fill(canvas, theme::SURFACE_0);
+    let info = active_multicam_clip(app)
+        .and_then(|c| c.multicam.as_ref().map(|mc| (c.id.clone(), mc.source.clone(), mc.angle)));
+    let Some((clip_id, source_id, active_angle)) = info else {
+        ui.text_centered(
+            "Kein Multicam-Clip am Playhead",
+            canvas,
+            theme::TEXT_2,
+            FontKind::Sans14,
+        );
+        return;
+    };
+    let angles: Vec<String> = match app.timeline.multicam_source(&source_id) {
+        Some(src) => src.angles.iter().map(|a| a.name.clone()).collect(),
+        None => return,
+    };
+    let n = angles.len();
+    if n == 0 {
+        return;
+    }
+    let cols = crate::core::multicam::grid_cols(n);
+    let rows = n.div_ceil(cols);
+    let gap = 3.0f32;
+    let cell_w = ((canvas.w - gap * (cols as f32 + 1.0)) / cols as f32).max(1.0);
+    let cell_h = ((canvas.h - gap * (rows as f32 + 1.0)) / rows as f32).max(1.0);
+    let white = raylib::color::Color::new(255, 255, 255, 255);
+    let strip_bg = raylib::color::Color::new(0, 0, 0, 160);
+    let playing = app.playback.program_playing;
+    let mut clicked: Option<u32> = None;
+    for (i, angle_name) in angles.iter().enumerate() {
+        let r = i / cols;
+        let c = i % cols;
+        let x = canvas.x + gap + c as f32 * (cell_w + gap);
+        let y = canvas.y + gap + r as f32 * (cell_h + gap);
+        let cell = Rect::new(x, y, cell_w, cell_h);
+        ui.fill(cell, theme::SURFACE_1);
+        let key = clip_texture_key(&mc_angle_id(&clip_id, i as u32));
+        if let Some((tw, th)) = ui.texture_size(&key) {
+            let dest = cell.fit_contain(tw, th);
+            ui.draw_texture_in(&key, Rect::new(0.0, 0.0, tw, th), dest, white);
+        } else {
+            ui.text_centered("lädt …", cell, theme::TEXT_3, FontKind::Sans12);
+        }
+        // Nummer + Winkelname als Streifen unten links.
+        let strip = Rect::new(cell.x, cell.bottom() - 20.0, cell.w, 20.0);
+        ui.fill(strip, strip_bg);
+        let label = Rect::new(strip.x + 6.0, strip.y, strip.w - 12.0, strip.h);
+        ui.text_left(
+            &format!("{}  {}", i + 1, angle_name),
+            label,
+            theme::TEXT_1,
+            FontKind::Sans12,
+        );
+        // Rahmen: aktiver Winkel betont (Akzent), sonst dezent.
+        if i as u32 == active_angle {
+            draw_border(ui, cell, theme::ACCENT, 2.5);
+        } else {
+            draw_border(ui, cell, theme::LINE, 1.0);
+        }
+        let it = ui.interact(ui.id(("mc.tile", i)), cell);
+        if it.clicked {
+            clicked = Some(i as u32);
+        }
+    }
+    if let Some(angle) = clicked {
+        if playing {
+            app.timeline.multicam_live_cut(t, angle);
+        } else {
+            app.timeline.set_multicam_angle_undoable(&clip_id, angle);
+        }
+    }
 }
 
 /// Nur die Clip-Layer (Gizmo/Farbpipette arbeiten auf Clips).
@@ -823,6 +953,40 @@ impl Panel for ProgramMonitorPanel {
 
         let layers = resolve_program_layers(ui, app, canvas, t);
 
+        // Wiedergabe aus dem Sequenz-Render-Cache: das fertig gerenderte
+        // Programmbild als ein Vollbild-Layer zeichnen (statt N Clip-Layer zu
+        // komponieren). Erst zeichnen, wenn die Cache-Textur wirklich anliegt
+        // (kein Schwarz-Flackern am Bereichsanfang).
+        let cache_layers: Vec<StageLayer> = if app.monitor.program_from_cache
+            && ui
+                .texture_size(crate::core::player::RENDER_CACHE_KEY)
+                .is_some()
+        {
+            vec![StageLayer::Clip(ResolvedLayer {
+                clip_id: String::new(),
+                tex_key: crate::core::player::RENDER_CACHE_KEY.to_string(),
+                quad: LayerQuad {
+                    cx: (canvas.x + canvas.w / 2.0) as f64,
+                    cy: (canvas.y + canvas.h / 2.0) as f64,
+                    w: canvas.w as f64,
+                    h: canvas.h as f64,
+                    rot_deg: 0.0,
+                },
+                alpha: 255,
+                grade: crate::core::grade::precompute(&crate::core::grade::ColorGrade::default()),
+                mask: None,
+                extend_k: 1.0,
+                is_title: false,
+            })]
+        } else {
+            Vec::new()
+        };
+        let stage_layers: &[StageLayer] = if cache_layers.is_empty() {
+            &layers
+        } else {
+            &cache_layers
+        };
+
         let chrome = MonitorChrome {
             monitor: "program",
             time: app.timeline.playhead_sec,
@@ -839,7 +1003,7 @@ impl Panel for ProgramMonitorPanel {
             stage: if has_clips {
                 StageContent::Program {
                     canvas,
-                    layers: &layers,
+                    layers: stage_layers,
                 }
             } else {
                 StageContent::Empty
@@ -854,16 +1018,28 @@ impl Panel for ProgramMonitorPanel {
         let scale = app.monitor.program_scale;
         let action = render_monitor(ui, &chrome, &mut self.scrub_active, scale, rect);
 
+        // Multicam-Raster: alle Winkel synchron über das Programmbild legen.
+        let multicam_view = app.monitor.view == crate::stores::MonitorView::Multicam;
+        if multicam_view && has_clips {
+            ui.push_clip(stage);
+            draw_multicam_grid(ui, app, canvas, t);
+            ui.pop_clip();
+        }
+
         // Sichere Ränder (Action-/Title-Safe) über dem Programmbild.
-        if app.monitor.safe_margins && has_clips {
+        if app.monitor.safe_margins && has_clips && !multicam_view {
             ui.push_clip(stage);
             draw_safe_margins(ui, canvas);
             ui.pop_clip();
         }
 
         // ---- Farbpipette (Chroma-Key): Klick liest die Quellfarbe ----
+        // Im Multicam-Raster ruhen Gizmo/Texteingabe/Farbpipette (das Raster
+        // hat eigene Klick-Semantik: Winkel wählen).
         let clip_only = clip_layers(&layers);
-        if app.app.color_pick.is_some() {
+        if multicam_view {
+            // nichts — das Raster verarbeitet die Klicks selbst.
+        } else if app.app.color_pick.is_some() {
             self.title_editor.stop(ui);
             handle_color_pick(ui, app, stage, &clip_only, t);
         } else if self.title_editor.update(ui, app, stage, canvas, &clip_only) {
@@ -907,9 +1083,189 @@ impl Panel for ProgramMonitorPanel {
             app.monitor.safe_margins = !app.monitor.safe_margins;
         }
 
+        // Proxy-Umschalter (Premiere-Pendant): Vorschau aus dem Proxy, der
+        // Export bleibt immer im Original. Aktiv = grün; ein kleiner Punkt
+        // zeigt verfügbare Proxys / laufende Erstellung an.
+        let use_proxy = app.media.use_proxies;
+        let proxy_count = app.media.proxy_count();
+        let building = !app.media.proxy_jobs.is_empty();
+        let pbtn = Rect::new(btn.x + 32.0, btn.y, 28.0, 28.0);
+        let pid = ui.id("program.proxyToggle");
+        let pit = ui.interact(pid, pbtn);
+        if use_proxy || pit.hovered {
+            ui.fill_rounded(pbtn, theme::RADIUS_SM, theme::SURFACE_3);
+        }
+        ui.icon(
+            "gauge",
+            pbtn,
+            16.0,
+            if use_proxy {
+                theme::SUCCESS
+            } else if pit.hovered {
+                theme::TEXT_1
+            } else {
+                theme::TEXT_2
+            },
+        );
+        // Status-Punkt oben rechts: gelb = wird erstellt, grün = vorhanden.
+        if building || proxy_count > 0 {
+            let dot = Rect::new(pbtn.right() - 8.0, pbtn.y + 4.0, 6.0, 6.0);
+            let c = if building { theme::WARNING } else { theme::SUCCESS };
+            ui.fill_rounded(dot, 3.0, c);
+        }
+        if pit.hovered {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+            let tip = if building {
+                "Proxies verwenden — Erstellung läuft".to_string()
+            } else if proxy_count > 0 {
+                format!("Proxies verwenden ({proxy_count} vorhanden) — Export bleibt Original")
+            } else {
+                "Proxies verwenden — noch keine Proxys erstellt".to_string()
+            };
+            ui.tooltip(pid, pbtn, &tip);
+        }
+        if pit.clicked {
+            ui.run_command("proxy.toggle");
+        }
+
+        // Performance-Overlay-Umschalter (rechts neben dem Proxy-Badge).
+        let fbtn = Rect::new(pbtn.x + 32.0, pbtn.y, 28.0, 28.0);
+        let fid = ui.id("program.perfOverlay");
+        let fit = ui.interact(fid, fbtn);
+        let perf = app.monitor.perf;
+        if app.monitor.show_perf_overlay || fit.hovered {
+            ui.fill_rounded(fbtn, theme::RADIUS_SM, theme::SURFACE_3);
+        }
+        ui.icon(
+            "activity",
+            fbtn,
+            16.0,
+            if app.monitor.show_perf_overlay {
+                theme::ACCENT
+            } else if fit.hovered {
+                theme::TEXT_1
+            } else {
+                theme::TEXT_2
+            },
+        );
+        // Roter Punkt bei kürzlich verworfenen Frames (auch ohne Overlay).
+        if perf.dropped_recent > 0 {
+            let dot = Rect::new(fbtn.right() - 8.0, fbtn.y + 4.0, 6.0, 6.0);
+            ui.fill_rounded(dot, 3.0, theme::DANGER);
+        }
+        if fit.hovered {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+            ui.tooltip(
+                fid,
+                fbtn,
+                "Performance-Overlay (Decode-/Upload-/Frame-Zeiten, Cache)",
+            );
+        }
+        if fit.clicked {
+            ui.run_command("monitor.togglePerfOverlay");
+        }
+
+        // Multicam-Monitor-Umschalter (Winkel-Raster): aktiv = Akzent.
+        let mc_on = app.monitor.view == crate::stores::MonitorView::Multicam;
+        let mbtn = Rect::new(fbtn.x + 32.0, fbtn.y, 28.0, 28.0);
+        let mid = ui.id("program.multicamToggle");
+        let mit = ui.interact(mid, mbtn);
+        if mc_on || mit.hovered {
+            ui.fill_rounded(mbtn, theme::RADIUS_SM, theme::SURFACE_3);
+        }
+        ui.icon(
+            "layout-grid",
+            mbtn,
+            16.0,
+            if mc_on {
+                theme::ACCENT
+            } else if mit.hovered {
+                theme::TEXT_1
+            } else {
+                theme::TEXT_2
+            },
+        );
+        if mit.hovered {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+            ui.tooltip(
+                mid,
+                mbtn,
+                "Multicam-Monitor (alle Winkel als Raster, Zifferntasten schneiden)",
+            );
+        }
+        if mit.clicked {
+            ui.run_command("multicam.toggleMonitor");
+        }
+
+        // ---- Dropped-Frame-Indikator (Resolve-artig) oben rechts ----
+        if has_clips && perf.dropped_recent > 0 {
+            let label = format!("⚠ {} dropped", perf.dropped_recent);
+            let w = ui.font(FontKind::Mono12).width(&label) + 16.0;
+            let box_ = Rect::new(stage.right() - w - 8.0, stage.y + 8.0, w, 20.0);
+            ui.fill_rounded(box_, theme::RADIUS_SM, theme::with_alpha(theme::BLACK, 180));
+            ui.text_left(
+                &label,
+                Rect::new(box_.x + 8.0, box_.y, box_.w - 8.0, box_.h),
+                theme::DANGER,
+                FontKind::Mono12,
+            );
+        }
+
+        // ---- Performance-Overlay (Decode-/Upload-/Frame-Zeiten, Cache) ----
+        if app.monitor.show_perf_overlay {
+            let cached_secs: f64 = app
+                .render_cache
+                .cached_spans()
+                .iter()
+                .map(|(a, b)| (b - a) as f64)
+                .sum::<f64>()
+                / app.timeline.settings.rate.fps().max(1.0);
+            let lines = [
+                format!("{:.0} fps · {:.1} ms/Frame", perf.fps, perf.frame_ms),
+                format!("Decode {:.1} ms · Upload {:.1} ms", perf.decode_ms, perf.upload_ms),
+                format!(
+                    "Frame-Cache {:.0} MB · {} Frames · {:.0}% hit",
+                    perf.cache_used_mb,
+                    perf.cache_entries,
+                    perf.cache_hit_ratio() * 100.0
+                ),
+                format!("Verworfen gesamt: {}", perf.dropped_total),
+                format!(
+                    "Render-Cache: {} Segmente · {:.1} s{}",
+                    app.render_cache.segments.len(),
+                    cached_secs,
+                    if app.render_cache.rendering.is_some() {
+                        " · rendert…"
+                    } else {
+                        ""
+                    }
+                ),
+            ];
+            let lh = 16.0;
+            let bw = lines
+                .iter()
+                .map(|l| ui.font(FontKind::Mono11).width(l))
+                .fold(0.0_f32, f32::max)
+                + 16.0;
+            let bh = lines.len() as f32 * lh + 12.0;
+            let box_ = Rect::new(stage.x + 8.0, stage.y + 8.0, bw, bh);
+            ui.fill_rounded(box_, theme::RADIUS_SM, theme::with_alpha(theme::BLACK, 190));
+            for (i, line) in lines.iter().enumerate() {
+                ui.text_left(
+                    line,
+                    Rect::new(box_.x + 8.0, box_.y + 6.0 + i as f32 * lh, bw - 16.0, lh),
+                    theme::TEXT_1,
+                    FontKind::Mono11,
+                );
+            }
+        }
+
         match action {
             MonitorAction::None => {}
-            MonitorAction::Seek(t) => app.timeline.set_playhead(t),
+            MonitorAction::Seek(t) => {
+                app.timeline.set_playhead(t);
+                app.playback.scrub_active = true; // Audio-Scrubbing am Programm
+            }
             MonitorAction::GoToStart => app.timeline.go_to_start(),
             MonitorAction::GoToEnd => app.timeline.go_to_end(),
             MonitorAction::StepFrames(frames) => {
@@ -944,6 +1300,7 @@ impl Panel for ProgramMonitorPanel {
             MonitorAction::SetScale(v) => app.monitor.program_scale = v,
             // Insert/Overwrite gibt es nur im Quellmonitor.
             MonitorAction::Insert | MonitorAction::Overwrite => {}
+            MonitorAction::ExportFrame => ui.run_command("export.frame"),
         }
 
         if ui.mouse_in(rect) && (ui.input.left_pressed || ui.input.right_pressed) {

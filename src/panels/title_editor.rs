@@ -15,7 +15,6 @@ use crate::theme;
 use crate::ui::geom::{v2, Rect};
 use crate::ui::Ui;
 use raylib::consts::{KeyboardKey, MouseCursor};
-use raylib::prelude::RaylibDraw;
 
 struct EditState {
     clip_id: String,
@@ -317,7 +316,7 @@ impl TitleTextEditor {
                 v2(x, y)
             });
             for i in 0..4 {
-                ui.d.draw_line_ex(
+                ui.line(
                     corners[i],
                     corners[(i + 1) % 4],
                     1.5,
@@ -330,12 +329,7 @@ impl TitleTextEditor {
                 {
                     let a = map.to_screen((x, y));
                     let b = map.to_screen((x, y + h));
-                    ui.d.draw_line_ex(
-                        v2(a.0, a.1),
-                        v2(b.0, b.1),
-                        2.0,
-                        theme::TEXT_1,
-                    );
+                    ui.line(v2(a.0, a.1), v2(b.0, b.1), 2.0, theme::TEXT_1);
                 }
             }
         }

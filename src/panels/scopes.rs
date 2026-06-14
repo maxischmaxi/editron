@@ -15,7 +15,6 @@ use crate::theme;
 use crate::ui::geom::{v2, Rect};
 use crate::ui::widgets::select::select;
 use crate::ui::{FontKind, Ui};
-use raylib::prelude::RaylibDraw;
 
 /// Analyse-Auflösung des komponierten Programm-Bilds.
 const CANVAS_W: usize = 192;
@@ -60,14 +59,15 @@ impl ScopesPanel {
             return None;
         }
 
-        // Opakes schwarzes Canvas.
-        let mut canvas = vec![0u8; CANVAS_W * CANVAS_H * 4];
+        // Opakes schwarzes f32-Canvas (Analyse läuft in voller Präzision wie
+        // der Export; am Ende für die Scope-Darstellung nach u8 quantisiert).
+        let mut canvas = vec![0f32; CANVAS_W * CANVAS_H * 4];
         for px in canvas.chunks_exact_mut(4) {
-            px[3] = 255;
+            px[3] = 1.0;
         }
 
         struct Layer {
-            data: Vec<u8>,
+            data: Vec<f32>,
             w: usize,
             h: usize,
             quad: compose::LayerQuad,
@@ -85,7 +85,7 @@ impl ScopesPanel {
             // Bildquelle: Text-Raster (Mini der Titel-Engine — Titel und
             // Untertitel), Live-Frame, sonst Thumbnail.
             let mut title_extend = 1.0f64;
-            let (w, h, mut data) = if clip.is_generator() {
+            let (w, h, data_u8) = if clip.is_generator() {
                 let Some(mini) = app.monitor.preview_frames.get(&clip.id) else { continue };
                 // Vertikale Raster-Erweiterung (Abspann) aus dem Mini ableiten.
                 title_extend = ((mini.h as f64 * CANVAS_W as f64)
@@ -115,7 +115,8 @@ impl ScopesPanel {
                     (s.w, s.h, s.rgba.clone())
                 }
             };
-            // Effekte + Farbkorrektur — identische Mathematik wie Export.
+            // Quelle (u8) → f32; Effekte + Farbkorrektur identisch zum Export.
+            let mut data = crate::core::pixbuf::rgba8_to_f32(&data_u8);
             let resolved = effects::resolve_video_effects(&clip.effects, media_t);
             if !resolved.is_empty() {
                 effects::apply_effects_buffer(&mut data, w, h, (0, 0, w, h), &resolved, 1);
@@ -162,7 +163,8 @@ impl ScopesPanel {
             })
             .collect();
         compose::composite_frame(&mut canvas, CANVAS_W, CANVAS_H, &frames, 1);
-        Some(canvas)
+        // f32-Analyse-Canvas → u8 für die Scope-Darstellung (Histogramm/WFM).
+        Some(crate::core::pixbuf::f32_to_rgba8(&canvas))
     }
 }
 
@@ -278,13 +280,13 @@ impl Panel for ScopesPanel {
                 let radius = (w.min(h) / 2.0 - 8.0).max(10.0);
                 // Graticule: Kreise bei 75 % / 100 %, Achsenkreuz.
                 let line = raylib::color::Color::new(255, 255, 255, 26);
-                ui.d.draw_circle_lines(cx as i32, cy as i32, radius, line);
-                ui.d.draw_circle_lines(cx as i32, cy as i32, radius * 0.75, line);
-                ui.d.draw_line_v(v2(cx - radius, cy), v2(cx + radius, cy), line);
-                ui.d.draw_line_v(v2(cx, cy - radius), v2(cx, cy + radius), line);
+                ui.circle_outline(v2(cx, cy), radius, line);
+                ui.circle_outline(v2(cx, cy), radius * 0.75, line);
+                ui.line_thin(v2(cx - radius, cy), v2(cx + radius, cy), line);
+                ui.line_thin(v2(cx, cy - radius), v2(cx, cy + radius), line);
                 // Hauttonlinie (~123° im Vektorskop).
                 let skin = 123.0f32.to_radians();
-                ui.d.draw_line_v(
+                ui.line_thin(
                     v2(cx, cy),
                     v2(cx + skin.cos() * radius, cy - skin.sin() * radius),
                     raylib::color::Color::new(255, 255, 255, 40),
@@ -328,7 +330,7 @@ impl Panel for ScopesPanel {
                     for (b, v) in channel.iter().enumerate() {
                         let x = area.x + (b as f32 / 255.0) * (w - 1.0);
                         let y = area.y + h - 1.0 - (v / max) * (h - 4.0);
-                        ui.d.draw_line_v(prev, raylib::math::Vector2::new(x, y), colors[c]);
+                        ui.line_thin(prev, raylib::math::Vector2::new(x, y), colors[c]);
                         prev = raylib::math::Vector2::new(x, y);
                     }
                 }

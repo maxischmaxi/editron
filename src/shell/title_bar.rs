@@ -9,7 +9,6 @@ use crate::ui::geom::{v2, Rect};
 use crate::ui::widgets::IconButton;
 use crate::ui::{FontKind, Ui};
 use raylib::consts::MouseCursor;
-use raylib::prelude::RaylibDraw;
 
 /// Einträge des Datei-Menüs (Projektverwaltung, Import/Export, Relink).
 fn file_menu_items(app: &AppState) -> Vec<MenuEntry> {
@@ -36,6 +35,7 @@ fn file_menu_items(app: &AppState) -> Vec<MenuEntry> {
             })
             .collect()
     };
+    let has_clips = !app.timeline.clips.is_empty();
     vec![
         MenuEntry::Item(MenuItem::command("project.new").with_icon("clapperboard")),
         MenuEntry::Item(MenuItem::command("project.open").with_icon("folder-open")),
@@ -53,11 +53,38 @@ fn file_menu_items(app: &AppState) -> Vec<MenuEntry> {
         MenuEntry::Item(MenuItem::command("media.import").with_icon("import")),
         MenuEntry::Item(MenuItem::command("app.export").with_icon("file-output")),
         MenuEntry::Separator,
+        MenuEntry::Submenu {
+            label: "Sequenz importieren".into(),
+            icon: Some("import"),
+            items: vec![
+                MenuEntry::Item(MenuItem::command("sequence.import.otio")),
+                MenuEntry::Item(MenuItem::command("sequence.import.edl")),
+            ],
+        },
+        MenuEntry::Submenu {
+            label: "Sequenz exportieren".into(),
+            icon: Some("file-output"),
+            items: vec![
+                MenuEntry::Item(
+                    MenuItem::command("sequence.export.otio").with_disabled(!has_clips),
+                ),
+                MenuEntry::Item(
+                    MenuItem::command("sequence.export.edl").with_disabled(!has_clips),
+                ),
+                MenuEntry::Item(
+                    MenuItem::command("sequence.export.fcpxml").with_disabled(!has_clips),
+                ),
+            ],
+        },
+        MenuEntry::Separator,
         MenuEntry::Item(MenuItem::command("subtitle.importSrt").with_icon("captions")),
         MenuEntry::Item(MenuItem::command("subtitle.exportSrt").with_icon("captions")),
         MenuEntry::Separator,
         MenuEntry::Item(MenuItem::command("project.relink").with_icon("link-2")),
+        MenuEntry::Item(MenuItem::command("project.autosaveVersions").with_icon("history")),
         MenuEntry::Item(MenuItem::command("project.restoreAutosave")),
+        MenuEntry::Separator,
+        MenuEntry::Item(MenuItem::command("app.settings").with_icon("sliders-horizontal")),
     ]
 }
 
@@ -181,7 +208,7 @@ pub fn render(ui: &mut Ui, app: &mut AppState, rect: Rect) {
         ),
     };
     let dot = v2(status_rect.x + 12.0, status_rect.center().y);
-    ui.d.draw_circle_v(dot, 4.0, dot_color);
+    ui.circle(dot, 4.0, dot_color);
     ui.text_left(
         "FFmpeg",
         Rect::new(status_rect.x + 22.0, status_rect.y, ffmpeg_label_w, status_rect.h),

@@ -342,6 +342,19 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::new("marker.prev", "Shift+PageUp"),
         Keybinding::when("marker.deleteAtPlayhead", "Mod+Alt+M", "panel == 'timeline'"),
         Keybinding::new("markers.openPanel", "Mod+Shift+M"),
+        // Multicam — in allen Presets gleich (NLE-Konvention): Shift+0 schaltet
+        // den Multicam-Monitor um; die Zifferntasten 1–9 schneiden live bzw.
+        // wechseln den Winkel (nur im Multicam-Monitor aktiv, sonst frei).
+        Keybinding::new("multicam.toggleMonitor", "Shift+0"),
+        Keybinding::when("multicam.angle1", "1", "multicamActive"),
+        Keybinding::when("multicam.angle2", "2", "multicamActive"),
+        Keybinding::when("multicam.angle3", "3", "multicamActive"),
+        Keybinding::when("multicam.angle4", "4", "multicamActive"),
+        Keybinding::when("multicam.angle5", "5", "multicamActive"),
+        Keybinding::when("multicam.angle6", "6", "multicamActive"),
+        Keybinding::when("multicam.angle7", "7", "multicamActive"),
+        Keybinding::when("multicam.angle8", "8", "multicamActive"),
+        Keybinding::when("multicam.angle9", "9", "multicamActive"),
     ]
 }
 
@@ -352,6 +365,8 @@ fn project_bindings() -> Vec<Keybinding> {
         Keybinding::new("project.open", "Mod+O"),
         Keybinding::new("project.save", "Mod+S"),
         Keybinding::new("project.saveAs", "Mod+Shift+S"),
+        // Neue Sequenz (Premiere: Cmd+N ist hier Projekt; Sequenz auf Shift).
+        Keybinding::new("sequence.new", "Mod+Shift+N"),
     ]
 }
 
@@ -419,9 +434,15 @@ fn editron_preset() -> KeymapPreset {
         // Medien
         Keybinding::new("media.import", "Mod+I"),
         Keybinding::when("media.removeSelected", "Delete", "panel == 'media'"),
+        Keybinding::new("proxy.toggle", "Mod+Alt+P"),
+        // Wiedergabe-Performance
+        Keybinding::new("render.inToOut", "Mod+Shift+R"),
+        Keybinding::new("monitor.togglePerfOverlay", "Mod+Alt+Shift+P"),
         // Anwendung
         Keybinding::new("app.export", "Mod+E"),
         Keybinding::new("sequence.settings", "Mod+Alt+S"),
+        // Einstellungen wie in Premiere/macOS-Apps auf Cmd/Strg+Komma.
+        Keybinding::new("app.settings", "Mod+,"),
         Keybinding::new("app.commandPalette", "Mod+Shift+P"),
         Keybinding::new("app.shortcutEditor", "Mod+K Mod+S"),
         // Workspaces
@@ -477,6 +498,7 @@ fn premiere_preset() -> KeymapPreset {
         Keybinding::new("media.import", "Mod+I"),
         Keybinding::when("media.removeSelected", "Delete", "panel == 'media'"),
         Keybinding::when("media.removeSelected", "Backspace", "panel == 'media'"),
+        Keybinding::new("proxy.toggle", "Mod+Alt+P"),
         // Premiere: Medien exportieren = Ctrl/Cmd+M, Tastaturbefehle = Ctrl+Alt+K
         Keybinding::new("app.export", "Mod+M"),
         Keybinding::new("sequence.settings", "Mod+Alt+S"),
@@ -527,6 +549,7 @@ fn resolve_preset() -> KeymapPreset {
         Keybinding::new("media.import", "Mod+I"),
         Keybinding::when("media.removeSelected", "Delete", "panel == 'media'"),
         Keybinding::when("media.removeSelected", "Backspace", "panel == 'media'"),
+        Keybinding::new("proxy.toggle", "Mod+Alt+P"),
         Keybinding::new("app.shortcutEditor", "Mod+Alt+K"),
         Keybinding::new("app.export", "Shift+8"),
         Keybinding::new("app.export", "Mod+Shift+E"),

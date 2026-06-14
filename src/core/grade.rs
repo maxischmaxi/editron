@@ -501,11 +501,11 @@ fn luma(r: f32, g: f32, b: f32) -> f32 {
 /// Ein Pixel (Gamma-RGB 0…1) durch die Grading-Pipeline schicken.
 /// `u`, `v` = normierte Position im Clip-Frame (Vignette).
 /// MUSS formelgleich mit dem Fragment-Shader bleiben (`ui/grade_shader.rs`).
-/// Referenz-Implementierung der vollen Pipeline (Tests, künftige Aufrufer);
-/// der Puffer-Pfad nutzt die LUT-Variante `grade_pixel_post_wb`.
+/// EINZIGE Referenz-Implementierung der vollen Pipeline — der Puffer-Pfad
+/// [`grade_buffer`] ruft sie direkt pro Pixel (keine separate LUT-Variante
+/// mehr, damit CPU-Export und GPU-Vorschau garantiert identisch rechnen).
 #[inline]
 #[allow(clippy::needless_range_loop)] // Kanal-Indizes spiegeln den Shader
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn grade_pixel(p: &GradeParams, rgb: [f32; 3], u: f32, v: f32) -> [f32; 3] {
     let mut c = [0f32; 3];
     // 1) Weißabgleich + Belichtung in linearem Licht (γ 2,2).
@@ -563,14 +563,15 @@ pub fn grade_pixel(p: &GradeParams, rgb: [f32; 3], u: f32, v: f32) -> [f32; 3] {
     ]
 }
 
-/// RGBA-Puffer in place graden. `content` = (x, y, w, h) des sichtbaren
-/// Inhalts im Puffer (Vignetten-Bezugsrahmen — beim Export ist der Puffer
-/// das volle, transparent gepolsterte Frame, der Clip liegt contain-fit
-/// darin). Zeilenbänder laufen parallel auf `threads` Threads.
-/// Weißabgleich (Schritt 1) läuft über eine 256er-LUT je Kanal.
-#[allow(clippy::needless_range_loop)] // Kanal-Indizes spiegeln den Shader
+/// f32-RGBA-Puffer (0..1, display-referred) in place graden. `content` =
+/// (x, y, w, h) des sichtbaren Inhalts im Puffer (Vignetten-Bezugsrahmen —
+/// beim Export ist der Puffer das volle, transparent gepolsterte Frame, der
+/// Clip liegt contain-fit darin). Zeilenbänder laufen parallel auf `threads`
+/// Threads. Ruft pro Pixel direkt [`grade_pixel`] ⇒ formelgleich mit dem
+/// GPU-Shader, kein Banding (volle f32-Präzision bis zur finalen
+/// Quantisierung in der Encoder-Pipe).
 pub fn grade_buffer(
-    data: &mut [u8],
+    data: &mut [f32],
     w: usize,
     h: usize,
     content: (usize, usize, usize, usize),
@@ -581,14 +582,6 @@ pub fn grade_buffer(
     if p.is_identity() || w == 0 || h == 0 {
         return;
     }
-    // LUT für Schritt 1 (per Kanal): u8 → Gamma-Wert nach WB/Belichtung.
-    let mut wb_lut = [[0f32; 256]; 3];
-    for ch in 0..3 {
-        for (i, slot) in wb_lut[ch].iter_mut().enumerate() {
-            let lin = (i as f32 / 255.0).powf(2.2) * p.wb_gain[ch];
-            *slot = lin.max(0.0).powf(1.0 / 2.2);
-        }
-    }
     let (cx, cy, cw, ch_) = content;
     let inv_cw = 1.0 / cw.max(1) as f32;
     let inv_ch = 1.0 / ch_.max(1) as f32;
@@ -597,7 +590,6 @@ pub fn grade_buffer(
     let band_rows = h.div_ceil(threads).max(1);
     std::thread::scope(|scope| {
         for (band_idx, band) in data.chunks_mut(band_rows * w * 4).enumerate() {
-            let wb_lut = &wb_lut;
             scope.spawn(move || {
                 let y0 = band_idx * band_rows;
                 let rows = band.len() / (w * 4);
@@ -606,81 +598,19 @@ pub fn grade_buffer(
                     let v = (y as f32 - cy as f32 + 0.5) * inv_ch;
                     let line = &mut band[row * w * 4..(row + 1) * w * 4];
                     for (x, px) in line.chunks_exact_mut(4).enumerate() {
-                        if px[3] == 0 {
+                        if px[3] <= 0.0 {
                             continue; // transparentes Padding
                         }
                         let u = (x as f32 - cx as f32 + 0.5) * inv_cw;
-                        let rgb = [
-                            wb_lut[0][px[0] as usize],
-                            wb_lut[1][px[1] as usize],
-                            wb_lut[2][px[2] as usize],
-                        ];
-                        let out = grade_pixel_post_wb(p, rgb, u, v);
-                        px[0] = (out[0] * 255.0 + 0.5) as u8;
-                        px[1] = (out[1] * 255.0 + 0.5) as u8;
-                        px[2] = (out[2] * 255.0 + 0.5) as u8;
+                        let out = grade_pixel(p, [px[0], px[1], px[2]], u, v);
+                        px[0] = out[0];
+                        px[1] = out[1];
+                        px[2] = out[2];
                     }
                 }
             });
         }
     });
-}
-
-/// Pipeline ab Schritt 2 (Weißabgleich bereits angewendet — LUT-Pfad).
-#[inline]
-#[allow(clippy::needless_range_loop)] // Kanal-Indizes spiegeln den Shader
-fn grade_pixel_post_wb(p: &GradeParams, rgb: [f32; 3], u: f32, v: f32) -> [f32; 3] {
-    // Identisch zu `grade_pixel` ab den Tonwerten; eigene Funktion, damit
-    // der LUT-Pfad Schritt 1 überspringen kann.
-    let mut c = rgb;
-    let l = luma(c[0], c[1], c[2]);
-    let tonal = p.blacks * (1.0 - smoothstep(0.0, 0.25, l))
-        + p.shadows * (1.0 - smoothstep(0.0, 0.65, l))
-        + p.highlights * smoothstep(0.35, 1.0, l)
-        + p.whites * smoothstep(0.75, 1.0, l);
-    for ch in 0..3 {
-        let g = ((c[ch] + tonal - 0.5) * p.slope + 0.5).clamp(0.0, 1.0);
-        let g = (g * p.gain[ch] + p.lift[ch] * (1.0 - g)).clamp(0.0, 1.0);
-        c[ch] = if p.inv_gamma[ch] == 1.0 {
-            g
-        } else {
-            g.powf(p.inv_gamma[ch])
-        };
-    }
-    let l = luma(c[0], c[1], c[2]);
-    let max_c = c[0].max(c[1]).max(c[2]);
-    let min_c = c[0].min(c[1]).min(c[2]);
-    let sat_now = (max_c - min_c).clamp(0.0, 1.0);
-    let sat = (p.saturation * (1.0 + p.vibrance * (1.0 - smoothstep(0.0, 0.5, sat_now)))).max(0.0);
-    for ch in 0..3 {
-        c[ch] = l + (c[ch] - l) * sat;
-    }
-    let amount = p.vignette[0];
-    if amount != 0.0 {
-        let px = (u - 0.5) * 2.0;
-        let py = (v - 0.5) * 2.0;
-        let circ = (px * px + py * py).sqrt() * std::f32::consts::FRAC_1_SQRT_2;
-        let rect = px.abs().max(py.abs());
-        let shape = (p.vignette[3] + 1.0) * 0.5;
-        let d = rect + (circ - rect) * shape;
-        let mid = p.vignette[1];
-        let feather = p.vignette[2].max(0.01);
-        let f = smoothstep(mid, (mid + feather).min(1.5), d);
-        if amount > 0.0 {
-            for ch in 0..3 {
-                c[ch] *= 1.0 - amount * f;
-            }
-        } else {
-            for ch in 0..3 {
-                c[ch] += (1.0 - c[ch]) * (-amount) * f;
-            }
-        }
-    }
-    [
-        c[0].clamp(0.0, 1.0),
-        c[1].clamp(0.0, 1.0),
-        c[2].clamp(0.0, 1.0),
-    ]
 }
 
 #[cfg(test)]
@@ -815,26 +745,27 @@ mod tests {
         g.saturation = 150.0;
         let p = precompute(&g);
         let (w, h) = (4usize, 2usize);
-        let mut buf = vec![0u8; w * h * 4];
+        let (r, gg, b) = (100.0 / 255.0, 150.0 / 255.0, 200.0 / 255.0);
+        let mut buf = vec![0f32; w * h * 4];
         for (i, px) in buf.chunks_exact_mut(4).enumerate() {
-            px[0] = 100;
-            px[1] = 150;
-            px[2] = 200;
-            px[3] = if i == 0 { 0 } else { 255 };
+            px[0] = r;
+            px[1] = gg;
+            px[2] = b;
+            px[3] = if i == 0 { 0.0 } else { 1.0 };
         }
         grade_buffer(&mut buf, w, h, (0, 0, w, h), &p, 2);
         // Transparenter Pixel unangetastet.
-        assert_eq!(&buf[0..3], &[100, 150, 200]);
-        // Opaker Pixel = grade_pixel-Ergebnis (LUT-Pfad ≈ powf-Pfad).
+        assert_eq!(&buf[0..3], &[r, gg, b]);
+        // Opaker Pixel = grade_pixel-Ergebnis (jetzt exakt — gleicher Pfad).
         let expected = grade_pixel(
             &p,
-            [100.0 / 255.0, 150.0 / 255.0, 200.0 / 255.0],
+            [r, gg, b],
             (1.0 + 0.5) / w as f32,
             0.5 / h as f32,
         );
         for ch in 0..3 {
-            let got = buf[4 + ch] as f32 / 255.0;
-            assert!(close(got, expected[ch], 0.01), "ch{ch}: {got} vs {}", expected[ch]);
+            let got = buf[4 + ch];
+            assert!(close(got, expected[ch], 1e-6), "ch{ch}: {got} vs {}", expected[ch]);
         }
     }
 
@@ -851,6 +782,65 @@ mod tests {
         // Leeres Objekt ⇒ Default (ältere Projektdateien ohne Grade-Felder).
         let legacy: ColorGrade = serde_json::from_str("{}").unwrap();
         assert!(legacy.is_default());
+    }
+
+    #[test]
+    fn float_grade_with_dither_beats_8bit_banding() {
+        use crate::core::pixbuf;
+        // Sanfter vertikaler Verlauf 0,45 → 0,55 über 200 Zeilen — in 8 Bit nur
+        // ~26 Codes, also sichtbares Banding nach einem kräftigen Grade.
+        let (w, h) = (8usize, 200usize);
+        let ramp = |y: usize| 0.45 + (y as f32 / (h - 1) as f32) * 0.10;
+
+        // f32-Quelle.
+        let mut src = vec![0f32; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let v = ramp(y);
+                src[i] = v;
+                src[i + 1] = v;
+                src[i + 2] = v;
+                src[i + 3] = 1.0;
+            }
+        }
+
+        // Kräftiger Grade (Kontrast spreizt den schmalen Bereich auf).
+        let mut g = ColorGrade::default();
+        g.contrast = 80.0;
+        let p = precompute(&g);
+
+        // NEUER Pfad: f32-Grade → TPDF-Dither auf 8 Bit.
+        let mut hi = src.clone();
+        grade_buffer(&mut hi, w, h, (0, 0, w, h), &p, 2);
+        let new_u8 = pixbuf::f32_to_rgba8_dithered(&hi, w, h);
+
+        // ALTER Pfad simuliert: Quelle ZUERST auf 8 Bit quantisieren, dann
+        // graden (1 Eingangscode ⇒ 1 Ausgangscode = Treppenstufen), ohne Dither.
+        let src8 = pixbuf::f32_to_rgba8(&src);
+        let mut old = pixbuf::rgba8_to_f32(&src8);
+        grade_buffer(&mut old, w, h, (0, 0, w, h), &p, 2);
+        let old_u8 = pixbuf::f32_to_rgba8(&old);
+
+        let distinct = |buf: &[u8]| -> usize {
+            buf.iter().step_by(4).collect::<std::collections::HashSet<_>>().len()
+        };
+        let new_levels = distinct(&new_u8);
+        let old_levels = distinct(&old_u8);
+        // Der gespreizte schmale Verlauf belegt im Ziel eine Range von ~42
+        // Codes. Der 8-Bit-zuerst-Pfad quetscht nur die ~26 Quellcodes hinein
+        // (Lücken = Banding); Float+Dither füllt die Range lückenlos.
+        assert!(
+            (new_levels as f64) >= (old_levels as f64) * 1.5,
+            "Float+Dither bricht Banding: neu={new_levels} Stufen vs alt={old_levels}"
+        );
+        assert!(new_levels >= 40, "Verlauf füllt die Range lückenlos: {new_levels}");
+        // Und: die belegten Codes des Float-Pfads sind nahezu lückenlos
+        // (kein Sprung > 2 Codes zwischen benachbarten belegten Stufen).
+        let mut codes: Vec<u8> = new_u8.iter().step_by(4).copied().collect::<std::collections::HashSet<_>>().into_iter().collect();
+        codes.sort_unstable();
+        let max_gap = codes.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+        assert!(max_gap <= 2, "keine harten Banding-Sprünge: größte Lücke {max_gap}");
     }
 
     #[test]

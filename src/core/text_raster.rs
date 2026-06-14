@@ -919,9 +919,11 @@ mod visual_dump {
         let (w, h) = (160usize, 90usize);
         let r = render_title(&spec, w as u32, h as u32);
         assert_eq!(r.extend_k, 1);
-        let mut canvas = vec![0u8; w * h * 4];
+        // f32-Compositor: Raster (u8) → f32, Canvas opak schwarz (f32).
+        let data = crate::core::pixbuf::rgba8_to_f32(&r.data);
+        let mut canvas = vec![0f32; w * h * 4];
         for px in canvas.chunks_exact_mut(4) {
-            px[3] = 255;
+            px[3] = 1.0;
         }
         let fx = compose::eval_fx(&ClipFx::default(), 0.0);
         let quad = compose::layer_quad(w as f64, h as f64, w as f64, h as f64, &fx);
@@ -930,7 +932,7 @@ mod visual_dump {
             w,
             h,
             &[compose::CpuLayerFrame {
-                data: &r.data,
+                data: &data,
                 w: r.w,
                 h: r.h,
                 quad,
@@ -939,12 +941,12 @@ mod visual_dump {
             }],
             2,
         );
+        // f32-Luma (0..1 je Kanal) — weiße Titelpixel ≈ 3,0 Summe.
         let max_lum = canvas
             .chunks_exact(4)
-            .map(|p| p[0] as u16 + p[1] as u16 + p[2] as u16)
-            .max()
-            .unwrap_or(0);
-        assert!(max_lum > 700, "weiße Titelpixel fehlen: max = {max_lum}");
+            .map(|p| p[0] + p[1] + p[2])
+            .fold(0.0f32, f32::max);
+        assert!(max_lum > 700.0 / 255.0, "weiße Titelpixel fehlen: max = {max_lum}");
     }
 
     /// Abspann-Rolle: Blöcke höher als das Frame erweitern den Raster

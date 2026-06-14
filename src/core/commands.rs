@@ -3,7 +3,8 @@
 
 use crate::core::marker::MarkerScope;
 use crate::core::playback::{self, PlaybackCmd};
-use crate::core::timeline::{TrackKind, TrimEdge};
+use crate::core::render_cache::{render_cache_dir, RenderCacheStore, RenderProgress};
+use crate::core::timeline::{sequence_end, TrackKind, TrimEdge};
 use crate::services::Services;
 use crate::state::{set_active_workspace, AppState};
 use crate::stores::{
@@ -94,12 +95,43 @@ pub fn context_value(state: &AppState, key: &str) -> Value {
         "timelineAttrClipboard" => state.timeline.has_attr_clipboard().into(),
         "timelineCanUndo" => state.timeline.can_undo().into(),
         "timelineCanRedo" => state.timeline.can_redo().into(),
+        "mediaCanUndo" => state.media.can_undo().into(),
+        "mediaCanRedo" => state.media.can_redo().into(),
+        "canUndo" => (state.timeline.can_undo() || state.media.can_undo()).into(),
+        "canRedo" => (state.timeline.can_redo() || state.media.can_redo()).into(),
         "timelineInOutSet" => {
             (state.timeline.in_point.is_some() || state.timeline.out_point.is_some()).into()
         }
+        "hasClips" => (!state.timeline.clips.is_empty()).into(),
         "projectDirty" => state.project.dirty.into(),
         "projectHasPath" => state.project.path.is_some().into(),
         "mediaOffline" => (state.media.offline_count() > 0).into(),
+        "proxyEnabled" => state.media.use_proxies.into(),
+        // Genau ein Clip ausgewählt, der eine verschachtelte Sequenz ist.
+        "nestClipSelected" => (state.timeline.selected_clip_ids.len() == 1
+            && state
+                .timeline
+                .selected_clip_ids
+                .first()
+                .and_then(|id| state.timeline.clip(id))
+                .is_some_and(|c| c.is_nest()))
+        .into(),
+        // Mehr als eine Sequenz vorhanden (löschbar).
+        "sequenceCanDelete" => (state.timeline.len() > 1).into(),
+        // Mehrfachauswahl im Browser (≥ 2 Assets) — Multicam-Quelle erstellbar.
+        "mediaMultiSelected" => (state.media.selected_asset_ids.len() >= 2).into(),
+        // Multicam-Monitor aktiv (Programmmonitor zeigt das Winkel-Raster):
+        // gating der Zifferntasten-Live-Schnitt-Bindings.
+        "multicamActive" => {
+            (state.monitor.view == crate::stores::MonitorView::Multicam).into()
+        }
+        // Mindestens ein ausgewählter Clip ist ein Multicam-Clip.
+        "multicamClipSelected" => state
+            .timeline
+            .selected_clip_ids
+            .iter()
+            .any(|id| state.timeline.clip(id).is_some_and(|c| c.is_multicam()))
+            .into(),
         _ => Value::Null,
     }
 }
@@ -174,6 +206,109 @@ fn arg_asset_id(ctx: &CommandCtx, args: Option<&Value>) -> Option<String> {
     ctx.state.media.selected_asset_ids.first().cloned()
 }
 
+/// String-Argument eines Commands lesen (z. B. `binId`, `label`).
+fn arg_str(args: Option<&Value>, key: &str) -> Option<String> {
+    args.and_then(|v| v.get(key))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Ziel-Assets einer Selektions-Aktion: explizites `assetId`-Argument, sonst
+/// die gesamte Medien-Auswahl.
+fn target_asset_ids(ctx: &CommandCtx, args: Option<&Value>) -> Vec<String> {
+    if let Some(id) = arg_str(args, "assetId") {
+        return vec![id];
+    }
+    ctx.state.media.selected_asset_ids.clone()
+}
+
+/// Ausgewählte Medien tatsächlich entfernen (samt verwendender Clips und
+/// Quellmonitor-Bezug). Gemeinsame Logik für direktes und bestätigtes Entfernen.
+fn remove_selected_media(ctx: &mut CommandCtx) {
+    let ids = ctx.state.media.selected_asset_ids.clone();
+    if ids.is_empty() {
+        return;
+    }
+    ctx.state.timeline.remove_clips_for_assets(&ids);
+    if let Some(src) = &ctx.state.playback.source_asset_id {
+        if ids.contains(src) {
+            ctx.state.playback.source_asset_id = None;
+            ctx.state.playback.source = Default::default();
+        }
+    }
+    ctx.state.media.remove_assets(&ids);
+}
+
+/// Proxy-Transcode-Aufträge für eine Asset-Auswahl bauen: nur Video-Assets mit
+/// vorhandenem Original, ohne bereits gültigen Proxy und ohne laufenden Job
+/// (so wirkt der Befehl zugleich als Retry für fehlgeschlagene). Pfade +
+/// Encode-Argumente kommen aus den Proxy-Einstellungen des Projekts.
+fn build_proxy_tasks(ctx: &CommandCtx, ids: &[String]) -> Vec<crate::services::ProxyTask> {
+    use crate::core::proxy;
+    use crate::core::types::MediaKind;
+    use crate::stores::ProxyJobStatus;
+
+    let project_path = ctx.state.project.path.clone();
+    let settings = ctx.state.media.proxy_settings.clone();
+    let mut tasks = Vec::new();
+    for id in ids {
+        let Some(asset) = ctx.state.media.asset(id) else { continue };
+        if asset.kind != MediaKind::Video || asset.offline {
+            continue; // nur Video; das Original muss vorhanden sein
+        }
+        if asset.has_valid_proxy() {
+            continue; // schon ein gültiger Proxy vorhanden
+        }
+        if matches!(ctx.state.media.proxy_status(id), Some(ProxyJobStatus::Building(_))) {
+            continue; // läuft bereits
+        }
+        let Some(v) = asset.info.video.first() else { continue };
+        let (w, h) = proxy::proxy_dims(v.width, v.height, settings.scale);
+        let out = proxy::proxy_output_path(&settings, project_path.as_deref(), &asset.path, &asset.id);
+        tasks.push(crate::services::ProxyTask {
+            asset_id: id.clone(),
+            src: asset.path.clone(),
+            out,
+            encode_args: proxy::encode_args(settings.codec, w, h, v.fps),
+            duration: asset.info.duration_sec,
+        });
+    }
+    tasks
+}
+
+/// Proxy-Aufträge starten + Statusmeldung (gemeinsam für „Auswahl“/„alle“).
+fn dispatch_proxy_tasks(ctx: &mut CommandCtx, ids: &[String]) {
+    // Preflight: fehlt der gewählte Proxy-Encoder in dieser ffmpeg-Installation,
+    // würde jeder Transcode mit kryptischem Fehler scheitern — klar abfangen.
+    let encoder = ctx.state.media.proxy_settings.codec.encoder();
+    if let Some(set) = &ctx.state.app.encoders {
+        if !set.contains(encoder) {
+            let label = ctx.state.media.proxy_settings.codec.label();
+            status(
+                ctx,
+                &format!("Proxy-Encoder „{encoder}“ ({label}) fehlt in dieser FFmpeg-Installation"),
+            );
+            return;
+        }
+    }
+    let tasks = build_proxy_tasks(ctx, ids);
+    if tasks.is_empty() {
+        status(
+            ctx,
+            "Keine Proxys zu erstellen (kein Video, bereits vorhanden oder Original offline)",
+        );
+        return;
+    }
+    let n = tasks.len();
+    ctx.services.start_proxy_jobs(tasks);
+    let msg = if n == 1 {
+        "Erstelle 1 Proxy …".to_string()
+    } else {
+        format!("Erstelle {n} Proxys …")
+    };
+    status(ctx, &msg);
+}
+
 fn cycle_workspace(ctx: &mut CommandCtx, offset: i32) {
     let current = ctx.state.app.active_workspace.clone();
     let index = WORKSPACE_IDS
@@ -188,6 +323,118 @@ fn cycle_workspace(ctx: &mut CommandCtx, offset: i32) {
 fn status(ctx: &mut CommandCtx, msg: &str) {
     let now = ctx.now;
     ctx.state.app.set_status_message(Some(msg.to_string()), now);
+}
+
+// -------------------------------------------------------------- Multicam
+
+/// Eine Multicam-Quelle aus den aktuell ausgewählten Video-Assets erzeugen
+/// (synchron — bewusste Nutzeraktion). Synchronisiert je nach Verfahren über
+/// gemeinsamen Start, Medien-Timecode oder Audio-Kreuzkorrelation und legt die
+/// Quelle als Hintergrund-Sequenz an (erscheint im Browser). Liefert die ID.
+fn create_multicam_source(
+    ctx: &mut CommandCtx,
+    sync: crate::core::multicam::MulticamSync,
+) -> Result<String, String> {
+    use crate::core::multicam as mc;
+    use crate::core::types::MediaKind;
+    let ids = ctx.state.media.selected_asset_ids.clone();
+    let assets: Vec<crate::core::types::MediaAsset> = ids
+        .iter()
+        .filter_map(|id| ctx.state.media.asset(id).cloned())
+        .filter(|a| a.kind == MediaKind::Video && !a.info.video.is_empty() && !a.offline)
+        .collect();
+    if assets.len() < 2 {
+        return Err("Mindestens zwei Video-Clips auswählen".into());
+    }
+    let n = assets.len();
+    let positions: Vec<f64> = match sync {
+        mc::MulticamSync::Start => mc::positions_from_start(n),
+        mc::MulticamSync::Timecode => {
+            let tcs: Vec<Option<f64>> = assets
+                .iter()
+                .map(|a| {
+                    let fps = a.info.video.first().map(|v| v.fps).unwrap_or(25.0);
+                    crate::services::probe_start_timecode(&a.path)
+                        .and_then(|tc| mc::timecode_to_seconds(&tc, fps))
+                })
+                .collect();
+            if tcs.iter().all(|t| t.is_none()) {
+                return Err("Kein Medien-Timecode vorhanden — anderes Verfahren wählen".into());
+            }
+            mc::positions_from_timecodes(&tcs)
+        }
+        mc::MulticamSync::Audio => {
+            let envs: Vec<Option<Vec<f32>>> = assets
+                .iter()
+                .map(|a| mc::extract_sync_envelope(&a.path))
+                .collect();
+            if envs.iter().filter(|e| e.is_some()).count() < 2 {
+                return Err("Zu wenig Audio für die Analyse — anderes Verfahren wählen".into());
+            }
+            mc::positions_from_audio(&envs, mc::SYNC_RATE)
+        }
+    };
+    let refs: Vec<&crate::core::types::MediaAsset> = assets.iter().collect();
+    let source = mc::build_source(&refs, &positions, None, sync);
+    let inner = mc::build_inner_timeline(&source);
+    let bin_id = assets[0].bin_id.clone();
+    let name = format!("Multicam – {}", assets[0].name);
+    let mut seq = crate::core::sequences::Sequence::new(name, bin_id, inner);
+    seq.timeline.multicam = Some(source);
+    Ok(ctx.state.timeline.add_background(seq))
+}
+
+/// Handler der Zifferntasten-Multicam-Befehle (`multicam.angle{N}`): bei
+/// Wiedergabe Live-Schnitt am Playhead + Winkelwechsel, sonst nur Winkelwechsel
+/// des ausgewählten/aktiven Multicam-Clips.
+fn multicam_angle(ctx: &mut CommandCtx, args: Option<&Value>) {
+    let Some(angle) = args
+        .and_then(|v| v.get("angle"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+    else {
+        return;
+    };
+    let playing = ctx.state.playback.program_playing;
+    let t = ctx.state.timeline.playhead_sec;
+    let clip_id: Option<String> = if playing {
+        ctx.state
+            .timeline
+            .topmost_multicam_video_at(t)
+            .map(|c| c.id.clone())
+    } else {
+        let sel = ctx.state.timeline.selected_clip_ids.clone();
+        sel.iter()
+            .find(|id| ctx.state.timeline.clip(id).is_some_and(|c| c.is_multicam()))
+            .cloned()
+            .or_else(|| {
+                ctx.state
+                    .timeline
+                    .topmost_multicam_video_at(t)
+                    .map(|c| c.id.clone())
+            })
+    };
+    let Some(clip_id) = clip_id else { return };
+    // Winkel muss in der Quelle existieren.
+    let source_id = ctx
+        .state
+        .timeline
+        .clip(&clip_id)
+        .and_then(|c| c.multicam.as_ref())
+        .map(|mc| mc.source.clone());
+    let n = source_id
+        .as_ref()
+        .and_then(|s| ctx.state.timeline.multicam_source(s))
+        .map(|s| s.angle_count())
+        .unwrap_or(0);
+    if angle as usize >= n {
+        return;
+    }
+    if playing {
+        ctx.state.timeline.multicam_live_cut(t, angle);
+    } else {
+        ctx.state.timeline.set_multicam_angle_undoable(&clip_id, angle);
+    }
 }
 
 // -------------------------------------------------------------- Marker
@@ -372,16 +619,185 @@ pub fn build_registry() -> CommandRegistry {
         ctx.state.app.open_dialog = Some(DialogId::Export)
     }));
     commands.push(cmd(
+        "queue.open",
+        "Render-Warteschlange…",
+        "Anwendung",
+        |ctx, _| {
+            ctx.state.app.open_dialog = Some(DialogId::Export);
+            ctx.state.app.export_open_queue = true;
+        },
+    ));
+    commands.push(cmd(
+        "export.frame",
+        "Frame exportieren…",
+        "Anwendung",
+        |ctx, _| {
+            // Pfad-Dialog; der eigentliche Render läuft nach Auswahl im
+            // Event-Handler (1-Frame-Plan am Playhead → Bilddatei).
+            let name = format!("{}_frame", ctx.state.project.display_name());
+            ctx.services.pick_frame_export_target(&name);
+        },
+    ));
+    commands.push(cmd(
         "sequence.settings",
         "Sequenzeinstellungen…",
         "Sequenz",
         |ctx, _| ctx.state.app.open_dialog = Some(DialogId::SequenceSettings),
     ));
     commands.push(cmd(
+        "sequence.new",
+        "Neue Sequenz",
+        "Sequenz",
+        |ctx, _| {
+            // Neue Sequenz erbt die Einstellungen der aktiven (Projektformat)
+            // und landet im aktuell geöffneten Medien-Bin.
+            let settings = ctx.state.timeline.settings;
+            let bin = ctx.state.media.current_bin().to_string();
+            let id = ctx.state.timeline.add(None, settings, &bin);
+            let name = ctx.state.timeline.name_of(&id).unwrap_or("Sequenz").to_string();
+            ctx.state.dock.open_panel("timeline");
+            status(ctx, &format!("Neue Sequenz „{name}“"));
+        },
+    ));
+    commands.push(cmd(
+        "sequence.duplicate",
+        "Sequenz duplizieren",
+        "Sequenz",
+        |ctx, args| {
+            let target = arg_str(args, "sequenceId")
+                .unwrap_or_else(|| ctx.state.timeline.active_id().to_string());
+            if let Some(id) = ctx.state.timeline.duplicate(&target) {
+                let name = ctx.state.timeline.name_of(&id).unwrap_or("Sequenz").to_string();
+                ctx.state.dock.open_panel("timeline");
+                status(ctx, &format!("Sequenz dupliziert: „{name}“"));
+            }
+        },
+    ));
+    commands.push(cmd(
+        "sequence.rename",
+        "Sequenz umbenennen",
+        "Sequenz",
+        |ctx, args| {
+            let target = arg_str(args, "sequenceId")
+                .unwrap_or_else(|| ctx.state.timeline.active_id().to_string());
+            // Tab/Browser-Eintrag in den Inline-Umbenennen-Modus versetzen.
+            ctx.state.timeline.set_active(&target);
+            ctx.state.app.rename_sequence = Some(target);
+            ctx.state.dock.open_panel("timeline");
+        },
+    ));
+    commands.push(cmd(
+        "sequence.delete",
+        "Sequenz löschen",
+        "Sequenz",
+        |ctx, args| {
+            let target = arg_str(args, "sequenceId")
+                .unwrap_or_else(|| ctx.state.timeline.active_id().to_string());
+            if ctx.state.timeline.len() <= 1 {
+                status(ctx, "Die letzte Sequenz kann nicht gelöscht werden");
+                return;
+            }
+            // Wird die Sequenz als Nest verwendet, erst bestätigen lassen.
+            if ctx.state.timeline.nest_usage_count(&target) > 0 {
+                ctx.state.app.sequence_delete_target = Some(target);
+                ctx.state.app.open_dialog = Some(DialogId::ConfirmDeleteSequence);
+                return;
+            }
+            let name = ctx.state.timeline.name_of(&target).unwrap_or("Sequenz").to_string();
+            if ctx.state.timeline.remove(&target) {
+                status(ctx, &format!("Sequenz gelöscht: „{name}“"));
+            }
+        },
+    ));
+    commands.push(cmd(
+        "sequence.open",
+        "Sequenz öffnen",
+        "Sequenz",
+        |ctx, args| {
+            let Some(id) = arg_str(args, "sequenceId") else { return };
+            if ctx.state.timeline.set_active(&id) || ctx.state.timeline.is_tab_open(&id) {
+                ctx.state.dock.open_panel("timeline");
+            }
+        },
+    ));
+    commands.push(with_when(
+        cmd(
+            "sequence.openNested",
+            "Verschachtelte Sequenz öffnen",
+            "Sequenz",
+            |ctx, _| {
+                // Innere Sequenz des (einzeln) ausgewählten Nest-Clips öffnen.
+                let nested = ctx
+                    .state
+                    .timeline
+                    .selected_clip_ids
+                    .first()
+                    .and_then(|id| ctx.state.timeline.clip(id))
+                    .and_then(|c| c.nest_seq.clone());
+                if let Some(id) = nested {
+                    ctx.state.timeline.set_active(&id);
+                    ctx.state.dock.open_panel("timeline");
+                } else {
+                    status(ctx, "Kein verschachtelter Clip ausgewählt");
+                }
+            },
+        ),
+        "nestClipSelected",
+    ));
+    // ------------------------------------------ Interop (Austauschformate)
+    // Schnitte mit DaVinci Resolve & Co. austauschen: Export der aktiven
+    // Sequenz, Import als neue Sequenz (FCPXML vorerst nur Export).
+    {
+        use crate::core::interop::InteropFormat;
+        for format in InteropFormat::ALL {
+            let key = format.key();
+            commands.push(with_when(
+                with_arg(
+                    cmd(
+                        &format!("sequence.export.{key}"),
+                        &format!("Exportieren: {}", format.label()),
+                        "Interop",
+                        |ctx, args| {
+                            let Some(format) = arg_str(args, "format")
+                                .and_then(|k| InteropFormat::from_key(&k))
+                            else {
+                                return;
+                            };
+                            let name = ctx.state.timeline.active_name();
+                            let default = format!("{name}.{}", format.extension());
+                            ctx.services.pick_interop_export_target(format, &default);
+                        },
+                    ),
+                    serde_json::json!({ "format": key }),
+                ),
+                "timelineHasClips",
+            ));
+            if format.can_import() {
+                commands.push(with_arg(
+                    cmd(
+                        &format!("sequence.import.{key}"),
+                        &format!("Importieren: {}", format.label()),
+                        "Interop",
+                        |ctx, args| {
+                            let Some(format) = arg_str(args, "format")
+                                .and_then(|k| InteropFormat::from_key(&k))
+                            else {
+                                return;
+                            };
+                            ctx.services.pick_interop_import(format);
+                        },
+                    ),
+                    serde_json::json!({ "format": key }),
+                ));
+            }
+        }
+    }
+
+    commands.push(cmd(
         "app.settings",
         "Einstellungen…",
         "Anwendung",
-        |ctx, _| status(ctx, "Einstellungen folgen"),
+        |ctx, _| ctx.state.app.open_dialog = Some(DialogId::Settings),
     ));
 
     // ------------------------------------------------------------- Projekt
@@ -477,6 +893,16 @@ pub fn build_registry() -> CommandRegistry {
         },
     ));
     commands.push(cmd(
+        "project.autosaveVersions",
+        "Autosave-Versionen…",
+        "Projekt",
+        |ctx, _| {
+            // Beim manuellen Öffnen keinen Absturz-Hinweis zeigen.
+            ctx.state.app.autosave_recover_hint = None;
+            ctx.state.app.open_dialog = Some(DialogId::AutosaveVersions);
+        },
+    ));
+    commands.push(cmd(
         "project.relink",
         "Fehlende Medien neu verknüpfen…",
         "Projekt",
@@ -484,17 +910,35 @@ pub fn build_registry() -> CommandRegistry {
     ));
 
     // ----------------------------------------------------------- Bearbeiten
+    // Rückgängig/Wiederholen koordinieren Timeline- und Medien-History: beide
+    // führen eine eigene Snapshot-Liste, jeder Snapshot trägt eine globale
+    // op-Sequenz. Undo macht die jüngste Operation (höchste Sequenz) rückgängig;
+    // Redo stellt die älteste vorgemerkte (kleinste Sequenz) wieder her.
     commands.push(with_repeat(with_when(
         cmd("edit.undo", "Rückgängig", "Bearbeiten", |ctx, _| {
-            ctx.state.timeline.undo()
+            let t = ctx.state.timeline.undo_seq();
+            let m = ctx.state.media.undo_seq();
+            match (t, m) {
+                (Some(ts), Some(ms)) if ms > ts => ctx.state.media.undo(),
+                (Some(_), _) => ctx.state.timeline.undo(),
+                (None, Some(_)) => ctx.state.media.undo(),
+                (None, None) => {}
+            }
         }),
-        "timelineCanUndo",
+        "canUndo",
     )));
     commands.push(with_repeat(with_when(
         cmd("edit.redo", "Wiederholen", "Bearbeiten", |ctx, _| {
-            ctx.state.timeline.redo()
+            let t = ctx.state.timeline.redo_seq();
+            let m = ctx.state.media.redo_seq();
+            match (t, m) {
+                (Some(ts), Some(ms)) if ms < ts => ctx.state.media.redo(),
+                (Some(_), _) => ctx.state.timeline.redo(),
+                (None, Some(_)) => ctx.state.media.redo(),
+                (None, None) => {}
+            }
         }),
-        "timelineCanRedo",
+        "canRedo",
     )));
 
     // -------------------------------------------------------------- Medien
@@ -517,15 +961,28 @@ pub fn build_registry() -> CommandRegistry {
                 if ids.is_empty() {
                     return;
                 }
-                // Clips in der Timeline, die auf die Assets zeigen, mit entfernen.
-                ctx.state.timeline.remove_clips_for_assets(&ids);
-                if let Some(src) = &ctx.state.playback.source_asset_id {
-                    if ids.contains(src) {
-                        ctx.state.playback.source_asset_id = None;
-                        ctx.state.playback.source = Default::default();
-                    }
+                // Wird ein ausgewähltes Asset in der Timeline verwendet, erst
+                // bestätigen lassen (Clips würden mit entfernt).
+                let used = ids
+                    .iter()
+                    .any(|id| ctx.state.timeline.asset_usage_count(id) > 0);
+                if used {
+                    ctx.state.app.open_dialog = Some(DialogId::ConfirmRemoveMedia);
+                    return;
                 }
-                ctx.state.media.remove_assets(&ids);
+                remove_selected_media(ctx);
+            },
+        ),
+        "mediaSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "media.removeSelectedConfirmed",
+            "Ausgewählte Medien entfernen (bestätigt)",
+            "Medien",
+            |ctx, _| {
+                ctx.state.app.open_dialog = None;
+                remove_selected_media(ctx);
             },
         ),
         "mediaSelected",
@@ -598,6 +1055,531 @@ pub fn build_registry() -> CommandRegistry {
             |ctx, args| {
                 let Some(asset_id) = arg_asset_id(ctx, args) else { return };
                 ctx.services.pick_relink_file(&asset_id);
+            },
+        ),
+        "mediaSelected",
+    ));
+
+    // ----------------------------------------------------------- Multicam
+    // Multicam-Quelle aus der Mehrfachauswahl erstellen (Verfahren via `method`-
+    // Argument; ohne Argument: Audio-Analyse — der Premiere-Killer-Workflow).
+    commands.push(with_when(
+        cmd(
+            "media.createMulticamSource",
+            "Multicam-Quelle erstellen…",
+            "Multicam",
+            |ctx, args| {
+                let sync = arg_str(args, "method")
+                    .and_then(|k| crate::core::multicam::MulticamSync::from_key(&k))
+                    .unwrap_or(crate::core::multicam::MulticamSync::Audio);
+                match create_multicam_source(ctx, sync) {
+                    Ok(_) => status(
+                        ctx,
+                        &format!("Multicam-Quelle erstellt (Sync: {})", sync.label()),
+                    ),
+                    Err(e) => status(ctx, &e),
+                }
+            },
+        ),
+        "mediaMultiSelected",
+    ));
+    // Multicam-Monitor (Programmmonitor-Raster) umschalten.
+    commands.push(cmd(
+        "multicam.toggleMonitor",
+        "Multicam-Monitor umschalten",
+        "Multicam",
+        |ctx, _| {
+            use crate::stores::MonitorView;
+            ctx.state.monitor.view = match ctx.state.monitor.view {
+                MonitorView::Program => MonitorView::Multicam,
+                MonitorView::Multicam => MonitorView::Program,
+            };
+            let on = ctx.state.monitor.view == MonitorView::Multicam;
+            status(
+                ctx,
+                if on {
+                    "Multicam-Monitor an"
+                } else {
+                    "Multicam-Monitor aus"
+                },
+            );
+        },
+    ));
+    // Zifferntasten 1–9: Live-Schnitt/Winkelwechsel (nur im Multicam-Monitor).
+    for n in 1..=9u32 {
+        commands.push(with_when(
+            with_repeat(with_arg(
+                cmd(
+                    &format!("multicam.angle{n}"),
+                    &format!("Multicam: Winkel {n}"),
+                    "Multicam",
+                    multicam_angle,
+                ),
+                serde_json::json!({ "angle": n - 1 }),
+            )),
+            "multicamActive",
+        ));
+    }
+    // Multicam-Clips „auf einzelne Clips reduzieren" (Flatten): ausgewählte,
+    // sonst alle der aktiven Sequenz.
+    commands.push(with_when(
+        cmd(
+            "multicam.flatten",
+            "Multicam auf einzelne Clips reduzieren",
+            "Multicam",
+            |ctx, _| {
+                let sel = ctx.state.timeline.selected_clip_ids.clone();
+                let use_sel = sel
+                    .iter()
+                    .any(|id| ctx.state.timeline.clip(id).is_some_and(|c| c.is_multicam()));
+                let count = if use_sel {
+                    ctx.state.timeline.flatten_multicam(Some(&sel))
+                } else {
+                    ctx.state.timeline.flatten_multicam(None)
+                };
+                if count > 0 {
+                    status(ctx, &format!("{count} Multicam-Clip(s) reduziert"));
+                } else {
+                    status(ctx, "Keine Multicam-Clips zum Reduzieren");
+                }
+            },
+        ),
+        "timelineHasClips",
+    ));
+
+    // ----------------------------------------------------------- Proxys
+    // Proxys sind leichtgewichtige Transcodes (ProRes Proxy / DNxHR LB) für
+    // flüssiges Schneiden von 4K/8K. Der EXPORT nutzt IMMER die Originale.
+    commands.push(with_when(
+        cmd(
+            "media.createProxies",
+            "Proxies erstellen",
+            "Medien",
+            |ctx, args| {
+                let ids = target_asset_ids(ctx, args);
+                dispatch_proxy_tasks(ctx, &ids);
+            },
+        ),
+        "mediaSelected",
+    ));
+    commands.push(cmd(
+        "media.createProxiesAll",
+        "Proxies für alle Medien erstellen",
+        "Medien",
+        |ctx, _| {
+            let ids: Vec<String> = ctx
+                .state
+                .media
+                .assets
+                .iter()
+                .filter(|a| a.kind == crate::core::types::MediaKind::Video)
+                .map(|a| a.id.clone())
+                .collect();
+            dispatch_proxy_tasks(ctx, &ids);
+        },
+    ));
+    commands.push(with_when(
+        cmd(
+            "media.cancelProxy",
+            "Proxy-Erstellung abbrechen",
+            "Medien",
+            |ctx, args| {
+                let ids = target_asset_ids(ctx, args);
+                for id in &ids {
+                    ctx.services.cancel_proxy(id);
+                    ctx.state.media.clear_proxy_job(id);
+                }
+            },
+        ),
+        "mediaSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "media.deleteProxies",
+            "Proxies entfernen",
+            "Medien",
+            |ctx, args| {
+                let ids = target_asset_ids(ctx, args);
+                let mut removed = 0usize;
+                for id in &ids {
+                    ctx.services.cancel_proxy(id);
+                    if let Some(path) = ctx.state.media.detach_proxy(id) {
+                        let _ = std::fs::remove_file(&path);
+                        removed += 1;
+                    }
+                }
+                if removed > 0 {
+                    status(ctx, &format!("{removed} Proxy/Proxys entfernt"));
+                }
+            },
+        ),
+        "mediaSelected",
+    ));
+    commands.push(cmd(
+        "proxy.toggle",
+        "Proxies verwenden umschalten",
+        "Medien",
+        |ctx, _| {
+            let on = !ctx.state.media.use_proxies;
+            ctx.state.media.set_use_proxies(on);
+            status(
+                ctx,
+                if on {
+                    "Proxies verwenden: an (Vorschau aus Proxy, Export bleibt Original)"
+                } else {
+                    "Proxies verwenden: aus"
+                },
+            );
+        },
+    ));
+    commands.push(cmd(
+        "proxy.settings",
+        "Proxy-Einstellungen…",
+        "Medien",
+        |ctx, _| ctx.state.app.open_dialog = Some(DialogId::ProxySettings),
+    ));
+
+    // ---- Wiedergabe-Performance: Render-Cache, Hardware-Decode, Overlay ----
+    commands.push(with_when(
+        cmd(
+            "render.inToOut",
+            "Render In to Out (Sequenz-Render-Cache)",
+            "Wiedergabe",
+            |ctx, _| {
+                let rate = ctx.state.timeline.settings.rate;
+                let end_sec = sequence_end(&ctx.state.timeline.clips);
+                let (a, b) = match (ctx.state.timeline.in_point, ctx.state.timeline.out_point) {
+                    (Some(i), Some(o)) if o - i > 1e-9 => (i.max(0.0), o.max(0.0)),
+                    _ => (0.0, end_sec),
+                };
+                let start_frame = rate.frame_round(a).max(0);
+                let end_frame = rate.frame_round(b);
+                if end_frame <= start_frame {
+                    status(ctx, "Render-Cache: leerer Bereich");
+                    return;
+                }
+                // Laufenden Render zuerst abbrechen (nur ein aktiver Job).
+                if let Some(r) = ctx.state.render_cache.rendering.take() {
+                    ctx.services.cancel_job(&format!("rendercache-{}", r.job_id));
+                }
+                let (w, h, fps) = (
+                    ctx.state.timeline.settings.width,
+                    ctx.state.timeline.settings.height,
+                    rate.fps(),
+                );
+                let plan = crate::core::export::build_cache_plan(
+                    &ctx.state.timeline,
+                    &ctx.state.media,
+                    w,
+                    h,
+                    fps,
+                    start_frame as u64,
+                    end_frame as u64,
+                );
+                if !plan.has_video_media() {
+                    status(ctx, "Render-Cache: kein Material im Bereich");
+                    return;
+                }
+                let hash = RenderCacheStore::range_signature(
+                    &ctx.state.timeline,
+                    &ctx.state.media,
+                    start_frame,
+                    end_frame,
+                );
+                let codec = ctx.state.settings.render_cache_codec;
+                let dir = render_cache_dir(&ctx.state.settings);
+                if std::fs::create_dir_all(&dir).is_err() {
+                    status(ctx, "Render-Cache: Ordner nicht beschreibbar");
+                    return;
+                }
+                let file = dir.join(format!("seq-{start_frame}-{end_frame}-{hash:016x}.{}", codec.ext()));
+                let encode_args: Vec<String> =
+                    codec.encode_args().iter().map(|s| s.to_string()).collect();
+                let job = ctx.services.start_render_cache(
+                    plan,
+                    encode_args,
+                    codec.ext(),
+                    file,
+                    start_frame,
+                    end_frame,
+                    hash,
+                );
+                ctx.state.render_cache.rendering = Some(RenderProgress {
+                    start_frame,
+                    end_frame,
+                    pct: 0.0,
+                    job_id: job.rsplit('-').next().and_then(|n| n.parse().ok()).unwrap_or(0),
+                });
+                status(ctx, "Render-Cache wird erstellt …");
+            },
+        ),
+        "hasClips",
+    ));
+    commands.push(cmd(
+        "render.clearCache",
+        "Render-Cache leeren",
+        "Wiedergabe",
+        |ctx, _| {
+            // Laufenden Render-Cache-Job abbrechen.
+            if let Some(r) = ctx.state.render_cache.rendering.take() {
+                ctx.services.cancel_job(&format!("rendercache-{}", r.job_id));
+            }
+            for f in ctx.state.render_cache.clear() {
+                let _ = std::fs::remove_file(f);
+            }
+            status(ctx, "Render-Cache geleert");
+        },
+    ));
+    commands.push(cmd(
+        "hwaccel.toggle",
+        "Hardware-Decode umschalten",
+        "Wiedergabe",
+        |ctx, _| {
+            let on = !ctx.state.settings.hwaccel;
+            ctx.state.settings.hwaccel = on;
+            ctx.state.settings.save();
+            status(
+                ctx,
+                if on {
+                    "Hardware-Decode: an (mit Software-Fallback)"
+                } else {
+                    "Hardware-Decode: aus (reiner Software-Decode)"
+                },
+            );
+        },
+    ));
+    commands.push(cmd(
+        "monitor.togglePerfOverlay",
+        "Performance-Overlay umschalten",
+        "Wiedergabe",
+        |ctx, _| {
+            let on = !ctx.state.monitor.show_perf_overlay;
+            ctx.state.monitor.show_perf_overlay = on;
+            status(
+                ctx,
+                if on {
+                    "Performance-Overlay: an"
+                } else {
+                    "Performance-Overlay: aus"
+                },
+            );
+        },
+    ));
+    commands.push(cmd(
+        "ui.scaleUp",
+        "UI vergrößern (HiDPI)",
+        "Ansicht",
+        |ctx, _| {
+            let next = (ctx.state.app.ui_scale + 0.25)
+                .clamp(crate::core::settings::UI_SCALE_MIN, crate::core::settings::UI_SCALE_MAX);
+            ctx.state.settings.ui_scale = Some(next);
+            ctx.state.settings.save();
+            status(ctx, &format!("UI-Skalierung: {:.0}%", next * 100.0));
+        },
+    ));
+    commands.push(cmd(
+        "ui.scaleDown",
+        "UI verkleinern (HiDPI)",
+        "Ansicht",
+        |ctx, _| {
+            let next = (ctx.state.app.ui_scale - 0.25)
+                .clamp(crate::core::settings::UI_SCALE_MIN, crate::core::settings::UI_SCALE_MAX);
+            ctx.state.settings.ui_scale = Some(next);
+            ctx.state.settings.save();
+            status(ctx, &format!("UI-Skalierung: {:.0}%", next * 100.0));
+        },
+    ));
+    commands.push(cmd(
+        "ui.scaleAuto",
+        "UI-Skalierung automatisch (Monitor-DPI)",
+        "Ansicht",
+        |ctx, _| {
+            ctx.state.settings.ui_scale = None;
+            ctx.state.settings.save();
+            status(ctx, "UI-Skalierung: automatisch (Monitor-DPI)");
+        },
+    ));
+    commands.push(cmd(
+        "proxy.pickFolder",
+        "Proxy-Ordner wählen…",
+        "Medien",
+        |ctx, _| ctx.services.pick_proxy_folder(),
+    ));
+    commands.push(cmd(
+        "proxy.resetFolder",
+        "Proxy-Ordner auf Standard zurücksetzen",
+        "Medien",
+        |ctx, _| {
+            if ctx.state.media.proxy_settings.folder.take().is_some() {
+                ctx.state.media.revision += 1;
+            }
+        },
+    ));
+
+    // ----------------------------------------------- Medien: Bins / Ordner
+    commands.push(cmd(
+        "media.createBin",
+        "Neuen Ordner anlegen",
+        "Medien",
+        |ctx, args| {
+            // Eltern-Bin: explizites Argument, sonst der geöffnete Bin.
+            let parent = arg_str(args, "binId")
+                .unwrap_or_else(|| ctx.state.media.current_bin().to_string());
+            let id = ctx.state.media.create_bin(&parent, "Neuer Ordner");
+            // Direkt zum Umbenennen freigeben (Premiere-Verhalten).
+            ctx.state.media.rename_request = Some(crate::stores::RenameTarget::Bin(id));
+            ctx.state.dock.open_panel("media");
+        },
+    ));
+    commands.push(cmd(
+        "media.renameBin",
+        "Ordner umbenennen",
+        "Medien",
+        |ctx, args| {
+            if let Some(id) = arg_str(args, "binId") {
+                if ctx.state.media.bin_exists(&id) {
+                    ctx.state.media.rename_request = Some(crate::stores::RenameTarget::Bin(id));
+                }
+            }
+        },
+    ));
+    commands.push(cmd(
+        "media.deleteBin",
+        "Ordner löschen",
+        "Medien",
+        |ctx, args| {
+            let Some(id) = arg_str(args, "binId") else { return };
+            if !ctx.state.media.bin_exists(&id) || id == crate::core::bin::ROOT_BIN_ID {
+                return;
+            }
+            // Leerer Ordner (keine Unter-Ordner, keine Assets): direkt löschen.
+            let empty = ctx.state.media.bin_subtree(&id).len() == 1
+                && ctx.state.media.count_assets_in_subtree(&id) == 0;
+            if empty {
+                ctx.state.media.delete_bin(&id, true);
+            } else {
+                ctx.state.app.bin_delete_target = Some(id);
+                ctx.state.app.open_dialog = Some(DialogId::DeleteBin);
+            }
+        },
+    ));
+    commands.push(cmd(
+        "media.openBin",
+        "Ordner öffnen",
+        "Medien",
+        |ctx, args| {
+            if let Some(id) = arg_str(args, "binId") {
+                ctx.state.media.set_current_bin(&id);
+                ctx.state.dock.open_panel("media");
+            }
+        },
+    ));
+    commands.push(cmd(
+        "media.goToParentBin",
+        "Eine Ebene nach oben",
+        "Medien",
+        |ctx, _| {
+            let cur = ctx.state.media.current_bin().to_string();
+            let parent = ctx
+                .state
+                .media
+                .bin(&cur)
+                .map(|b| b.parent.clone())
+                .unwrap_or_else(|| crate::core::bin::ROOT_BIN_ID.to_string());
+            ctx.state.media.set_current_bin(&parent);
+        },
+    ));
+    commands.push(cmd(
+        "media.moveToBin",
+        "In Ordner verschieben",
+        "Medien",
+        |ctx, args| {
+            let Some(bin_id) = arg_str(args, "binId") else { return };
+            let ids = target_asset_ids(ctx, args);
+            if !ids.is_empty() {
+                ctx.state.media.move_assets_to_bin(&ids, &bin_id);
+            }
+        },
+    ));
+
+    // ------------------------------------------- Medien: Metadaten / Etikett
+    commands.push(with_when(
+        cmd(
+            "media.renameAsset",
+            "Medium umbenennen",
+            "Medien",
+            |ctx, args| {
+                if let Some(id) = arg_asset_id(ctx, args) {
+                    if ctx.state.media.asset(&id).is_some() {
+                        ctx.state.media.rename_request =
+                            Some(crate::stores::RenameTarget::Asset(id));
+                    }
+                }
+            },
+        ),
+        "mediaSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "media.setLabel",
+            "Farbetikett setzen",
+            "Medien",
+            |ctx, args| {
+                let ids = target_asset_ids(ctx, args);
+                if ids.is_empty() {
+                    return;
+                }
+                let label = arg_str(args, "label")
+                    .as_deref()
+                    .and_then(crate::core::bin::MediaLabel::from_key);
+                ctx.state.media.set_label(&ids, label);
+            },
+        ),
+        "mediaSelected",
+    ));
+    // Je Etikettfarbe ein Eintrag (Palette + Kontextmenü-Argument).
+    for label in crate::core::bin::MediaLabel::ALL {
+        let id = format!("media.setLabel.{}", label.key());
+        let title = format!("Farbetikett: {}", label.label());
+        let mut c = cmd(&id, &title, "Medien", |ctx, args| {
+            let ids = target_asset_ids(ctx, args);
+            let label = arg_str(args, "label")
+                .as_deref()
+                .and_then(crate::core::bin::MediaLabel::from_key);
+            if !ids.is_empty() {
+                ctx.state.media.set_label(&ids, label);
+            }
+        });
+        c.when = Some("mediaSelected");
+        c.bound_arg = Some(serde_json::json!({ "label": label.key() }));
+        commands.push(c);
+    }
+    commands.push(with_when(
+        cmd(
+            "media.clearLabel",
+            "Farbetikett entfernen",
+            "Medien",
+            |ctx, args| {
+                let ids = target_asset_ids(ctx, args);
+                if !ids.is_empty() {
+                    ctx.state.media.set_label(&ids, None);
+                }
+            },
+        ),
+        "mediaSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "media.showInTimeline",
+            "In Timeline anzeigen",
+            "Medien",
+            |ctx, args| {
+                let Some(id) = arg_asset_id(ctx, args) else { return };
+                if ctx.state.timeline.reveal_asset_usage(&id) {
+                    ctx.state.dock.open_panel("timeline");
+                } else {
+                    status(ctx, "Dieses Medium wird in der Sequenz nicht verwendet");
+                }
             },
         ),
         "mediaSelected",
@@ -717,6 +1699,16 @@ pub fn build_registry() -> CommandRegistry {
         "In- und Out-Punkt löschen",
         "Wiedergabe",
         |ctx, _| playback::dispatch(ctx.state, PlaybackCmd::ClearMarks),
+    ));
+    commands.push(cmd(
+        "playback.toggleAudioScrub",
+        "Audio-Scrubbing umschalten",
+        "Wiedergabe",
+        |ctx, _| {
+            let on = !ctx.state.playback.audio_scrub_enabled;
+            ctx.state.playback.audio_scrub_enabled = on;
+            status(ctx, if on { "Audio-Scrubbing: an" } else { "Audio-Scrubbing: aus" });
+        },
     ));
 
     // ----------------------------------------------------------- Werkzeuge
@@ -1630,4 +2622,122 @@ pub fn build_registry() -> CommandRegistry {
         cat.then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
     CommandRegistry { commands }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::bin::ROOT_BIN_ID;
+    use crate::services::Services;
+
+    fn run(reg: &CommandRegistry, state: &mut AppState, services: &Services, id: &str) {
+        let mut ctx = CommandCtx { state, services, now: 0.0 };
+        reg.execute(id, None, &mut ctx);
+    }
+
+    /// edit.undo/redo machen Timeline- und Medien-Operationen in globaler
+    /// zeitlicher Reihenfolge rückgängig (jüngste zuerst) bzw. wieder her.
+    #[test]
+    fn undo_redo_coordinates_timeline_and_media() {
+        let reg = build_registry();
+        let services = Services::new();
+        let mut state = AppState::default();
+
+        // op1 (älter): Timeline-Marker. op2 (jünger): Bin anlegen.
+        state.timeline.add_marker_at(1.0);
+        let bin = state.media.create_bin(ROOT_BIN_ID, "Footage");
+        assert!(reg.is_enabled("edit.undo", &state));
+
+        // Undo #1: jüngste Operation = Bin-Anlage.
+        run(&reg, &mut state, &services, "edit.undo");
+        assert!(state.media.bin(&bin).is_none(), "Bin rückgängig");
+        assert_eq!(state.timeline.markers.len(), 1, "Marker bleibt");
+
+        // Undo #2: nun der Timeline-Marker.
+        run(&reg, &mut state, &services, "edit.undo");
+        assert!(state.timeline.markers.is_empty(), "Marker rückgängig");
+        assert!(!reg.is_enabled("edit.undo", &state), "nichts mehr rückgängig");
+
+        // Redo #1: älteste vorgemerkte Operation = Marker.
+        run(&reg, &mut state, &services, "edit.redo");
+        assert_eq!(state.timeline.markers.len(), 1, "Marker wieder da");
+        assert!(state.media.bin(&bin).is_none(), "Bin noch nicht zurück");
+
+        // Redo #2: Bin-Anlage.
+        run(&reg, &mut state, &services, "edit.redo");
+        assert!(state.media.bin(&bin).is_some(), "Bin wiederhergestellt");
+    }
+
+    #[test]
+    fn remove_used_media_opens_confirmation() {
+        let reg = build_registry();
+        let services = Services::new();
+        let mut state = AppState::default();
+        // Asset + verwendender Clip.
+        let mut a = crate::core::types::MediaAsset {
+            id: "a1".into(),
+            path: "/tmp/a1.mp4".into(),
+            name: "a1".into(),
+            kind: crate::core::types::MediaKind::Video,
+            info: crate::core::types::MediaInfo {
+                path: "/tmp/a1.mp4".into(),
+                file_name: "a1.mp4".into(),
+                container: "mp4".into(),
+                duration_sec: 5.0,
+                size_bytes: 1,
+                video: Vec::new(),
+                audio: Vec::new(),
+                recorded_at: None,
+            },
+            thumbnail_path: None,
+            imported_at: 0.0,
+            bin_id: ROOT_BIN_ID.to_string(),
+            label: None,
+            offline: false,
+            markers: Vec::new(),
+            proxy_path: None,
+            proxy_src_mtime: None,
+            proxy_offline: false,
+        };
+        a.bin_id = ROOT_BIN_ID.to_string();
+        state.media.add_asset(a);
+        let v = state.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().id.clone();
+        state.timeline.clips.push(crate::core::timeline::TimelineClip {
+            id: "c1".into(),
+            track_id: v,
+            asset_id: "a1".into(),
+            name: "a1".into(),
+            kind: TrackKind::Video,
+            start: 0.0,
+            duration: 2.0,
+            src_in: 0.0,
+            src_duration: 5.0,
+            link_id: None,
+            enabled: true,
+            gain_db: 0.0,
+            fx: Default::default(),
+            grade: Default::default(),
+            effects: Vec::new(),
+            title: None,
+            subtitle: None,
+            speed: 1.0,
+            reverse: false,
+            freeze: false,
+            markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
+        });
+        state.media.select(vec!["a1".into()]);
+
+        // Verwendetes Medium → Bestätigungsdialog statt sofortigem Entfernen.
+        run(&reg, &mut state, &services, "media.removeSelected");
+        assert_eq!(state.app.open_dialog, Some(DialogId::ConfirmRemoveMedia));
+        assert!(state.media.asset("a1").is_some(), "noch nicht entfernt");
+
+        // Bestätigen entfernt Asset + Clip und schließt den Dialog.
+        run(&reg, &mut state, &services, "media.removeSelectedConfirmed");
+        assert!(state.media.asset("a1").is_none());
+        assert!(state.timeline.clips.is_empty());
+        assert_eq!(state.app.open_dialog, None);
+    }
 }

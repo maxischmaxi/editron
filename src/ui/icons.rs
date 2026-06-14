@@ -52,7 +52,11 @@ impl IconSet {
         icon
     }
 
-    /// Zeichnet das Icon zentriert in `rect` mit Kantenlänge `size`.
+    /// Zeichnet das Icon zentriert in `rect` (logische Koordinaten) mit
+    /// Kantenlänge `size`. `ui_scale` bildet Logik- auf Framebuffer-Pixel ab:
+    /// Punkte UND Strichstärke werden physikalisch berechnet, damit die Linien
+    /// auf HiDPI-Displays scharf bleiben (raylib + MSAA rastern dann in voller
+    /// Auflösung).
     pub fn draw(
         &self,
         d: &mut impl RaylibDraw,
@@ -60,16 +64,22 @@ impl IconSet {
         rect: Rect,
         size: f32,
         color: Color,
+        ui_scale: f32,
     ) {
         let Some(icon) = self.get(name) else { return };
         let target = rect.center_box(size, size);
         let scale = size / 24.0;
-        let stroke = 2.0 * scale;
+        let stroke = 2.0 * scale * ui_scale;
         for path in &icon.paths {
             let pts: Vec<Vector2> = path
                 .points
                 .iter()
-                .map(|p| v2(target.x + p.x * scale, target.y + p.y * scale))
+                .map(|p| {
+                    v2(
+                        (target.x + p.x * scale) * ui_scale,
+                        (target.y + p.y * scale) * ui_scale,
+                    )
+                })
                 .collect();
             draw_stroke(d, &pts, path.closed, stroke, color);
         }

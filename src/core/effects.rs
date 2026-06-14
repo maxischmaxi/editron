@@ -622,10 +622,11 @@ fn luma(r: f32, g: f32, b: f32) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
-/// Alle Effekte nacheinander auf den Puffer anwenden (in place).
-/// `content` = (x, y, w, h) des sichtbaren Inhalts.
+/// Alle Effekte nacheinander auf den f32-RGBA-Puffer (0..1, display-referred)
+/// anwenden (in place). `content` = (x, y, w, h) des sichtbaren Inhalts.
+/// Volle f32-Präzision ⇒ kein Banding zwischen Effekt- und Grading-Pass.
 pub fn apply_effects_buffer(
-    data: &mut [u8],
+    data: &mut [f32],
     w: usize,
     h: usize,
     content: (usize, usize, usize, usize),
@@ -778,7 +779,7 @@ pub fn gaussian_kernel(sigma: f32) -> (usize, Vec<f32>) {
 /// Der Closure bekommt RGBA (0–1, NICHT premultiplied) und die normierten
 /// Inhalts-UVs; Alpha wird mitgeführt.
 fn per_pixel(
-    data: &mut [u8],
+    data: &mut [f32],
     w: usize,
     content: (usize, usize, usize, usize),
     threads: usize,
@@ -805,17 +806,12 @@ fn per_pixel(
                     for x in cx..(cx + cw).min(w) {
                         let px = &mut line[x * 4..x * 4 + 4];
                         let u = (x as f32 - cx as f32 + 0.5) * inv_cw;
-                        let mut c = [
-                            px[0] as f32 / 255.0,
-                            px[1] as f32 / 255.0,
-                            px[2] as f32 / 255.0,
-                            px[3] as f32 / 255.0,
-                        ];
+                        let mut c = [px[0], px[1], px[2], px[3]];
                         f(&mut c, u, v);
-                        px[0] = (c[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        px[1] = (c[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        px[2] = (c[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                        px[3] = (c[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        px[0] = c[0].clamp(0.0, 1.0);
+                        px[1] = c[1].clamp(0.0, 1.0);
+                        px[2] = c[2].clamp(0.0, 1.0);
+                        px[3] = c[3].clamp(0.0, 1.0);
                     }
                 }
             });
@@ -877,7 +873,7 @@ pub fn hue_matrix(hue_deg: f64) -> [f32; 9] {
 /// Separierbarer Gauß-Weichzeichner (premultipliziertes Alpha gegen dunkle
 /// Säume), geklemmt am Inhaltsrand. H- und V-Pass parallel über Bänder.
 fn gaussian_blur(
-    data: &mut [u8],
+    data: &mut [f32],
     w: usize,
     content: (usize, usize, usize, usize),
     sigma: f32,
@@ -895,10 +891,10 @@ fn gaussian_blur(
         for x in 0..cw {
             let s = ((cy + y) * w + cx + x) * 4;
             let d = (y * cw + x) * 4;
-            let a = data[s + 3] as f32 / 255.0;
-            src[d] = data[s] as f32 / 255.0 * a;
-            src[d + 1] = data[s + 1] as f32 / 255.0 * a;
-            src[d + 2] = data[s + 2] as f32 / 255.0 * a;
+            let a = data[s + 3];
+            src[d] = data[s] * a;
+            src[d + 1] = data[s + 1] * a;
+            src[d + 2] = data[s + 2] * a;
             src[d + 3] = a;
         }
     }
@@ -984,17 +980,17 @@ fn gaussian_blur(
             let d = ((cy + y) * w + cx + x) * 4;
             let a = src[s + 3];
             let inv = if a > 1e-5 { 1.0 / a } else { 0.0 };
-            data[d] = ((src[s] * inv).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            data[d + 1] = ((src[s + 1] * inv).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            data[d + 2] = ((src[s + 2] * inv).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            data[d + 3] = (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            data[d] = (src[s] * inv).clamp(0.0, 1.0);
+            data[d + 1] = (src[s + 1] * inv).clamp(0.0, 1.0);
+            data[d + 2] = (src[s + 2] * inv).clamp(0.0, 1.0);
+            data[d + 3] = a.clamp(0.0, 1.0);
         }
     }
 }
 
 /// Unscharf-Maskierung: out = src + (src − blur(src)) × amount.
 fn sharpen(
-    data: &mut [u8],
+    data: &mut [f32],
     w: usize,
     content: (usize, usize, usize, usize),
     amount: f64,
@@ -1018,7 +1014,7 @@ fn sharpen(
 
 /// Glühen: Screen-Mischung der weichgezeichneten Kopie.
 fn glow(
-    data: &mut [u8],
+    data: &mut [f32],
     w: usize,
     content: (usize, usize, usize, usize),
     intensity: f64,
@@ -1042,14 +1038,14 @@ fn glow(
     });
 }
 
-/// Inhalt als eigenständigen RGBA-Puffer kopieren.
+/// Inhalt als eigenständigen f32-RGBA-Puffer kopieren.
 fn extract_content(
-    data: &[u8],
+    data: &[f32],
     w: usize,
     content: (usize, usize, usize, usize),
-) -> Vec<u8> {
+) -> Vec<f32> {
     let (cx, cy, cw, ch) = content;
-    let mut out = vec![0u8; cw * ch * 4];
+    let mut out = vec![0f32; cw * ch * 4];
     for y in 0..ch {
         let s = ((cy + y) * w + cx) * 4;
         let d = y * cw * 4;
@@ -1058,12 +1054,12 @@ fn extract_content(
     out
 }
 
-/// Inhalt mit einer Hilfskopie verrechnen (per Pixel, 0–1).
+/// Inhalt mit einer Hilfskopie verrechnen (per Pixel, 0–1 f32).
 fn combine_content(
-    data: &mut [u8],
+    data: &mut [f32],
     w: usize,
     content: (usize, usize, usize, usize),
-    aux: &[u8],
+    aux: &[f32],
     f: impl Fn([f32; 4], [f32; 4]) -> [f32; 4],
 ) {
     let (cx, cy, cw, ch) = content;
@@ -1071,28 +1067,18 @@ fn combine_content(
         for x in 0..cw {
             let d = ((cy + y) * w + cx + x) * 4;
             let s = (y * cw + x) * 4;
-            let src = [
-                data[d] as f32 / 255.0,
-                data[d + 1] as f32 / 255.0,
-                data[d + 2] as f32 / 255.0,
-                data[d + 3] as f32 / 255.0,
-            ];
-            let b = [
-                aux[s] as f32 / 255.0,
-                aux[s + 1] as f32 / 255.0,
-                aux[s + 2] as f32 / 255.0,
-                aux[s + 3] as f32 / 255.0,
-            ];
+            let src = [data[d], data[d + 1], data[d + 2], data[d + 3]];
+            let b = [aux[s], aux[s + 1], aux[s + 2], aux[s + 3]];
             let out = f(src, b);
             for c in 0..4 {
-                data[d + c] = (out[c].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                data[d + c] = out[c].clamp(0.0, 1.0);
             }
         }
     }
 }
 
 /// Spiegeln innerhalb des Inhaltsrechtecks (in place).
-fn flip(data: &mut [u8], w: usize, content: (usize, usize, usize, usize), h_flip: bool, v_flip: bool) {
+fn flip(data: &mut [f32], w: usize, content: (usize, usize, usize, usize), h_flip: bool, v_flip: bool) {
     let (cx, cy, cw, ch) = content;
     if h_flip {
         for y in 0..ch {
@@ -1124,7 +1110,7 @@ pub fn pixelate_block(strength: f64, content_w: usize) -> usize {
 }
 
 /// Mosaik: jeder Block übernimmt den Pixel in seiner Mitte.
-fn pixelate(data: &mut [u8], w: usize, content: (usize, usize, usize, usize), strength: f64) {
+fn pixelate(data: &mut [f32], w: usize, content: (usize, usize, usize, usize), strength: f64) {
     let (cx, cy, cw, ch) = content;
     let block = pixelate_block(strength, cw);
     if block <= 1 {
@@ -1181,17 +1167,30 @@ pub fn parse_test_effects(spec: &str) -> Vec<EffectInstance> {
 mod tests {
     use super::*;
 
-    fn solid(w: usize, h: usize, rgba: [u8; 4]) -> Vec<u8> {
-        let mut buf = vec![0u8; w * h * 4];
+    /// u8-RGBA → f32 (0..1) — Tests bleiben in u8-Werten lesbar.
+    fn u8px(rgba: [u8; 4]) -> [f32; 4] {
+        [
+            rgba[0] as f32 / 255.0,
+            rgba[1] as f32 / 255.0,
+            rgba[2] as f32 / 255.0,
+            rgba[3] as f32 / 255.0,
+        ]
+    }
+
+    fn solid(w: usize, h: usize, rgba: [u8; 4]) -> Vec<f32> {
+        let f = u8px(rgba);
+        let mut buf = vec![0f32; w * h * 4];
         for px in buf.chunks_exact_mut(4) {
-            px.copy_from_slice(&rgba);
+            px.copy_from_slice(&f);
         }
         buf
     }
 
-    fn px(buf: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
+    /// f32-Pixel als gerundetes u8-RGBA auslesen (Assertions in u8).
+    fn px(buf: &[f32], w: usize, x: usize, y: usize) -> [u8; 4] {
         let i = (y * w + x) * 4;
-        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        [q(buf[i]), q(buf[i + 1]), q(buf[i + 2]), q(buf[i + 3])]
     }
 
     fn resolved(kind: EffectKind, values: &[f64]) -> ResolvedEffect {
@@ -1293,10 +1292,10 @@ mod tests {
     #[test]
     fn chroma_key_removes_green_keeps_red() {
         let (w, h) = (4usize, 1usize);
-        let mut buf = vec![0u8; w * h * 4];
+        let mut buf = vec![0f32; w * h * 4];
         // Pixel 0: Greenscreen-Grün, Pixel 1: Rot.
-        buf[0..4].copy_from_slice(&[0, 255, 0, 255]);
-        buf[4..8].copy_from_slice(&[220, 30, 30, 255]);
+        buf[0..4].copy_from_slice(&u8px([0, 255, 0, 255]));
+        buf[4..8].copy_from_slice(&u8px([220, 30, 30, 255]));
         apply_effects_buffer(
             &mut buf,
             w,
@@ -1315,9 +1314,9 @@ mod tests {
     #[test]
     fn luma_key_drops_dark_pixels() {
         let (w, h) = (2usize, 1usize);
-        let mut buf = vec![0u8; w * h * 4];
-        buf[0..4].copy_from_slice(&[10, 10, 10, 255]);
-        buf[4..8].copy_from_slice(&[240, 240, 240, 255]);
+        let mut buf = vec![0f32; w * h * 4];
+        buf[0..4].copy_from_slice(&u8px([10, 10, 10, 255]));
+        buf[4..8].copy_from_slice(&u8px([240, 240, 240, 255]));
         apply_effects_buffer(
             &mut buf,
             w,
@@ -1334,7 +1333,7 @@ mod tests {
     fn flip_mirrors_content() {
         let (w, h) = (4usize, 2usize);
         let mut buf = solid(w, h, [0, 0, 0, 255]);
-        buf[0..4].copy_from_slice(&[255, 0, 0, 255]); // oben links rot
+        buf[0..4].copy_from_slice(&u8px([255, 0, 0, 255])); // oben links rot
         apply_effects_buffer(
             &mut buf,
             w,
@@ -1357,7 +1356,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w / 2 {
                 let i = (y * w + x) * 4;
-                buf[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+                buf[i..i + 4].copy_from_slice(&u8px([255, 255, 255, 255]));
             }
         }
         apply_effects_buffer(
@@ -1378,13 +1377,13 @@ mod tests {
     #[test]
     fn pixelate_makes_uniform_blocks() {
         let (w, h) = (40usize, 40usize);
-        let mut buf = vec![0u8; w * h * 4];
+        let mut buf = vec![0f32; w * h * 4];
         // Vertikaler Verlauf.
         for y in 0..h {
             for x in 0..w {
                 let i = (y * w + x) * 4;
-                buf[i] = (y * 6) as u8;
-                buf[i + 3] = 255;
+                buf[i] = (y * 6) as f32 / 255.0;
+                buf[i + 3] = 1.0;
             }
         }
         apply_effects_buffer(

@@ -38,7 +38,27 @@ pub const PROJECT_FORMAT: &str = "editron-project";
 /// als Keyframe-Kurven in Sequenzzeit). Ältere App-Versionen ignorieren die
 /// neuen Felder; v7-und-älter-Dateien laden unverändert (Default: keine
 /// Spur-Effekte, keine Automation).
-pub const PROJECT_VERSION: u32 = 8;
+/// v9: Medien-Organisation — Bins (`mediaBins`), Asset-Zuordnung
+/// (`media[].binId`), Farbetiketten (`media[].label`), Aufnahmedatum
+/// (`media[].info.recordedAt`) und der Ansichts-Zustand des Browsers
+/// (`mediaView`). Ältere App-Versionen ignorieren die neuen Felder; v8-und-
+/// älter-Dateien laden unverändert — alle Assets landen in der Wurzel.
+/// v10: Proxy-Workflow — Proxy-Pfad/Quell-mtime je Asset
+/// (`media[].proxyPath`, `media[].proxySrcMtime`), globaler Schalter
+/// `useProxies` und Proxy-Einstellungen (`proxySettings`). Ältere App-
+/// Versionen ignorieren die neuen Felder; v9-und-älter-Dateien laden
+/// unverändert (kein Proxy, Schalter aus).
+/// v11: Mehrere Sequenzen pro Projekt (`sequences[]` mit je eigener Timeline,
+/// `activeSequenceId`) und verschachtelte Sequenzen (`clips[].nestSeq`). Das
+/// alte Einzel-`timeline`-Feld wird beim Speichern leer gelassen und nur noch
+/// zum Laden von v≤10-Dateien gelesen (= eine Sequenz). Ältere App-Versionen
+/// können das neue Format nicht öffnen (Versionssprung), daher der Bump.
+/// v12: Multicam-Schnitt — Multicam-Quellen (`sequences[].timeline.multicam`
+/// mit Winkeln + Sync-Offsets) und Multicam-Clips (`clips[].multicam` = Quelle
+/// + aktiver Winkel). Ältere App-Versionen können den Multicam-Clip nicht
+/// auflösen (er hätte kein `asset_id`), deshalb der Versionssprung; v11-und-
+/// älter-Dateien laden unverändert (kein Multicam).
+pub const PROJECT_VERSION: u32 = 12;
 const RECENT_LIMIT: usize = 10;
 
 // ------------------------------------------------------------------- Format
@@ -57,12 +77,53 @@ pub struct ProjectFile {
     pub active_workspace: String,
     #[serde(default)]
     pub media: Vec<MediaAsset>,
+    /// Bins (Ordner) der Medienverwaltung (ab Formatversion 9). `default`
+    /// hält ältere Dateien lesbar; ohne Bins liegen alle Assets in der Wurzel.
+    #[serde(default)]
+    pub media_bins: Vec<crate::core::bin::Bin>,
+    /// Ansichts-Zustand des Medien-Browsers (Modus, Sortierung, Spaltenbreiten,
+    /// geöffneter Bin). `default` → Standardansicht.
+    #[serde(default)]
+    pub media_view: crate::core::bin::MediaViewState,
+    /// Proxy-Workflow: globaler „Proxies verwenden“-Schalter (ab Formatversion
+    /// 10). `default` ⇒ aus.
+    #[serde(default)]
+    pub use_proxies: bool,
+    /// Proxy-Format/-Auflösung für neue Transcodes (ab Formatversion 10).
+    #[serde(default)]
+    pub proxy_settings: crate::core::proxy::ProxySettings,
     #[serde(default)]
     pub selected_asset_ids: Vec<String>,
-    #[serde(default)]
+    /// Einzel-Timeline (Formatversionen ≤ 10). Ab v11 leer; der Loader
+    /// bevorzugt `sequences`, wenn vorhanden, und liest dieses Feld nur als
+    /// Altprojekt-Fallback (= genau eine Sequenz).
+    #[serde(default, skip_serializing_if = "TimelineDoc::is_empty")]
     pub timeline: TimelineDoc,
+    /// Alle Sequenzen des Projekts (ab Formatversion 11). Leer ⇒ Altprojekt,
+    /// dann gilt `timeline` als einzige Sequenz.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequences: Vec<SequenceDoc>,
+    /// ID der aktiven Sequenz (ab v11). None ⇒ erste Sequenz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_sequence_id: Option<String>,
     #[serde(default)]
     pub source_monitor: SourceMonitorDoc,
+}
+
+/// Eine persistierte Sequenz: Identität + Bin-Zuordnung + Timeline-Dokument.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SequenceDoc {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_seq_bin")]
+    pub bin_id: String,
+    #[serde(default)]
+    pub timeline: TimelineDoc,
+}
+
+fn default_seq_bin() -> String {
+    crate::core::bin::ROOT_BIN_ID.to_string()
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -102,6 +163,10 @@ pub struct TimelineDoc {
     /// Aktive Untertitel-Spur (Ziel von „Untertitel hinzufügen“/SRT-Export).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_subtitle_track_id: Option<String>,
+    /// Multicam-Quelle (ab Formatversion 12): ist dies gesetzt, ist die Sequenz
+    /// eine Multicam-Quelle mit Winkeln + Sync-Offsets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multicam: Option<crate::core::multicam::MulticamSource>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -117,6 +182,19 @@ pub struct SourceMonitorDoc {
     pub out_mark: Option<f64>,
     #[serde(default)]
     pub looping: bool,
+}
+
+impl TimelineDoc {
+    /// Leeres Timeline-Dokument (keine Spuren/Clips/Übergänge/Marker/Settings)
+    /// — beim Speichern eines v11-Projekts wird das Alt-Feld `timeline` so
+    /// weggelassen, weil alle Daten in `sequences` stehen.
+    pub fn is_empty(&self) -> bool {
+        self.sequence.is_none()
+            && self.tracks.is_empty()
+            && self.clips.is_empty()
+            && self.transitions.is_empty()
+            && self.markers.is_empty()
+    }
 }
 
 fn default_zoom() -> f64 {
@@ -229,8 +307,38 @@ pub fn autosave_path() -> PathBuf {
 
 // -------------------------------------------------------------- Save / Load
 
+/// Eine Timeline in ihr Persistenz-Dokument übersetzen.
+fn timeline_doc(t: &crate::core::timeline::TimelineStore) -> TimelineDoc {
+    TimelineDoc {
+        sequence: Some(t.settings),
+        tracks: t.tracks.clone(),
+        clips: t.clips.clone(),
+        transitions: t.transitions.clone(),
+        markers: t.markers.clone(),
+        playhead_sec: t.playhead_sec,
+        in_point: t.in_point,
+        out_point: t.out_point,
+        zoom_px_per_sec: t.zoom_px_per_sec,
+        snapping: t.snapping,
+        selected_clip_ids: t.selected_clip_ids.clone(),
+        master_gain_db: t.master_gain_db,
+        active_subtitle_track_id: t.active_subtitle_track_id.clone(),
+        multicam: t.multicam.clone(),
+    }
+}
+
 /// Projektdaten aus dem App-Zustand einsammeln.
 pub fn collect(state: &AppState) -> ProjectFile {
+    let sequences: Vec<SequenceDoc> = state
+        .timeline
+        .iter()
+        .map(|seq| SequenceDoc {
+            id: seq.id.clone(),
+            name: seq.name.clone(),
+            bin_id: seq.bin_id.clone(),
+            timeline: timeline_doc(&seq.timeline),
+        })
+        .collect();
     ProjectFile {
         format: PROJECT_FORMAT.to_string(),
         version: PROJECT_VERSION,
@@ -241,22 +349,15 @@ pub fn collect(state: &AppState) -> ProjectFile {
             .unwrap_or(0.0),
         active_workspace: state.app.active_workspace.clone(),
         media: state.media.assets.clone(),
+        media_bins: state.media.bins.clone(),
+        media_view: state.media.view.clone(),
+        use_proxies: state.media.use_proxies,
+        proxy_settings: state.media.proxy_settings.clone(),
         selected_asset_ids: state.media.selected_asset_ids.clone(),
-        timeline: TimelineDoc {
-            sequence: Some(state.timeline.settings),
-            tracks: state.timeline.tracks.clone(),
-            clips: state.timeline.clips.clone(),
-            transitions: state.timeline.transitions.clone(),
-            markers: state.timeline.markers.clone(),
-            playhead_sec: state.timeline.playhead_sec,
-            in_point: state.timeline.in_point,
-            out_point: state.timeline.out_point,
-            zoom_px_per_sec: state.timeline.zoom_px_per_sec,
-            snapping: state.timeline.snapping,
-            selected_clip_ids: state.timeline.selected_clip_ids.clone(),
-            master_gain_db: state.timeline.master_gain_db,
-            active_subtitle_track_id: state.timeline.active_subtitle_track_id.clone(),
-        },
+        // Ab v11 leer (skip_serializing_if); alle Daten stehen in `sequences`.
+        timeline: TimelineDoc::default(),
+        sequences,
+        active_sequence_id: Some(state.timeline.active_id().to_string()),
         source_monitor: SourceMonitorDoc {
             asset_id: state.playback.source_asset_id.clone(),
             position: state.playback.source.position,
@@ -299,7 +400,7 @@ pub fn save_to(state: &mut AppState, path: &Path) -> Result<(), String> {
 
     state.project.path = Some(path.to_path_buf());
     state.project.push_recent(path);
-    let (t_rev, m_rev) = (state.timeline.revision, state.media.revision);
+    let (t_rev, m_rev) = (state.timeline.aggregate_revision(), state.media.revision);
     state.project.mark_clean(t_rev, m_rev);
     Ok(())
 }
@@ -320,6 +421,65 @@ pub fn load_from(path: &Path) -> Result<ProjectFile, String> {
         ));
     }
     Ok(file)
+}
+
+/// Ein Timeline-Dokument in eine fertige [`TimelineStore`] laden: Inhalt
+/// übernehmen, Altprojekt-Auflösung raten, Patch-/Target-Defaults setzen und
+/// verwaiste Medien-Clips entfernen (Generatoren UND Nests bleiben erhalten).
+fn load_timeline_doc(
+    doc: TimelineDoc,
+    version: u32,
+    asset_ids: &std::collections::HashSet<String>,
+    media: &crate::stores::MediaStore,
+) -> crate::core::timeline::TimelineStore {
+    let mut store = crate::core::timeline::TimelineStore::default();
+    let legacy_sequence = doc.sequence.is_none();
+    store.load_document(
+        doc.sequence,
+        doc.tracks,
+        doc.clips,
+        doc.transitions,
+        doc.markers,
+        doc.playhead_sec,
+        doc.in_point,
+        doc.out_point,
+        doc.zoom_px_per_sec,
+        doc.snapping,
+        doc.selected_clip_ids,
+        doc.master_gain_db,
+        doc.active_subtitle_track_id,
+    );
+    store.multicam = doc.multicam;
+    if legacy_sequence {
+        let (w, h) = crate::core::export::suggested_resolution(&store, media);
+        store.settings.width = w;
+        store.settings.height = h;
+    }
+    if version < 7 {
+        store.ensure_patch_target_defaults();
+    }
+    // Clips verwaister Assets entfernen (Asset aus der Datei gelöscht o. ä.).
+    // Titel-/Untertitel-Generatoren, Nest- und Multicam-Clips haben kein
+    // `asset_id` und bleiben erhalten.
+    let orphans: Vec<String> = store
+        .clips
+        .iter()
+        .filter(|c| {
+            !c.is_generator()
+                && !c.is_nest()
+                && !c.is_multicam()
+                && !asset_ids.contains(c.asset_id.as_str())
+        })
+        .map(|c| c.id.clone())
+        .collect();
+    if !orphans.is_empty() {
+        store.clips.retain(|c| !orphans.contains(&c.id));
+        store.transitions.retain(|t| {
+            let gone = |id: &Option<String>| id.as_ref().is_some_and(|id| orphans.contains(id));
+            !gone(&t.from_clip_id) && !gone(&t.to_clip_id)
+        });
+    }
+    store
 }
 
 /// Geladenes Projekt in den App-Zustand übernehmen. Liefert die Anzahl
@@ -346,6 +506,22 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
         media.iter().map(|a| a.id.clone()).collect();
 
     state.media.assets = media;
+    state.media.bins = file.media_bins;
+    state.media.view = file.media_view;
+    state.media.view.sanitize();
+    // Proxy-Workflow übernehmen + Proxys validieren (Existenz/Staleness →
+    // `proxy_offline`). Fehlende/veraltete Proxys fallen so automatisch aufs
+    // Original zurück.
+    state.media.use_proxies = file.use_proxies;
+    state.media.proxy_settings = file.proxy_settings;
+    state.media.proxy_jobs.clear();
+    state.media.revalidate_proxies();
+    // Bin-Eltern, Asset-Bins und Navigation auf existierende Ziele bringen
+    // (Zyklen → Wurzel); danach ist der Baum konsistent.
+    state.media.reconcile_bins();
+    state.media.clear_history();
+    state.media.rename_request = None;
+    state.media.scrub_thumbs.clear();
     state.media.selected_asset_ids = file
         .selected_asset_ids
         .into_iter()
@@ -355,53 +531,68 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
     state.media.importing = false;
     state.media.revision += 1;
 
-    let t = file.timeline;
-    let legacy_sequence = t.sequence.is_none();
-    state.timeline.load_document(
-        t.sequence,
-        t.tracks,
-        t.clips,
-        t.transitions,
-        t.markers,
-        t.playhead_sec,
-        t.in_point,
-        t.out_point,
-        t.zoom_px_per_sec,
-        t.snapping,
-        t.selected_clip_ids,
-        t.master_gain_db,
-        t.active_subtitle_track_id,
-    );
-    // Altprojekt (v1, ohne Sequenz-Einstellungen): 25 fps bleiben, die
-    // Auflösung wird wie früher aus dem Material geraten.
-    if legacy_sequence {
-        let (w, h) = crate::core::export::suggested_resolution(&state.timeline, &state.media);
-        state.timeline.settings.width = w;
-        state.timeline.settings.height = h;
+    // Sequenzen aufbauen: ab v11 aus `sequences`, sonst Altprojekt mit genau
+    // einer Sequenz aus dem alten `timeline`-Feld.
+    use crate::core::sequences::{Sequence, SequenceStore};
+    let mut sequences: Vec<Sequence> = Vec::new();
+    if !file.sequences.is_empty() {
+        for sd in file.sequences {
+            let store = load_timeline_doc(sd.timeline, file.version, &asset_ids, &state.media);
+            let bin_id = if state.media.bin_exists(&sd.bin_id) {
+                sd.bin_id
+            } else {
+                crate::core::bin::ROOT_BIN_ID.to_string()
+            };
+            let name = if sd.name.trim().is_empty() {
+                "Sequenz".to_string()
+            } else {
+                sd.name
+            };
+            let mut seq = Sequence::new(name, bin_id, store);
+            if !sd.id.trim().is_empty() {
+                seq.id = sd.id;
+            }
+            sequences.push(seq);
+        }
+    } else {
+        let store = load_timeline_doc(file.timeline, file.version, &asset_ids, &state.media);
+        sequences.push(Sequence::new(
+            "Sequenz 01",
+            crate::core::bin::ROOT_BIN_ID,
+            store,
+        ));
     }
-    // Vor Formatv7 gab es kein Patching/Targeting — je Art einen Standard
-    // (V1/A1) setzen, damit Three-Point-Edits sofort funktionieren. Ab v7
-    // werden die gespeicherten Flags unverändert übernommen.
-    if file.version < 7 {
-        state.timeline.ensure_patch_target_defaults();
+    // Verwaiste Nest-Verweise (auf nicht existierende Sequenzen) entfernen.
+    let seq_ids: std::collections::HashSet<String> =
+        sequences.iter().map(|s| s.id.clone()).collect();
+    for seq in sequences.iter_mut() {
+        let dangling: Vec<String> = seq
+            .timeline
+            .clips
+            .iter()
+            .filter_map(|c| c.nest_seq.clone())
+            .filter(|n| !seq_ids.contains(n))
+            .collect();
+        for d in dangling {
+            seq.timeline.remove_nest_clips_of(&d);
+        }
+        // Multicam-Clips verwaister Quellen (Quell-Sequenz fehlt) entfernen.
+        let gone: Vec<String> = seq
+            .timeline
+            .clips
+            .iter()
+            .filter(|c| {
+                c.multicam
+                    .as_ref()
+                    .is_some_and(|m| !seq_ids.contains(&m.source))
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        if !gone.is_empty() {
+            seq.timeline.clips.retain(|c| !gone.contains(&c.id));
+        }
     }
-    // Clips verwaister Assets entfernen (Asset aus der Datei gelöscht o. ä.).
-    // Titel-/Untertitel-Clips sind Generatoren ohne Asset und bleiben immer.
-    let orphans: Vec<String> = state
-        .timeline
-        .clips
-        .iter()
-        .filter(|c| !c.is_generator() && !asset_ids.contains(c.asset_id.as_str()))
-        .map(|c| c.id.clone())
-        .collect();
-    if !orphans.is_empty() {
-        state.timeline.clips.retain(|c| !orphans.contains(&c.id));
-        // Übergänge an entfernten Clips ebenfalls aufräumen.
-        state.timeline.transitions.retain(|t| {
-            let gone = |id: &Option<String>| id.as_ref().is_some_and(|id| orphans.contains(id));
-            !gone(&t.from_clip_id) && !gone(&t.to_clip_id)
-        });
-    }
+    state.timeline = SequenceStore::from_sequences(sequences, file.active_sequence_id.as_deref());
 
     let sm = file.source_monitor;
     state.playback = Default::default();
@@ -421,7 +612,7 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
     if let Some(p) = &path {
         state.project.push_recent(p);
     }
-    let (t_rev, m_rev) = (state.timeline.revision, state.media.revision);
+    let (t_rev, m_rev) = (state.timeline.aggregate_revision(), state.media.revision);
     state.project.mark_clean(t_rev, m_rev);
     offline
 }
@@ -445,7 +636,7 @@ pub fn reset_to_new(state: &mut AppState) {
     state.timeline.revision += 1;
     state.playback = Default::default();
     state.project.path = None;
-    let (t_rev, m_rev) = (state.timeline.revision, state.media.revision);
+    let (t_rev, m_rev) = (state.timeline.aggregate_revision(), state.media.revision);
     state.project.mark_clean(t_rev, m_rev);
 }
 
@@ -462,8 +653,10 @@ pub fn safeguard_unsaved(state: &mut AppState) -> Option<String> {
         }
         return None;
     }
-    // Nichts zu sichern, wenn das Projekt faktisch leer ist.
-    if state.media.assets.is_empty() && state.timeline.clips.is_empty() {
+    // Nichts zu sichern, wenn das Projekt faktisch leer ist (keine Medien und
+    // keine einzige Sequenz mit Clips).
+    let any_clips = state.timeline.iter().any(|s| !s.timeline.clips.is_empty());
+    if state.media.assets.is_empty() && !any_clips {
         return None;
     }
     let path = autosave_path();
@@ -510,11 +703,17 @@ mod tests {
                 size_bytes: 1234,
                 video: Vec::new(),
                 audio: Vec::new(),
+                recorded_at: None,
             },
             thumbnail_path: None,
             imported_at: 0.0,
+            bin_id: crate::core::bin::ROOT_BIN_ID.to_string(),
+            label: None,
             offline: false,
             markers: Vec::new(),
+            proxy_path: None,
+            proxy_src_mtime: None,
+            proxy_offline: false,
         };
         state.media.add_asset(asset);
         let track_id = state.timeline.tracks[0].id.clone();
@@ -566,6 +765,8 @@ mod tests {
             reverse: false,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         });
         // Standbild mit unendlicher Quelldauer (Infinity-Roundtrip).
         let track_id = state.timeline.tracks[1].id.clone();
@@ -591,6 +792,8 @@ mod tests {
             reverse: false,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         });
         // Rückwärts-Clip mit 37 % muss den Roundtrip exakt überleben.
         let track_id = state.timeline.tracks[0].id.clone();
@@ -616,6 +819,8 @@ mod tests {
             reverse: true,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         });
         // Übergang (Einblenden auf clip-1) muss den Roundtrip überleben.
         state.timeline.transitions.push({
@@ -680,58 +885,58 @@ mod tests {
         assert_eq!(file.format, PROJECT_FORMAT);
         assert_eq!(file.version, PROJECT_VERSION);
         assert_eq!(file.media.len(), 1);
-        assert_eq!(file.timeline.clips.len(), 3);
-        assert_eq!(file.timeline.playhead_sec, 3.25);
+        assert_eq!(file.sequences[0].timeline.clips.len(), 3);
+        assert_eq!(file.sequences[0].timeline.playhead_sec, 3.25);
         // Clip-Geschwindigkeit exakt erhalten (rückwärts, 37 %).
-        let speedy = file.timeline.clips.iter().find(|c| c.id == "clip-3").unwrap();
+        let speedy = file.sequences[0].timeline.clips.iter().find(|c| c.id == "clip-3").unwrap();
         assert_eq!(speedy.speed, 0.37);
         assert!(speedy.reverse);
         assert!(!speedy.freeze);
         // Normale Clips bleiben bei 100 % vorwärts.
-        assert_eq!(file.timeline.clips[0].speed, 1.0);
-        assert!(!file.timeline.clips[0].reverse);
-        assert_eq!(file.timeline.in_point, Some(1.0));
-        assert!(file.timeline.clips[1].src_duration.is_infinite());
-        assert!(!file.timeline.clips[1].enabled);
-        assert_eq!(file.timeline.master_gain_db, -4.5);
-        assert_eq!(file.timeline.clips[0].gain_db, -3.0);
-        let fx = &file.timeline.clips[0].fx;
+        assert_eq!(file.sequences[0].timeline.clips[0].speed, 1.0);
+        assert!(!file.sequences[0].timeline.clips[0].reverse);
+        assert_eq!(file.sequences[0].timeline.in_point, Some(1.0));
+        assert!(file.sequences[0].timeline.clips[1].src_duration.is_infinite());
+        assert!(!file.sequences[0].timeline.clips[1].enabled);
+        assert_eq!(file.sequences[0].timeline.master_gain_db, -4.5);
+        assert_eq!(file.sequences[0].timeline.clips[0].gain_db, -3.0);
+        let fx = &file.sequences[0].timeline.clips[0].fx;
         assert_eq!(fx.pos_x.keyframes.len(), 2);
         assert_eq!(fx.pos_x.keyframes[0].interp, crate::core::animation::Interp::EaseInOut);
         assert_eq!(fx.opacity.value, 80.0);
         assert!(fx.pos_x.is_animated());
-        let g = &file.timeline.clips[0].grade;
+        let g = &file.sequences[0].timeline.clips[0].grade;
         assert_eq!(g.temperature, 25.0);
         assert_eq!(g.look, crate::core::grade::GradeLook::TealOrange);
         assert_eq!(g.gain.x, 0.3);
         assert_eq!(g.vignette_amount, 30.0);
         // Unveränderte Clips speichern kein fx-/grade-Feld (schlanke Datei).
-        assert!(file.timeline.clips[1].fx.is_default());
-        assert!(file.timeline.clips[1].grade.is_default());
-        assert_eq!(file.timeline.tracks[2].gain_db, 2.0);
-        assert_eq!(file.timeline.tracks[2].pan, -0.5);
+        assert!(file.sequences[0].timeline.clips[1].fx.is_default());
+        assert!(file.sequences[0].timeline.clips[1].grade.is_default());
+        assert_eq!(file.sequences[0].timeline.tracks[2].gain_db, 2.0);
+        assert_eq!(file.sequences[0].timeline.tracks[2].pan, -0.5);
         // Übergang vollständig erhalten.
-        assert_eq!(file.timeline.transitions.len(), 1);
-        let tr = &file.timeline.transitions[0];
+        assert_eq!(file.sequences[0].timeline.transitions.len(), 1);
+        let tr = &file.sequences[0].timeline.transitions[0];
         assert_eq!(tr.kind, crate::core::transitions::TransitionKind::Wipe);
         assert_eq!(tr.direction, crate::core::transitions::TransitionDirection::Down);
         assert_eq!(tr.to_clip_id.as_deref(), Some("clip-1"));
         assert_eq!(tr.duration, 1.5);
 
         // Sequenz-Einstellungen exakt erhalten (NTSC-Bruch, kein Float).
-        let seq = file.timeline.sequence.expect("Sequenz-Einstellungen gespeichert");
+        let seq = file.sequences[0].timeline.sequence.expect("Sequenz-Einstellungen gespeichert");
         assert_eq!(seq.rate, FrameRate::new(30000, 1001));
         assert_eq!((seq.width, seq.height), (1280, 720));
         assert!(seq.drop_frame);
 
         // Marker (Sequenz/Clip/Asset) vollständig erhalten.
         use crate::core::marker::MarkerColor;
-        assert_eq!(file.timeline.markers.len(), 2);
-        let intro = file.timeline.markers.iter().find(|m| m.name == "Intro").unwrap();
+        assert_eq!(file.sequences[0].timeline.markers.len(), 2);
+        let intro = file.sequences[0].timeline.markers.iter().find(|m| m.name == "Intro").unwrap();
         assert_eq!(intro.color, MarkerColor::Red);
         assert_eq!(intro.note, "Schnittidee");
-        assert!(file.timeline.markers.iter().any(|m| (m.duration - 1.0).abs() < 1e-9));
-        let c1 = file.timeline.clips.iter().find(|c| c.id == "clip-1").unwrap();
+        assert!(file.sequences[0].timeline.markers.iter().any(|m| (m.duration - 1.0).abs() < 1e-9));
+        let c1 = file.sequences[0].timeline.clips.iter().find(|c| c.id == "clip-1").unwrap();
         assert_eq!(c1.markers.len(), 1);
         assert_eq!(c1.markers[0].name, "Beat");
         assert_eq!(file.media[0].markers.len(), 1);
@@ -834,6 +1039,8 @@ mod tests {
             reverse: false,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         };
         let mut orphan = good.clone();
         orphan.id = "orphan".into();
@@ -996,6 +1203,8 @@ mod tests {
             reverse: false,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         });
 
         let dir = std::env::temp_dir().join(format!("editron-proj-title-{}", std::process::id()));
@@ -1005,7 +1214,7 @@ mod tests {
 
         let file = load_from(&path).expect("load");
         assert_eq!(file.version, PROJECT_VERSION);
-        let saved = file
+        let saved = file.sequences[0]
             .timeline
             .clips
             .iter()
@@ -1064,7 +1273,7 @@ mod tests {
 
         let file = load_from(&path).expect("load");
         assert_eq!(file.version, PROJECT_VERSION);
-        assert_eq!(file.timeline.active_subtitle_track_id.as_deref(), Some(u2.as_str()));
+        assert_eq!(file.sequences[0].timeline.active_subtitle_track_id.as_deref(), Some(u2.as_str()));
 
         let mut target = AppState::default();
         apply(&mut target, file, Some(path));
@@ -1091,6 +1300,347 @@ mod tests {
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].text, "Zweite Sprache");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hilfskonstruktor für Medien-Assets in den Bin-Tests.
+    fn test_asset(id: &str, name: &str, recorded_at: Option<f64>) -> MediaAsset {
+        MediaAsset {
+            id: id.into(),
+            path: format!("/tmp/editron-test/{id}.mp4"),
+            name: name.into(),
+            kind: crate::core::types::MediaKind::Video,
+            info: crate::core::types::MediaInfo {
+                path: format!("/tmp/editron-test/{id}.mp4"),
+                file_name: format!("{id}.mp4"),
+                container: "mov,mp4".into(),
+                duration_sec: 5.0,
+                size_bytes: 4242,
+                video: Vec::new(),
+                audio: Vec::new(),
+                recorded_at,
+            },
+            thumbnail_path: None,
+            imported_at: 0.0,
+            bin_id: crate::core::bin::ROOT_BIN_ID.to_string(),
+            label: None,
+            offline: false,
+            markers: Vec::new(),
+            proxy_path: None,
+            proxy_src_mtime: None,
+            proxy_offline: false,
+        }
+    }
+
+    #[test]
+    fn media_organization_survives_roundtrip() {
+        use crate::core::bin::{MediaLabel, SortKey, ViewMode, ROOT_BIN_ID};
+        isolate_config();
+        let mut state = AppState::default();
+        state.media.add_asset(test_asset("a-root", "root.mp4", None));
+
+        // Verschachtelter Bin-Baum: Footage / B-Roll.
+        let footage = state.media.create_bin(ROOT_BIN_ID, "Footage");
+        let broll = state.media.create_bin(&footage, "B-Roll");
+        assert_eq!(state.media.bins.len(), 2);
+
+        // Zweites Asset nach B-Roll verschieben, umbenennen, etikettieren.
+        state.media.add_asset(test_asset("a-broll", "clip.mp4", Some(1_600_000_000.0)));
+        state.media.move_assets_to_bin(&["a-broll".into()], &broll);
+        state.media.rename_asset("a-broll", "Sonnenuntergang");
+        state.media.set_label(&["a-broll".into()], Some(MediaLabel::Orange));
+
+        // Ansichts-Zustand abweichend vom Standard.
+        state.media.view.mode = ViewMode::List;
+        state.media.view.sort = SortKey::Size;
+        state.media.view.sort_desc = true;
+        state.media.view.current_bin = footage.clone();
+        state.media.view.col_widths[0] = 123.0;
+
+        let dir = std::env::temp_dir().join(format!("editron-proj-bins-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bins.etron");
+        save_to(&mut state, &path).expect("save");
+
+        let file = load_from(&path).expect("load");
+        assert_eq!(file.version, PROJECT_VERSION);
+        assert_eq!(file.media_bins.len(), 2);
+        assert_eq!(file.media_view.mode, ViewMode::List);
+
+        let mut target = AppState::default();
+        apply(&mut target, file, Some(path.clone()));
+        // Bin-Baum erhalten.
+        assert_eq!(target.media.bins.len(), 2);
+        assert_eq!(target.media.bin_path_label(&broll), "Projekt / Footage / B-Roll");
+        // Asset-Zuordnung, Anzeigename, Etikett, Aufnahmedatum.
+        let a2 = target.media.asset("a-broll").unwrap();
+        assert_eq!(a2.bin_id, broll);
+        assert_eq!(a2.name, "Sonnenuntergang");
+        assert_eq!(a2.label, Some(MediaLabel::Orange));
+        assert_eq!(a2.info.recorded_at, Some(1_600_000_000.0));
+        // Wurzel-Asset bleibt in der Wurzel.
+        assert_eq!(target.media.asset("a-root").unwrap().bin_id, ROOT_BIN_ID);
+        assert_eq!(target.media.assets_in_bin(ROOT_BIN_ID).len(), 1);
+        assert_eq!(target.media.assets_in_bin(&broll).len(), 1);
+        // Ansichts-Zustand erhalten.
+        assert_eq!(target.media.view.sort, SortKey::Size);
+        assert!(target.media.view.sort_desc);
+        assert_eq!(target.media.view.current_bin, footage);
+        assert_eq!(target.media.view.col_widths[0], 123.0);
+        // Laden verwirft die Undo-History.
+        assert!(!target.media.can_undo());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_state_survives_roundtrip_and_validates() {
+        use crate::core::proxy::{ProxyCodec, ProxyScale};
+        isolate_config();
+        let dir = std::env::temp_dir().join(format!("editron-proj-proxy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Echte Proxy-Datei, damit die Validierung sie als vorhanden erkennt.
+        let proxy = dir.join("clip_proxy.mov");
+        std::fs::write(&proxy, b"proxy-bytes").unwrap();
+
+        let mut state = AppState::default();
+        state.media.add_asset(test_asset("a1", "clip.mp4", None));
+        if let Some(a) = state.media.assets.iter_mut().find(|a| a.id == "a1") {
+            a.proxy_path = Some(proxy.to_string_lossy().into_owned());
+            a.proxy_src_mtime = Some(42.0);
+        }
+        state.media.use_proxies = true;
+        state.media.proxy_settings.codec = ProxyCodec::DnxhrLb;
+        state.media.proxy_settings.scale = ProxyScale::Quarter;
+
+        let path = dir.join("proxy.etron");
+        save_to(&mut state, &path).expect("save");
+
+        let file = load_from(&path).expect("load");
+        assert_eq!(file.version, PROJECT_VERSION);
+        assert!(file.use_proxies);
+        assert_eq!(file.proxy_settings.codec, ProxyCodec::DnxhrLb);
+        assert_eq!(file.proxy_settings.scale, ProxyScale::Quarter);
+        assert_eq!(file.media[0].proxy_path.as_deref(), Some(proxy.to_string_lossy().as_ref()));
+        assert_eq!(file.media[0].proxy_src_mtime, Some(42.0));
+
+        let mut target = AppState::default();
+        apply(&mut target, file, Some(path));
+        let a = target.media.asset("a1").unwrap();
+        // Quelle offline (Pfad existiert nicht), aber Proxy-Datei vorhanden ⇒
+        // gültiger Proxy (Fallback-Vorschau).
+        assert!(a.offline);
+        assert!(!a.proxy_offline, "vorhandener Proxy bleibt gültig");
+        assert!(a.has_valid_proxy());
+        assert!(target.media.use_proxies);
+        assert_eq!(a.decode_path(true), proxy.to_string_lossy());
+        // Ohne Proxy-Modus: Decode-Pfad bleibt das Original.
+        assert_eq!(a.decode_path(false), a.path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_project_without_bins_lands_in_root() {
+        use crate::core::bin::ROOT_BIN_ID;
+        isolate_config();
+        // v8-artige Datei ohne mediaBins/binId.
+        let raw = format!(
+            r#"{{
+                "format": "{PROJECT_FORMAT}",
+                "version": 8,
+                "activeWorkspace": "edit",
+                "media": [{{
+                    "id": "a1", "path": "/tmp/missing.mp4", "name": "missing.mp4",
+                    "kind": "video",
+                    "info": {{
+                        "path": "/tmp/missing.mp4", "fileName": "missing.mp4",
+                        "container": "mov,mp4", "durationSec": 10.0, "sizeBytes": 1,
+                        "video": [], "audio": []
+                    }},
+                    "thumbnailPath": null, "importedAt": 0.0, "offline": false
+                }}]
+            }}"#
+        );
+        let dir = std::env::temp_dir().join(format!("editron-proj-legacybin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.etron");
+        std::fs::write(&path, raw).unwrap();
+        let file = load_from(&path).expect("legacy lädt");
+        let mut state = AppState::default();
+        apply(&mut state, file, Some(path));
+        assert!(state.media.bins.is_empty());
+        assert_eq!(state.media.asset("a1").unwrap().bin_id, ROOT_BIN_ID);
+        assert_eq!(state.media.assets_in_bin(ROOT_BIN_ID).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiple_sequences_and_nesting_survive_roundtrip() {
+        use crate::core::bin::ROOT_BIN_ID;
+        use crate::core::sequence::SequenceSettings;
+        isolate_config();
+        let mut state = AppState::default();
+        state.media.add_asset(test_asset("a1", "clip.mp4", None));
+
+        // Innere Sequenz (Default „Sequenz 01") mit einem Medien-Clip.
+        let inner_id = state.timeline.active_id().to_string();
+        let track = state.timeline.tracks[0].id.clone();
+        let mut media_clip = crate::core::timeline::test_clip(&track);
+        media_clip.asset_id = "a1".into();
+        media_clip.duration = 6.0;
+        state.timeline.clips.push(media_clip);
+
+        // Äußere Sequenz anlegen (wird aktiv) und die innere darin verschachteln.
+        let outer_id = state
+            .timeline
+            .add(Some("Schnitt".into()), SequenceSettings::default(), ROOT_BIN_ID);
+        assert_eq!(state.timeline.active_id(), outer_id);
+        assert!(!state.timeline.would_create_cycle(&outer_id, &inner_id));
+        let otrack = state.timeline.tracks[0].id.clone();
+        let mut nest = crate::core::timeline::test_clip(&otrack);
+        nest.asset_id = String::new();
+        nest.nest_seq = Some(inner_id.clone());
+        nest.name = "Sequenz 01".into();
+        nest.duration = 6.0;
+        nest.src_duration = 6.0;
+        state.timeline.clips.push(nest);
+
+        let dir = std::env::temp_dir().join(format!("editron-proj-nest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nest.etron");
+        save_to(&mut state, &path).expect("save");
+
+        let file = load_from(&path).expect("load");
+        assert_eq!(file.version, PROJECT_VERSION);
+        assert_eq!(file.sequences.len(), 2, "beide Sequenzen gespeichert");
+        assert_eq!(file.active_sequence_id.as_deref(), Some(outer_id.as_str()));
+        assert!(file.timeline.is_empty(), "Alt-Feld bleibt beim v11-Speichern leer");
+
+        let mut target = AppState::default();
+        apply(&mut target, file, Some(path.clone()));
+        assert_eq!(target.timeline.len(), 2);
+        assert_eq!(target.timeline.active_id(), outer_id);
+        // Nest-Clip erhalten und verweist weiterhin auf die innere Sequenz.
+        let outer_tl = target.timeline.timeline_of(&outer_id).unwrap();
+        assert!(outer_tl
+            .clips
+            .iter()
+            .any(|c| c.nest_seq.as_deref() == Some(inner_id.as_str())));
+        // Innere Sequenz behält ihren Medien-Clip.
+        let inner_tl = target.timeline.timeline_of(&inner_id).unwrap();
+        assert_eq!(inner_tl.clips.iter().filter(|c| c.asset_id == "a1").count(), 1);
+        // Rekursionsschutz nach dem Laden weiterhin wasserdicht.
+        assert!(target.timeline.would_create_cycle(&inner_id, &outer_id));
+        assert_eq!(target.timeline.nest_usage_count(&inner_id), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multicam_source_and_clip_survive_roundtrip() {
+        use crate::core::bin::ROOT_BIN_ID;
+        use crate::core::multicam::{MulticamAngle, MulticamClip, MulticamSource, MulticamSync};
+        isolate_config();
+        let mut state = AppState::default();
+        state.media.add_asset(test_asset("a1", "cam1.mp4", None));
+        state.media.add_asset(test_asset("a2", "cam2.mp4", None));
+        let active_id = state.timeline.active_id().to_string();
+
+        // Multicam-Quelle (Hintergrund-Sequenz) mit zwei Winkeln.
+        let source = MulticamSource {
+            angles: vec![
+                MulticamAngle {
+                    name: "Kamera 1".into(),
+                    asset_id: "a1".into(),
+                    pos: 0.0,
+                    duration: 8.0,
+                    width: 1920,
+                    height: 1080,
+                    fps: 25.0,
+                    has_audio: true,
+                },
+                MulticamAngle {
+                    name: "Kamera 2".into(),
+                    asset_id: "a2".into(),
+                    pos: 1.5,
+                    duration: 8.0,
+                    width: 1920,
+                    height: 1080,
+                    fps: 25.0,
+                    has_audio: true,
+                },
+            ],
+            audio_angle: Some(0),
+            sync: MulticamSync::Audio,
+            duration: 9.5,
+        };
+        let inner = crate::core::multicam::build_inner_timeline(&source);
+        let mut seq = crate::core::sequences::Sequence::new("Multicam – Cam", ROOT_BIN_ID, inner);
+        seq.timeline.multicam = Some(source);
+        let src_id = state.timeline.add_background(seq);
+
+        // Multicam-Clip in der aktiven Sequenz, aktiver Winkel 1.
+        let track = state.timeline.tracks[0].id.clone();
+        let mut clip = crate::core::timeline::test_clip(&track);
+        clip.asset_id = String::new();
+        clip.name = "Multicam".into();
+        clip.duration = 9.5;
+        clip.src_duration = 9.5;
+        clip.multicam = Some(MulticamClip {
+            source: src_id.clone(),
+            angle: 1,
+        });
+        state.timeline.clips.push(clip);
+
+        let dir = std::env::temp_dir().join(format!("editron-proj-mc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mc.etron");
+        save_to(&mut state, &path).expect("save");
+
+        let file = load_from(&path).expect("load");
+        assert_eq!(file.version, PROJECT_VERSION);
+        assert_eq!(file.version, 12);
+
+        let mut target = AppState::default();
+        apply(&mut target, file, Some(path.clone()));
+        // Quelle: Multicam-Metadaten erhalten.
+        let src_tl = target.timeline.timeline_of(&src_id).expect("Quell-Sequenz");
+        let mc = src_tl.multicam.as_ref().expect("Multicam-Quelle erhalten");
+        assert_eq!(mc.angles.len(), 2);
+        assert_eq!(mc.audio_angle, Some(0));
+        assert!((mc.angles[1].pos - 1.5).abs() < 1e-9);
+        assert_eq!(mc.angles[0].asset_id, "a1");
+        // Multicam-Clip: erhalten mit aktivem Winkel 1 und Quell-Verweis.
+        let active_tl = target.timeline.timeline_of(&active_id).expect("aktive Sequenz");
+        let clip = active_tl
+            .clips
+            .iter()
+            .find(|c| c.is_multicam())
+            .expect("Multicam-Clip erhalten");
+        let mc_ref = clip.multicam.as_ref().unwrap();
+        assert_eq!(mc_ref.source, src_id);
+        assert_eq!(mc_ref.angle, 1);
+        // Multicam-Clip wird NICHT als verwaist entfernt (kein asset_id).
+        assert!(clip.asset_id.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_nested_sequence_cleans_dangling_nest_clips() {
+        use crate::core::bin::ROOT_BIN_ID;
+        use crate::core::sequence::SequenceSettings;
+        let mut store = crate::core::sequences::SequenceStore::default();
+        let inner = store.active_id().to_string();
+        let outer = store.add(Some("Outer".into()), SequenceSettings::default(), ROOT_BIN_ID);
+        // Nest-Clip in der äußeren Sequenz, der die innere referenziert.
+        let track = store.tracks[0].id.clone();
+        let mut nest = crate::core::timeline::test_clip(&track);
+        nest.nest_seq = Some(inner.clone());
+        store.clips.push(nest);
+        assert_eq!(store.nest_usage_count(&inner), 1);
+        // Innere Sequenz löschen → Nest-Clip in der äußeren verschwindet.
+        assert!(store.remove(&inner));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.active_id(), outer);
+        assert_eq!(store.nest_usage_count(&inner), 0);
+        assert!(store.clips.iter().all(|c| c.nest_seq.is_none()));
     }
 }
 

@@ -151,6 +151,11 @@ impl TimelineTrack {
     }
 }
 
+/// Frische Spur einer Art mit Standardwerten (für Interop-Import u. Ä.).
+pub fn new_track(kind: TrackKind) -> TimelineTrack {
+    make_track(kind)
+}
+
 fn make_track(kind: TrackKind) -> TimelineTrack {
     TimelineTrack {
         id: new_id(),
@@ -231,6 +236,21 @@ pub struct TimelineClip {
     /// (Formatversion 6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<Marker>,
+    /// Verschachtelte Sequenz (Nesting): ist dies gesetzt, ist der Clip kein
+    /// Mediendatei-Clip, sondern bildet eine andere Sequenz ab (`asset_id`
+    /// leer). Die Quelle wird zur Wiedergabe/zum Export rekursiv aus der
+    /// referenzierten Sequenz gerendert. Medienzeit-Achse = Sequenzzeit der
+    /// inneren Sequenz; `src_in`/`src_duration` trimmen in sie hinein
+    /// (Formatversion 11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nest_seq: Option<String>,
+    /// Multicam-Clip: verweist auf eine Multicam-Quelle (Sequenz mit
+    /// `timeline.multicam`) und trägt den aktiven Winkel. `asset_id` leer;
+    /// `src_in`/`duration` rechnen in gemeinsamer Multicam-Zeit. Der aktive
+    /// Winkel wird zur Wiedergabe/zum Export zu einem normalen Medien-Blatt
+    /// aufgelöst (Formatversion 12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multicam: Option<crate::core::multicam::MulticamClip>,
 }
 
 fn default_enabled() -> bool {
@@ -397,6 +417,20 @@ impl TimelineClip {
         self.is_title() || self.is_subtitle()
     }
 
+    /// Nest-Clip: bildet eine andere Sequenz ab (ohne eigene Mediendatei).
+    /// Wird wie ein Medien-Clip dekodiert/komponiert (NICHT wie ein Generator),
+    /// ist aber von der Verwaisten-Bereinigung ausgenommen (kein `asset_id`).
+    pub fn is_nest(&self) -> bool {
+        self.nest_seq.is_some()
+    }
+
+    /// Multicam-Clip: bildet den aktiven Winkel einer Multicam-Quelle ab
+    /// (ohne eigenes `asset_id`). Wie ein Nest von der Verwaisten-Bereinigung
+    /// ausgenommen; der aktive Winkel wird an den Render-Pfaden aufgelöst.
+    pub fn is_multicam(&self) -> bool {
+        self.multicam.is_some()
+    }
+
     /// Liegt eine Medienzeit `m` im aktuell sichtbaren Quellausschnitt des
     /// Clips? (Clip-Marker außerhalb sind weggetrimmt und werden nicht
     /// gezeichnet, bleiben aber erhalten.)
@@ -417,6 +451,99 @@ impl TimelineClip {
 /// Ende des letzten Clips — die effektive Sequenzdauer.
 pub fn sequence_end(clips: &[TimelineClip]) -> f64 {
     clips.iter().map(|c| c.end()).fold(0.0, f64::max)
+}
+
+/// Einen einfachen Medien-Clip mit Standardwerten bauen (für die innere
+/// Timeline einer Multicam-Quelle, Interop o. Ä.).
+#[allow(clippy::too_many_arguments)]
+pub fn new_media_clip(
+    track_id: &str,
+    asset_id: &str,
+    name: impl Into<String>,
+    kind: TrackKind,
+    start: f64,
+    duration: f64,
+    src_in: f64,
+    src_duration: f64,
+) -> TimelineClip {
+    TimelineClip {
+        id: new_id(),
+        track_id: track_id.to_string(),
+        asset_id: asset_id.to_string(),
+        name: name.into(),
+        kind,
+        start,
+        duration,
+        src_in,
+        src_duration,
+        link_id: None,
+        enabled: true,
+        gain_db: 0.0,
+        fx: Default::default(),
+        grade: Default::default(),
+        effects: Vec::new(),
+        title: None,
+        subtitle: None,
+        speed: 1.0,
+        reverse: false,
+        freeze: false,
+        markers: Vec::new(),
+        nest_seq: None,
+        multicam: None,
+    }
+}
+
+/// Einen Multicam-Clip bauen: verweist auf eine Multicam-Quelle (`source`,
+/// eine Sequenz-ID) und trägt den aktiven `angle`. `asset_id` leer;
+/// `src_in`/`duration` rechnen in gemeinsamer Multicam-Zeit.
+#[allow(clippy::too_many_arguments)]
+pub fn new_multicam_clip(
+    track_id: &str,
+    source: &str,
+    angle: u32,
+    name: impl Into<String>,
+    kind: TrackKind,
+    start: f64,
+    duration: f64,
+    src_in: f64,
+    src_duration: f64,
+) -> TimelineClip {
+    let mut c = new_media_clip(track_id, "", name, kind, start, duration, src_in, src_duration);
+    c.multicam = Some(crate::core::multicam::MulticamClip {
+        source: source.to_string(),
+        angle,
+    });
+    c
+}
+
+/// Minimaler, gültiger Test-Clip auf einer Spur (für modulübergreifende Tests).
+#[cfg(test)]
+pub fn test_clip(track_id: &str) -> TimelineClip {
+    TimelineClip {
+        id: new_id(),
+        track_id: track_id.to_string(),
+        asset_id: "asset".into(),
+        name: "clip".into(),
+        kind: TrackKind::Video,
+        start: 0.0,
+        duration: 2.0,
+        src_in: 0.0,
+        src_duration: 10.0,
+        link_id: None,
+        enabled: true,
+        gain_db: 0.0,
+        fx: Default::default(),
+        grade: Default::default(),
+        effects: Vec::new(),
+        title: None,
+        subtitle: None,
+        speed: 1.0,
+        reverse: false,
+        freeze: false,
+        markers: Vec::new(),
+        nest_seq: None,
+        multicam: None,
+    }
 }
 
 /// Anzeigename einer Spur (V1 unten im Video-Block, A1 oben im Audio-Block,
@@ -459,6 +586,9 @@ struct Snapshot {
     transitions: Vec<Transition>,
     markers: Vec<Marker>,
     master_gain_db: f64,
+    /// Globale Operationssequenz (siehe `core::next_op_seq`) — ordnet diesen
+    /// Snapshot gegen die Medien-Undo-History für die `edit.undo`-Koordination.
+    seq: u64,
 }
 
 /// Kopierte Clip-Attribute („Attribute einfügen“): Transform/Deckkraft/
@@ -544,6 +674,11 @@ pub struct TimelineStore {
     pub active_subtitle_track_id: Option<String>,
     /// Klemmbrett für „Attribute kopieren/einfügen“ (nicht persistiert).
     attr_clipboard: Option<ClipAttributes>,
+    /// Multicam-Quelle: ist dies gesetzt, ist die Sequenz eine Multicam-Quelle
+    /// (je Winkel ein Video-/Audio-Clip in der Timeline; die Winkel-Metadaten
+    /// + Sync-Offsets stehen hier). Multicam-Clips anderer Sequenzen verweisen
+    /// über `MulticamClip::source` auf die ID dieser Sequenz (Formatversion 12).
+    pub multicam: Option<crate::core::multicam::MulticamSource>,
     past: Vec<Snapshot>,
     future: Vec<Snapshot>,
 }
@@ -584,6 +719,7 @@ impl Default for TimelineStore {
             master_gain_db: 0.0,
             active_subtitle_track_id: None,
             attr_clipboard: None,
+            multicam: None,
             past: Vec::new(),
             future: Vec::new(),
         }
@@ -890,13 +1026,14 @@ pub fn edit_points(clips: &[TimelineClip]) -> Vec<f64> {
 }
 
 impl TimelineStore {
-    fn push_history(&mut self) {
+    pub(crate) fn push_history(&mut self) {
         self.past.push(Snapshot {
             tracks: self.tracks.clone(),
             clips: self.clips.clone(),
             transitions: self.transitions.clone(),
             markers: self.markers.clone(),
             master_gain_db: self.master_gain_db,
+            seq: crate::core::next_op_seq(),
         });
         if self.past.len() > HISTORY_LIMIT {
             self.past.remove(0);
@@ -1003,6 +1140,51 @@ impl TimelineStore {
         let existing: std::collections::HashSet<&str> =
             self.clips.iter().map(|c| c.id.as_str()).collect();
         self.selected_clip_ids.retain(|id| existing.contains(id.as_str()));
+    }
+
+    /// Inhaltskopie für „Sequenz duplizieren": gleiche Spuren/Clips/Übergänge/
+    /// Marker/Einstellungen, aber frische (leere) Undo-History und ohne
+    /// Auswahl/Zwischenablage. Clip-/Spur-IDs bleiben (nur innerhalb der
+    /// eigenen Timeline referenziert).
+    pub fn duplicate_content(&self) -> TimelineStore {
+        let mut t = TimelineStore::default();
+        t.settings = self.settings;
+        t.tracks = self.tracks.clone();
+        t.clips = self.clips.clone();
+        t.transitions = self.transitions.clone();
+        t.markers = self.markers.clone();
+        t.master_gain_db = self.master_gain_db;
+        t.active_subtitle_track_id = self.active_subtitle_track_id.clone();
+        t.playhead_sec = self.playhead_sec;
+        t.in_point = self.in_point;
+        t.out_point = self.out_point;
+        t.zoom_px_per_sec = self.zoom_px_per_sec;
+        t.snapping = self.snapping;
+        t.multicam = self.multicam.clone();
+        t.revision = 1;
+        t
+    }
+
+    /// Alle Nest-Clips entfernen, die eine bestimmte (gelöschte) Sequenz
+    /// referenzieren — samt anhängender Übergänge. Bumpt `revision`, falls
+    /// etwas entfernt wurde.
+    pub fn remove_nest_clips_of(&mut self, nested_seq_id: &str) {
+        let gone: std::collections::HashSet<String> = self
+            .clips
+            .iter()
+            .filter(|c| c.nest_seq.as_deref() == Some(nested_seq_id))
+            .map(|c| c.id.clone())
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        self.clips.retain(|c| !gone.contains(&c.id));
+        self.transitions.retain(|t| {
+            let hit = |id: &Option<String>| id.as_ref().is_some_and(|id| gone.contains(id));
+            !hit(&t.from_clip_id) && !hit(&t.to_clip_id)
+        });
+        self.selected_clip_ids.retain(|id| !gone.contains(id));
+        self.revision += 1;
     }
 
     pub fn can_undo(&self) -> bool {
@@ -1444,6 +1626,218 @@ impl TimelineStore {
             .unwrap_or(self.tracks.len())
     }
 
+    /// Verschachtelte Sequenzen als Nest-Clips einsetzen (Drop aus dem
+    /// Medien-Browser). `planned`: (sequenz_id, anzeigename, länge_sekunden,
+    /// hat_audio). Je Nest entsteht ein Video-Clip und — falls die innere
+    /// Sequenz Audio enthält — ein verknüpfter Audio-Clip; der Zielbereich
+    /// wird überschrieben (Overwrite wie beim Asset-Drop). `nest_seq` markiert
+    /// die Clips; `asset_id` bleibt leer. Liefert die Anzahl eingefügter Nests.
+    /// Der Rekursionsschutz liegt beim Aufrufer (siehe
+    /// [`SequenceStore::insert_nests`](crate::core::sequences::SequenceStore::insert_nests)).
+    pub fn insert_nest_clips(
+        &mut self,
+        planned: &[(String, String, f64, bool)],
+        at: f64,
+        drop_track_id: Option<&str>,
+    ) -> usize {
+        if planned.is_empty() {
+            return 0;
+        }
+        self.push_history();
+        let drop_track = drop_track_id
+            .and_then(|id| self.tracks.iter().find(|t| t.id == id))
+            .cloned();
+
+        // Video-Zielspur: Drop-Spur, sonst oberste freie, sonst neu anlegen.
+        let video_track = drop_track
+            .as_ref()
+            .filter(|t| t.kind == TrackKind::Video && !t.locked)
+            .map(|t| t.id.clone())
+            .or_else(|| {
+                self.tracks
+                    .iter()
+                    .filter(|t| t.kind == TrackKind::Video && !t.locked)
+                    .last()
+                    .map(|t| t.id.clone())
+            })
+            .unwrap_or_else(|| {
+                let track = make_track(TrackKind::Video);
+                let id = track.id.clone();
+                let idx = self.video_block_start();
+                self.tracks.insert(idx, track);
+                id
+            });
+        // Audio-Zielspur lazy bestimmen (erst beim ersten Audio-Nest anlegen).
+        let mut audio_track: Option<String> = self
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio && !t.locked)
+            .map(|t| t.id.clone());
+
+        let mut clips = std::mem::take(&mut self.clips);
+        let mut inserted_ids: Vec<String> = Vec::new();
+        let mut cursor = at.max(0.0);
+        let mut count = 0usize;
+        for (seq_id, name, length, has_audio) in planned {
+            let dur = length.max(MIN_CLIP_DURATION);
+            let link_id = if *has_audio { Some(new_id()) } else { None };
+            clips = overwrite_range(clips, &video_track, cursor, cursor + dur);
+            let vid = TimelineClip {
+                id: new_id(),
+                track_id: video_track.clone(),
+                asset_id: String::new(),
+                name: name.clone(),
+                kind: TrackKind::Video,
+                start: cursor,
+                duration: dur,
+                src_in: 0.0,
+                src_duration: dur,
+                link_id: link_id.clone(),
+                enabled: true,
+                gain_db: 0.0,
+                fx: ClipFx::default(),
+                grade: ColorGrade::default(),
+                effects: Vec::new(),
+                title: None,
+                subtitle: None,
+                speed: 1.0,
+                reverse: false,
+                freeze: false,
+                markers: Vec::new(),
+                nest_seq: Some(seq_id.clone()),
+                multicam: None,
+            };
+            inserted_ids.push(vid.id.clone());
+            clips.push(vid);
+            if *has_audio {
+                let atr = match &audio_track {
+                    Some(id) => id.clone(),
+                    None => {
+                        let track = make_track(TrackKind::Audio);
+                        let id = track.id.clone();
+                        self.tracks.push(track);
+                        audio_track = Some(id.clone());
+                        id
+                    }
+                };
+                clips = overwrite_range(clips, &atr, cursor, cursor + dur);
+                let aud = TimelineClip {
+                    id: new_id(),
+                    track_id: atr,
+                    asset_id: String::new(),
+                    name: format!("{name} (Audio)"),
+                    kind: TrackKind::Audio,
+                    start: cursor,
+                    duration: dur,
+                    src_in: 0.0,
+                    src_duration: dur,
+                    link_id,
+                    enabled: true,
+                    gain_db: 0.0,
+                    fx: ClipFx::default(),
+                    grade: ColorGrade::default(),
+                    effects: Vec::new(),
+                    title: None,
+                    subtitle: None,
+                    speed: 1.0,
+                    reverse: false,
+                    freeze: false,
+                    markers: Vec::new(),
+                    nest_seq: Some(seq_id.clone()),
+                    multicam: None,
+                };
+                inserted_ids.push(aud.id.clone());
+                clips.push(aud);
+            }
+            cursor += dur;
+            count += 1;
+        }
+        self.clips = clips;
+        self.selected_clip_ids = inserted_ids;
+        self.selected_transition_ids.clear();
+        self.reconcile_transitions();
+        count
+    }
+
+    /// Einen Multicam-Clip (Video + verknüpftes Audio) aus einer Multicam-Quelle
+    /// einsetzen — wie der Asset-Drop ein Overwrite am Zielbereich. `source_id`
+    /// ist die Quell-Sequenz; der aktive Winkel startet bei 0. Liefert die
+    /// ID des Video-Clips.
+    pub fn insert_multicam_clip(
+        &mut self,
+        source_id: &str,
+        name: &str,
+        duration: f64,
+        has_audio: bool,
+        at: f64,
+        drop_track_id: Option<&str>,
+    ) -> String {
+        let dur = duration.max(MIN_CLIP_DURATION);
+        self.push_history();
+        let drop_track = drop_track_id
+            .and_then(|id| self.tracks.iter().find(|t| t.id == id))
+            .cloned();
+        let video_track = drop_track
+            .as_ref()
+            .filter(|t| t.kind == TrackKind::Video && !t.locked)
+            .map(|t| t.id.clone())
+            .or_else(|| {
+                self.tracks
+                    .iter()
+                    .filter(|t| t.kind == TrackKind::Video && !t.locked)
+                    .last()
+                    .map(|t| t.id.clone())
+            })
+            .unwrap_or_else(|| {
+                let track = make_track(TrackKind::Video);
+                let id = track.id.clone();
+                let idx = self.video_block_start();
+                self.tracks.insert(idx, track);
+                id
+            });
+        let link_id = if has_audio { Some(new_id()) } else { None };
+        let cursor = at.max(0.0);
+        let mut clips = std::mem::take(&mut self.clips);
+        clips = overwrite_range(clips, &video_track, cursor, cursor + dur);
+        let mut vid =
+            new_multicam_clip(&video_track, source_id, 0, name, TrackKind::Video, cursor, dur, 0.0, dur);
+        vid.link_id = link_id.clone();
+        let vid_id = vid.id.clone();
+        clips.push(vid);
+        if has_audio {
+            let atr = self
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::Audio && !t.locked)
+                .map(|t| t.id.clone())
+                .unwrap_or_else(|| {
+                    let track = make_track(TrackKind::Audio);
+                    let id = track.id.clone();
+                    self.tracks.push(track);
+                    id
+                });
+            clips = overwrite_range(clips, &atr, cursor, cursor + dur);
+            let mut aud = new_multicam_clip(
+                &atr,
+                source_id,
+                0,
+                &format!("{name} (Audio)"),
+                TrackKind::Audio,
+                cursor,
+                dur,
+                0.0,
+                dur,
+            );
+            aud.link_id = link_id;
+            clips.push(aud);
+        }
+        self.clips = clips;
+        self.selected_clip_ids = vec![vid_id.clone()];
+        self.selected_transition_ids.clear();
+        self.reconcile_transitions();
+        vid_id
+    }
+
     pub fn remove_track(&mut self, track_id: &str) {
         if !self.tracks.iter().any(|t| t.id == track_id) {
             return;
@@ -1725,6 +2119,8 @@ impl TimelineStore {
                 reverse: false,
                 freeze: false,
                 markers,
+                nest_seq: None,
+                multicam: None,
             });
         }
 
@@ -2453,6 +2849,104 @@ impl TimelineStore {
         }
     }
 
+    // ------------------------------------------------------------- Multicam
+
+    /// Topmost sichtbarer Multicam-Video-Clip, der die Sequenzzeit `t` enthält.
+    pub fn topmost_multicam_video_at(&self, t: f64) -> Option<&TimelineClip> {
+        let order = |track_id: &str| {
+            self.tracks
+                .iter()
+                .position(|tr| tr.id == track_id)
+                .unwrap_or(usize::MAX)
+        };
+        self.clips
+            .iter()
+            .filter(|c| {
+                c.is_multicam()
+                    && c.kind == TrackKind::Video
+                    && c.enabled
+                    && t >= c.start - EPS
+                    && t < c.end() - EPS
+            })
+            .min_by_key(|c| order(&c.track_id))
+    }
+
+    /// Den aktiven Winkel eines Multicam-Clips (samt verknüpfter Link-Gruppe,
+    /// Video + Audio) setzen. Liefert true, wenn sich etwas geändert hat.
+    pub fn set_multicam_angle(&mut self, clip_id: &str, angle: u32) -> bool {
+        let group: std::collections::HashSet<String> =
+            expand_links(&self.clips, &[clip_id.to_string()])
+                .into_iter()
+                .collect();
+        let mut changed = false;
+        for c in self.clips.iter_mut().filter(|c| group.contains(&c.id)) {
+            if let Some(mc) = c.multicam.as_mut() {
+                if mc.angle != angle {
+                    mc.angle = angle;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.revision += 1;
+        }
+        changed
+    }
+
+    /// Wie [`set_multicam_angle`](Self::set_multicam_angle), aber mit History-
+    /// Snapshot (Winkelwechsel ohne Wiedergabe ist eine reguläre, rückgängig-
+    /// machbare Bearbeitung). Kein Snapshot, wenn sich nichts ändert.
+    pub fn set_multicam_angle_undoable(&mut self, clip_id: &str, angle: u32) -> bool {
+        let group: std::collections::HashSet<String> =
+            expand_links(&self.clips, &[clip_id.to_string()])
+                .into_iter()
+                .collect();
+        let changes = self.clips.iter().any(|c| {
+            group.contains(&c.id) && c.multicam.as_ref().is_some_and(|mc| mc.angle != angle)
+        });
+        if !changes {
+            return false;
+        }
+        self.push_history();
+        self.set_multicam_angle(clip_id, angle)
+    }
+
+    /// Multicam-Live-Schnitt am Playhead `t`: den Multicam-Clip (samt Link-
+    /// Gruppe) teilen und der RECHTEN Hälfte den Winkel `angle` geben (Premiere-
+    /// Verhalten während der Wiedergabe). Liegt der Playhead an einer Kante
+    /// (kein Schnitt möglich), wird nur der Winkel des bestehenden Clips
+    /// gesetzt. Liefert true, wenn ein Multicam-Clip betroffen war.
+    pub fn multicam_live_cut(&mut self, t: f64, angle: u32) -> bool {
+        let Some(clip_id) = self.topmost_multicam_video_at(t).map(|c| c.id.clone()) else {
+            return false;
+        };
+        let before: std::collections::HashSet<String> =
+            self.clips.iter().map(|c| c.id.clone()).collect();
+        self.split_at(t, Some(&[clip_id.clone()]));
+        let new_right: Vec<String> = self
+            .clips
+            .iter()
+            .filter(|c| !before.contains(&c.id) && c.is_multicam())
+            .map(|c| c.id.clone())
+            .collect();
+        if new_right.is_empty() {
+            // Kein Schnitt (Playhead an der Kante): nur Winkel setzen.
+            self.set_multicam_angle(&clip_id, angle);
+        } else {
+            for c in self
+                .clips
+                .iter_mut()
+                .filter(|c| new_right.contains(&c.id))
+            {
+                if let Some(mc) = c.multicam.as_mut() {
+                    mc.angle = angle;
+                }
+            }
+            self.revision += 1;
+        }
+        true
+    }
+
     /// Keine Link-Expansion — die Auswahl ist bereits expandiert.
     pub fn delete_clips(&mut self, ids: &[String], ripple: bool) {
         use std::collections::HashSet;
@@ -2806,6 +3300,8 @@ impl TimelineStore {
             reverse: false,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         };
         let id = clip.id.clone();
         self.selected_clip_ids = vec![id.clone()];
@@ -2962,6 +3458,8 @@ impl TimelineStore {
             reverse: false,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         }
     }
 
@@ -3087,6 +3585,45 @@ impl TimelineStore {
         self.clips.retain(|c| !asset_set.contains(c.asset_id.as_str()));
         self.prune_selection();
         self.reconcile_transitions();
+    }
+
+    // ------------------------------------------------ Verwendungs-Tracking
+
+    /// Wie oft ein Asset in der Sequenz verwendet wird (Anzahl Clips). A/V-
+    /// Paare zählen als zwei Clips — wie Premieres Verwendungszähler.
+    pub fn asset_usage_count(&self, asset_id: &str) -> usize {
+        self.clips.iter().filter(|c| c.asset_id == asset_id).count()
+    }
+
+    /// Frühester Clip, der `asset_id` verwendet: (clip_id, start_sec). Ziel von
+    /// „In Timeline anzeigen“.
+    pub fn first_use_of_asset(&self, asset_id: &str) -> Option<(String, f64)> {
+        self.clips
+            .iter()
+            .filter(|c| c.asset_id == asset_id)
+            .min_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|c| (c.id.clone(), c.start))
+    }
+
+    /// Springt zur ersten Verwendung eines Assets: Playhead auf den Clip-Start,
+    /// Clip auswählen. Liefert false, wenn das Asset nicht verwendet wird.
+    pub fn reveal_asset_usage(&mut self, asset_id: &str) -> bool {
+        let Some((clip_id, start)) = self.first_use_of_asset(asset_id) else {
+            return false;
+        };
+        self.set_playhead(start);
+        self.selected_transition_ids.clear();
+        // Verknüpften Partner (A/V) mitselektieren, falls vorhanden.
+        let mut ids = vec![clip_id.clone()];
+        if let Some(link) = self.clip(&clip_id).and_then(|c| c.link_id.clone()) {
+            for c in &self.clips {
+                if c.link_id.as_deref() == Some(&link) && c.id != clip_id {
+                    ids.push(c.id.clone());
+                }
+            }
+        }
+        self.selected_clip_ids = ids;
+        true
     }
 
     // ------------------------------------------------------ Zwischenablage
@@ -3963,6 +4500,17 @@ impl TimelineStore {
 
     // ------------------------------------------------------------- Verlauf
 
+    /// Sequenz der zuletzt rückgängig machbaren Timeline-Operation (für die
+    /// `edit.undo`-Koordination; höchste Sequenz = jüngste Operation).
+    pub fn undo_seq(&self) -> Option<u64> {
+        self.past.last().map(|s| s.seq)
+    }
+
+    /// Sequenz der als Nächstes wiederherstellbaren Timeline-Operation.
+    pub fn redo_seq(&self) -> Option<u64> {
+        self.future.first().map(|s| s.seq)
+    }
+
     pub fn undo(&mut self) {
         let Some(prev) = self.past.pop() else { return };
         self.future.insert(
@@ -3973,6 +4521,7 @@ impl TimelineStore {
                 transitions: std::mem::replace(&mut self.transitions, prev.transitions),
                 markers: std::mem::replace(&mut self.markers, prev.markers),
                 master_gain_db: std::mem::replace(&mut self.master_gain_db, prev.master_gain_db),
+                seq: prev.seq,
             },
         );
         self.prune_selection();
@@ -3991,6 +4540,7 @@ impl TimelineStore {
             transitions: std::mem::replace(&mut self.transitions, next.transitions),
             markers: std::mem::replace(&mut self.markers, next.markers),
             master_gain_db: std::mem::replace(&mut self.master_gain_db, next.master_gain_db),
+            seq: next.seq,
         });
         self.prune_selection();
         self.prune_transition_selection();
@@ -4408,6 +4958,8 @@ mod tests {
             reverse: false,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         }
     }
 
@@ -5973,11 +6525,17 @@ mod tests {
                 size_bytes: 1,
                 video: Vec::new(),
                 audio: Vec::new(),
+                recorded_at: None,
             },
             thumbnail_path: None,
             imported_at: 0.0,
+            bin_id: crate::core::bin::ROOT_BIN_ID.to_string(),
+            label: None,
             offline: false,
             markers: vec![Marker::new(2.0), Marker::new(8.0)],
+            proxy_path: None,
+            proxy_src_mtime: None,
+            proxy_offline: false,
         };
         asset.markers[0].name = "Beat".into();
         let assets = vec![asset];
@@ -6009,6 +6567,80 @@ mod tests {
         // Beide bleiben gespeichert, nur einer ist sichtbar.
         assert_eq!(c.markers.len(), 2);
         assert_eq!(c.visible_markers().count(), 1);
+    }
+
+    #[test]
+    fn asset_usage_tracking() {
+        let mut store = TimelineStore::default();
+        let v = track_ids(&store, TrackKind::Video)[1].clone();
+        // Zwei Clips referenzieren a1 (bei 8 s und bei 2 s), einer a2.
+        let mut c1 = test_clip(&v, TrackKind::Video, 8.0, 3.0);
+        c1.asset_id = "a1".into();
+        let mut c2 = test_clip(&v, TrackKind::Video, 2.0, 3.0);
+        c2.asset_id = "a1".into();
+        let mut c3 = test_clip(&v, TrackKind::Video, 20.0, 3.0);
+        c3.asset_id = "a2".into();
+        store.clips.push(c1);
+        store.clips.push(c2.clone());
+        store.clips.push(c3);
+
+        assert_eq!(store.asset_usage_count("a1"), 2);
+        assert_eq!(store.asset_usage_count("a2"), 1);
+        assert_eq!(store.asset_usage_count("a3"), 0);
+
+        // Erste Verwendung = der frühere Clip (Start 2 s).
+        let (first_id, start) = store.first_use_of_asset("a1").unwrap();
+        assert_eq!(first_id, c2.id);
+        assert!((start - 2.0).abs() < 1e-9);
+
+        // reveal springt zum Start und selektiert den Clip.
+        assert!(store.reveal_asset_usage("a1"));
+        assert!((store.playhead_sec - 2.0).abs() < 1e-9);
+        assert!(store.selected_clip_ids.contains(&c2.id));
+        // Unbenutztes Asset: kein Sprung.
+        assert!(!store.reveal_asset_usage("a3"));
+    }
+
+    #[test]
+    fn multicam_angle_switch_and_live_cut() {
+        let mut s = TimelineStore::default();
+        let vid_id = s.insert_multicam_clip("src", "Cam", 10.0, true, 0.0, None);
+        // Video + verknüpftes Audio, beide Winkel 0.
+        assert_eq!(s.clips.iter().filter(|c| c.is_multicam()).count(), 2);
+        assert!(s
+            .clips
+            .iter()
+            .filter(|c| c.is_multicam())
+            .all(|c| c.multicam.as_ref().unwrap().angle == 0));
+
+        // Winkelwechsel ohne Wiedergabe: ganze Link-Gruppe, rückgängig-machbar.
+        assert!(s.set_multicam_angle_undoable(&vid_id, 3));
+        assert!(s
+            .clips
+            .iter()
+            .filter(|c| c.is_multicam())
+            .all(|c| c.multicam.as_ref().unwrap().angle == 3));
+        s.undo();
+        assert!(s
+            .clips
+            .iter()
+            .filter(|c| c.is_multicam())
+            .all(|c| c.multicam.as_ref().unwrap().angle == 0));
+
+        // Live-Schnitt am Playhead 4 s, Winkel 2: teilt Video + Audio, die
+        // rechten Hälften tragen den neuen Winkel, die linken den alten.
+        s.set_playhead(4.0);
+        assert!(s.multicam_live_cut(4.0, 2));
+        let mc: Vec<&TimelineClip> = s.clips.iter().filter(|c| c.is_multicam()).collect();
+        assert_eq!(mc.len(), 4, "je Video/Audio eine linke + rechte Hälfte");
+        for c in &mc {
+            let a = c.multicam.as_ref().unwrap().angle;
+            if (c.start - 4.0).abs() < 1e-6 {
+                assert_eq!(a, 2, "rechte Hälfte = neuer Winkel");
+            } else {
+                assert_eq!(a, 0, "linke Hälfte = alter Winkel");
+            }
+        }
     }
 }
 

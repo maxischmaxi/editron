@@ -26,10 +26,20 @@ uniform vec3 invGamma;
 uniform vec3 gain;
 uniform vec2 satVib;    // Sättigung, Dynamik
 uniform vec4 vignette;  // Stärke (signiert), Mittelpunkt, Weichkante, Rundheit
+uniform float ditherAmt; // 1 = Output-Dithering an, 0 = aus (Paritätstest)
 
 out vec4 finalColor;
 
 float lumaOf(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// Interleaved Gradient Noise (blue-noise-artig, rein aus den Pixelkoordinaten —
+// flimmerfrei) → TPDF-Dither, formelgleich zu core/pixbuf.rs. Bricht das
+// 8-Bit-Banding eines Grades direkt beim Schreiben in den Framebuffer.
+float ign(vec2 p) { return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y)); }
+vec3 tpdfDither(vec2 frag) {
+    float d = ign(frag) - ign(frag + vec2(113.0, 271.0)); // ~(-1, 1)
+    return vec3(d / 255.0);
+}
 
 void main() {
     vec4 tex = texture(texture0, fragTexCoord);
@@ -63,6 +73,10 @@ void main() {
         if (vignette.x > 0.0) { c *= 1.0 - vignette.x * f; }
         else { c += (1.0 - c) * (-vignette.x) * f; }
     }
+    // Output-Dithering (getapert an den Extremen wie der CPU-Pfad): bricht das
+    // Banding gegradeter Verläufe auf dem 8-Bit-Display.
+    vec3 head = clamp(min(c, 1.0 - c) * 255.0, 0.0, 1.0);
+    c += tpdfDither(gl_FragCoord.xy) * head * ditherAmt;
     finalColor = vec4(clamp(c, 0.0, 1.0), tex.a) * colDiffuse * fragColor;
 }
 "#;
@@ -80,6 +94,7 @@ pub struct GradeShader {
     loc_gain: i32,
     loc_sat_vib: i32,
     loc_vignette: i32,
+    loc_dither: i32,
     last: Option<GradeParams>,
 }
 
@@ -93,7 +108,7 @@ impl GradeShader {
             return None;
         }
         let loc = |name: &str| shader.get_shader_location(name);
-        Some(GradeShader {
+        let mut gs = GradeShader {
             loc_wb_gain: loc("wbGain"),
             loc_tonal: loc("tonal"),
             loc_slope: loc("slope"),
@@ -102,9 +117,22 @@ impl GradeShader {
             loc_gain: loc("gain"),
             loc_sat_vib: loc("satVib"),
             loc_vignette: loc("vignette"),
+            loc_dither: loc("ditherAmt"),
             shader,
             last: None,
-        })
+        };
+        // Vorschau-Dithering standardmäßig an (EDITRON_GRADE_DITHER=0 schaltet
+        // es für Vergleichs-/Debug-Zwecke aus).
+        let on = std::env::var("EDITRON_GRADE_DITHER").map(|v| v != "0").unwrap_or(true);
+        gs.set_dither(on);
+        Some(gs)
+    }
+
+    /// Output-Dithering an-/ausschalten (aus: für den GPU↔CPU-Paritätstest,
+    /// damit gegen den ungeditherten f32-CPU-Pfad verglichen werden kann).
+    pub fn set_dither(&mut self, on: bool) {
+        self.shader
+            .set_shader_value(self.loc_dither, if on { 1.0f32 } else { 0.0f32 });
     }
 
     /// Uniforms für die Parameter setzen (vor `begin_shader_mode`).

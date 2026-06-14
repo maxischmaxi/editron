@@ -319,6 +319,19 @@ fn alignment_split(alignment: TransitionAlignment, duration: f64) -> (f64, f64) 
     }
 }
 
+/// Frame-genaue Anteile vor/nach der Schnittkante (Interop-Export). Die Summe
+/// ergibt stets exakt `frames` (zentriert: vorne abgerundet, hinten der Rest).
+pub fn alignment_split_frames(alignment: TransitionAlignment, frames: i64) -> (i64, i64) {
+    match alignment {
+        TransitionAlignment::Center => {
+            let pre = frames / 2;
+            (pre, frames - pre)
+        }
+        TransitionAlignment::StartAtCut => (0, frames),
+        TransitionAlignment::EndAtCut => (frames, 0),
+    }
+}
+
 // ------------------------------------------------------------------ Handles
 
 /// Quellmaterial VOR der Timeline-Kopfkante, in Timeline-Sekunden
@@ -569,6 +582,8 @@ mod tests {
             reverse: false,
             freeze: false,
             markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
         }
     }
 

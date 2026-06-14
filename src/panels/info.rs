@@ -49,6 +49,20 @@ fn format_sample_rate(sample_rate: u32) -> String {
     }
 }
 
+/// Proxy-Status eines Assets als Klartext fürs Info-Panel.
+fn proxy_info_text(media: &crate::stores::MediaStore, asset: &crate::core::types::MediaAsset) -> String {
+    use crate::stores::ProxyJobStatus;
+    match media.proxy_status(&asset.id) {
+        Some(ProxyJobStatus::Building(p)) => format!("wird erstellt — {} %", (p * 100.0).round() as u32),
+        Some(ProxyJobStatus::Failed(e)) => format!("Fehler ({e})"),
+        None => match &asset.proxy_path {
+            None => "—".into(),
+            Some(_) if asset.proxy_offline => "fehlt/veraltet".into(),
+            Some(_) => "vorhanden".into(),
+        },
+    }
+}
+
 fn format_imported_at(secs: f64) -> String {
     // Lokale Zeit über `date` (vermeidet eine Chrono-Abhängigkeit).
     let out = std::process::Command::new("date")
@@ -92,10 +106,34 @@ impl Panel for InfoPanel {
         let info = &asset.info;
         let fps = info.video.first().map(|v| v.fps).unwrap_or(25.0);
 
+        // Metadaten-Zeilen (vor der Höhenschätzung zusammenstellen).
+        let usage = app.timeline.asset_usage_count(&asset.id);
+        let usage_text = if usage == 0 {
+            "nicht verwendet".to_string()
+        } else {
+            format!("{usage}×")
+        };
+        let bin_label = app.media.bin_path_label(app.media.effective_bin(&asset));
+        let meta_rows: Vec<(&str, String)> = vec![
+            ("Container", info.container.clone()),
+            ("Dauer", format_timecode(info.duration_sec, fps)),
+            ("Größe", format_megabytes(info.size_bytes)),
+            (
+                "Aufnahme",
+                info.recorded_at
+                    .map(crate::panels::media_browser::format_unix_date)
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            ("Importiert", format_imported_at(asset.imported_at)),
+            ("Ordner", bin_label),
+            ("Verwendung", usage_text),
+            ("Proxy", proxy_info_text(&app.media, &asset)),
+        ];
+
         // Inhaltshöhe abschätzen (Header + Grid + Tabellen)
         let video_rows = info.video.len();
         let audio_rows = info.audio.len();
-        let mut content_h = 12.0 + 20.0 + 18.0 + 12.0 + 4.0 * 20.0;
+        let mut content_h = 12.0 + 20.0 + 18.0 + 12.0 + meta_rows.len() as f32 * 20.0;
         if video_rows > 0 {
             content_h += 16.0 + 20.0 + 24.0 + video_rows as f32 * 24.0;
         }
@@ -124,13 +162,7 @@ impl Panel for InfoPanel {
 
         // Metadaten-Grid (2 Spalten)
         let label_w = inner_w / 2.0;
-        let rows: [(&str, String); 4] = [
-            ("Container", info.container.clone()),
-            ("Dauer", format_timecode(info.duration_sec, fps)),
-            ("Größe", format_megabytes(info.size_bytes)),
-            ("Importiert", format_imported_at(asset.imported_at)),
-        ];
-        for (label, value) in rows {
+        for (label, value) in meta_rows {
             ui.text(
                 label,
                 crate::ui::geom::v2(inner_x, y),

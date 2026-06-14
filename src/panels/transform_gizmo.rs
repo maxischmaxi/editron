@@ -16,7 +16,6 @@ use crate::ui::geom::{v2, Rect};
 use crate::ui::Ui;
 use raylib::consts::MouseCursor;
 use raylib::math::Vector2;
-use raylib::prelude::RaylibDraw;
 
 const HANDLE: f32 = 8.0;
 const HANDLE_HIT: f32 = 7.0;
@@ -359,16 +358,15 @@ fn draw_gizmo(ui: &mut Ui, quad: &LayerQuad, dragging: bool) {
     // Rahmen
     let corners = quad.corners().map(|(x, y)| v2(x as f32, y as f32));
     for i in 0..4 {
-        ui.d
-            .draw_line_ex(corners[i], corners[(i + 1) % 4], 1.5, color);
+        ui.line(corners[i], corners[(i + 1) % 4], 1.5, color);
     }
 
     // Rotations-Griff: Linie von der Oberkante + Kreis.
     let top_mid = to_screen((0.0, -quad.h / 2.0), center, rot);
     let rot_p = to_screen(rotation_handle_local(quad), center, rot);
-    ui.d.draw_line_ex(top_mid, rot_p, 1.5, color);
-    ui.d.draw_circle_v(rot_p, HANDLE / 2.0 + 1.0, theme::SURFACE_0);
-    ui.d.draw_circle_lines(rot_p.x as i32, rot_p.y as i32, HANDLE / 2.0 + 1.0, color);
+    ui.line(top_mid, rot_p, 1.5, color);
+    ui.circle(rot_p, HANDLE / 2.0 + 1.0, theme::SURFACE_0);
+    ui.circle_outline(rot_p, HANDLE / 2.0 + 1.0, color);
 
     // Handles (achsparallel, wie in den großen NLEs).
     for l in handle_locals(quad) {

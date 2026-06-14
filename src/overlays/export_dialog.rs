@@ -10,10 +10,12 @@
 //! Schließen gesperrt — nur „Abbrechen“ beendet den Job.
 
 use crate::core::export::{
-    self, build_render_plan, validate, AudioSettings, ExportPhase, ExportSettings, QualityKind,
+    self, build_render_plan, validate, AudioSettings, EncoderQuality, ExportSettings, QualityKind,
     Severity, VideoQuality, VideoSettings, CONTAINERS, FRAMERATES, PRESETS, RESOLUTIONS,
     SAMPLE_RATES,
 };
+use crate::core::export_preset::{PresetData, UserPresets};
+use crate::core::render_queue::JobState;
 use crate::core::timecode::format_duration;
 use crate::services::Services;
 use crate::state::AppState;
@@ -32,17 +34,19 @@ const LABEL_W: f32 = 120.0;
 const PRESET_COL_W: f32 = 184.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Stage {
+enum Tab {
+    /// Einstellungen + Presets — Jobs in die Warteschlange legen.
     Settings,
-    Running,
-    Done,
-    Failed,
+    /// Render-Warteschlange — laufende/wartende/fertige Jobs.
+    Queue,
 }
 
 pub struct ExportDialog {
     settings: Option<ExportSettings>,
-    /// Aktives Render-Preset; None = Benutzerdefiniert.
+    /// Aktives eingebautes Render-Preset; None = Benutzerdefiniert/Nutzer-Preset.
     preset_idx: Option<usize>,
+    /// Aktives Nutzer-Preset (Name), falls eines gewählt ist.
+    user_preset: Option<String>,
     /// 0 = „Wie Quelle“, 1..=RESOLUTIONS = Vorgabe, danach Benutzerdefiniert.
     resolution_choice: usize,
     /// 0 = „Wie Sequenz“, 1..=FRAMERATES = Vorgabe, danach Benutzerdefiniert.
@@ -51,6 +55,9 @@ pub struct ExportDialog {
     height_input: TextInputState,
     fps_input: TextInputState,
     bitrate_input: TextInputState,
+    start_num_input: TextInputState,
+    /// Eingabefeld für den Namen eines neuen/zu überschreibenden Presets.
+    preset_name_input: TextInputState,
     crf: f64,
 
     issues: Vec<export::ValidationIssue>,
@@ -60,21 +67,15 @@ pub struct ExportDialog {
     /// Timeline-/Medien-Revision der letzten Validierung (Async-Import).
     revs_seen: (u64, u64),
 
-    stage: Stage,
-    job_id: Option<String>,
-    progress_pct: f64,
-    phase: ExportPhase,
-    frames_done: u64,
-    frames_total: u64,
-    render_fps: f64,
-    eta_sec: Option<f64>,
-    started_at: f64,
-    finished_output: String,
-    error: Option<String>,
+    /// Geladene Nutzer-Presets (XDG-Config).
+    user_presets: UserPresets,
+
+    tab: Tab,
 
     form_scroll: ScrollState,
     form_content_h: f32,
     preset_scroll: ScrollState,
+    queue_scroll: ScrollState,
     was_open: bool,
     /// Testmodus: Export automatisch starten (EDITRON_TEST_EXPORT=<ziel>).
     test_autostart: bool,
@@ -85,32 +86,27 @@ impl Default for ExportDialog {
         ExportDialog {
             settings: None,
             preset_idx: None,
+            user_preset: None,
             resolution_choice: 0,
             fps_choice: 0,
             width_input: TextInputState::default(),
             height_input: TextInputState::default(),
             fps_input: TextInputState::default(),
             bitrate_input: TextInputState::default(),
+            start_num_input: TextInputState::default(),
+            preset_name_input: TextInputState::default(),
             crf: 20.0,
             issues: Vec::new(),
             plan: export::RenderPlan::default(),
             dirty: true,
             encoders_seen: usize::MAX,
             revs_seen: (u64::MAX, u64::MAX),
-            stage: Stage::Settings,
-            job_id: None,
-            progress_pct: 0.0,
-            phase: ExportPhase::MixAudio,
-            frames_done: 0,
-            frames_total: 0,
-            render_fps: 0.0,
-            eta_sec: None,
-            started_at: 0.0,
-            finished_output: String::new(),
-            error: None,
+            user_presets: UserPresets::load(),
+            tab: Tab::Settings,
             form_scroll: ScrollState::default(),
             form_content_h: 0.0,
             preset_scroll: ScrollState::default(),
+            queue_scroll: ScrollState::default(),
             was_open: false,
             test_autostart: std::env::var("EDITRON_TEST_EXPORT").is_ok(),
         }
@@ -118,53 +114,6 @@ impl Default for ExportDialog {
 }
 
 impl ExportDialog {
-    #[allow(clippy::too_many_arguments)]
-    pub fn on_progress(
-        &mut self,
-        job_id: &str,
-        pct: f64,
-        phase: ExportPhase,
-        frames_done: u64,
-        frames_total: u64,
-        render_fps: f64,
-        eta_sec: Option<f64>,
-    ) {
-        if self.job_id.as_deref() != Some(job_id) {
-            return;
-        }
-        self.progress_pct = pct;
-        self.phase = phase;
-        self.frames_done = frames_done;
-        self.frames_total = frames_total;
-        self.render_fps = render_fps;
-        self.eta_sec = eta_sec;
-    }
-
-    pub fn on_done(
-        &mut self,
-        job_id: &str,
-        ok: bool,
-        cancelled: bool,
-        error: Option<String>,
-        output: &str,
-    ) {
-        if self.job_id.as_deref() != Some(job_id) {
-            return;
-        }
-        self.job_id = None;
-        if ok {
-            self.stage = Stage::Done;
-            self.progress_pct = 100.0;
-            self.finished_output = output.to_string();
-        } else if cancelled {
-            self.stage = Stage::Settings;
-            self.dirty = true;
-        } else {
-            self.stage = Stage::Failed;
-            self.error = error;
-        }
-    }
-
     pub fn on_target_picked(&mut self, path: Option<std::path::PathBuf>) {
         let Some(p) = path else { return };
         if let Some(s) = &mut self.settings {
@@ -185,9 +134,6 @@ impl ExportDialog {
         // Wiedergabe anhalten — Export braucht Decode-Ressourcen.
         state.playback.program_playing = false;
         state.playback.source.playing = false;
-        if self.stage != Stage::Running {
-            self.stage = Stage::Settings;
-        }
         if self.settings.is_none() {
             self.apply_preset(3, state); // H.264 Master als Allzweck-Default
         }
@@ -218,6 +164,25 @@ impl ExportDialog {
             .map(|s| s.subtitles)
             .unwrap_or_default();
         self.preset_idx = Some(idx);
+        self.user_preset = None;
+        self.settings = Some(settings);
+        self.sync_inputs_from_settings(state);
+        self.dirty = true;
+    }
+
+    /// Ein gespeichertes Nutzer-Preset anwenden (konkrete Werte).
+    fn apply_user_preset(&mut self, name: &str, state: &AppState) {
+        let Some(data) = self.user_presets.get(name).cloned() else { return };
+        // Zielpfad/Endung wie bei den eingebauten Presets behandeln.
+        let ext = export::container(&data.container).ext;
+        let output = match self.settings.as_ref() {
+            Some(old) if !old.output.is_empty() => replace_extension(&old.output, ext),
+            _ => default_output_path_raw(ext),
+        };
+        let mut settings = data.to_settings(output);
+        settings.use_in_out = self.settings.as_ref().map(|s| s.use_in_out).unwrap_or(false);
+        self.preset_idx = None;
+        self.user_preset = Some(name.to_string());
         self.settings = Some(settings);
         self.sync_inputs_from_settings(state);
         self.dirty = true;
@@ -256,22 +221,25 @@ impl ExportDialog {
                 self.bitrate_input.set_text("12");
             }
         }
+        self.start_num_input.set_text(s.image_start.to_string());
     }
 
     fn mark_custom(&mut self) {
         self.preset_idx = None;
+        self.user_preset = None;
         self.dirty = true;
     }
 
     fn revalidate(&mut self, state: &AppState) {
         let Some(s) = &self.settings else { return };
-        self.plan = build_render_plan(&state.timeline, &state.media, s);
+        self.plan = build_render_plan(&state.timeline, &state.media, s, &state.timeline);
         self.issues = validate(
             &state.timeline,
             &state.media,
             state.app.ffmpeg.as_ref().map(|f| f.available),
             state.app.encoders.as_ref(),
             s,
+            &state.timeline,
         );
         self.dirty = false;
     }
@@ -316,9 +284,17 @@ impl ExportDialog {
             self.revalidate(state);
         }
 
-        // Testmodus: sobald die Validierung durchgeht, automatisch starten
-        // (der asynchrone Test-Import braucht ein paar Frames).
-        if self.test_autostart && self.stage == Stage::Settings {
+        // Über die Statusleiste/„Warteschlange öffnen" angefordert: Queue-Tab.
+        if state.app.export_open_queue {
+            state.app.export_open_queue = false;
+            self.tab = Tab::Queue;
+        }
+
+        // Testmodus: sobald die Validierung durchgeht, automatisch in die
+        // Warteschlange legen + Queue-Tab zeigen (der asynchrone Test-Import
+        // braucht ein paar Frames). Die Running-/Done-Screenshots zeigen dann
+        // den Job in der Warteschlange.
+        if self.test_autostart {
             if let Ok(out) = std::env::var("EDITRON_TEST_EXPORT") {
                 if self.settings.as_ref().is_some_and(|s| s.output != out) {
                     if let Some(s) = &mut self.settings {
@@ -328,25 +304,22 @@ impl ExportDialog {
                 }
                 if !self.issues.iter().any(|i| i.severity == Severity::Error) {
                     self.test_autostart = false;
-                    self.start_export(state, services);
+                    self.enqueue(state);
+                    self.tab = Tab::Queue;
                 }
             } else {
                 self.test_autostart = false;
             }
         }
 
-        // ESC schließt — außer beim Rendern oder wenn Popup/Textfeld den
-        // Tastendruck selbst verarbeitet.
+        // ESC schließt — außer wenn Popup/Textfeld den Tastendruck selbst
+        // verarbeitet. Der Hintergrund-Export läuft beim Schließen weiter.
         let esc = ui
             .input
             .keys
             .iter()
             .any(|k| k.key == KeyboardKey::KEY_ESCAPE);
-        if esc
-            && self.stage != Stage::Running
-            && ui.persist.select.popup.is_none()
-            && ui.persist.keyboard_focus == 0
-        {
+        if esc && ui.persist.select.popup.is_none() && ui.persist.keyboard_focus == 0 {
             state.app.open_dialog = None;
             return;
         }
@@ -372,12 +345,7 @@ impl ExportDialog {
         ui.text_left(&title, hi, theme::TEXT_1, FontKind::Sans16Semibold);
         let close = Rect::new(head.right() - 16.0 - 28.0, head.y + 10.0, 28.0, 28.0);
         if IconButton::new("x")
-            .tooltip(if self.stage == Stage::Running {
-                "Während des Exports gesperrt"
-            } else {
-                "Schließen (Esc)"
-            })
-            .disabled(self.stage == Stage::Running)
+            .tooltip("Schließen (Esc) — Export läuft im Hintergrund weiter")
             .show(ui, "export.close", close)
             .clicked
         {
@@ -385,12 +353,49 @@ impl ExportDialog {
             return;
         }
 
-        match self.stage {
-            Stage::Settings => self.render_settings(ui, state, services, area),
-            Stage::Running => self.render_running(ui, services, area),
-            Stage::Done => self.render_done(ui, state, services, area),
-            Stage::Failed => self.render_failed(ui, area),
+        // ---- Tab-Leiste ----
+        let active = state.render_queue.active_count();
+        let tab_row = area.cut_top(36.0);
+        ui.hline(tab_row.x, tab_row.bottom() - 1.0, tab_row.w, theme::LINE);
+        let mut tx = tab_row.inset_xy(16.0, 0.0);
+        if self.tab_button(ui, tx.cut_left(140.0), "Einstellungen", self.tab == Tab::Settings) {
+            self.tab = Tab::Settings;
         }
+        tx.cut_left(4.0);
+        let queue_label = if active > 0 {
+            format!("Warteschlange ({active})")
+        } else {
+            "Warteschlange".to_string()
+        };
+        if self.tab_button(ui, tx.cut_left(170.0), &queue_label, self.tab == Tab::Queue) {
+            self.tab = Tab::Queue;
+        }
+
+        match self.tab {
+            Tab::Settings => self.render_settings(ui, state, services, area),
+            Tab::Queue => self.render_queue(ui, state, services, area),
+        }
+    }
+
+    /// Tab-Schaltfläche mit Unterstreichung des aktiven Tabs.
+    fn tab_button(&self, ui: &mut Ui, rect: Rect, label: &str, active: bool) -> bool {
+        let id = ui.id(("export.tab", label));
+        let it = ui.interact(id, rect);
+        if it.hovered {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+        }
+        let fg = if active {
+            theme::TEXT_1
+        } else if it.hovered {
+            theme::TEXT_2
+        } else {
+            theme::TEXT_3
+        };
+        ui.text_left(label, rect.inset_xy(8.0, 0.0), fg, FontKind::Sans12Medium);
+        if active {
+            ui.fill(Rect::new(rect.x, rect.bottom() - 2.0, rect.w, 2.0), theme::ACCENT);
+        }
+        it.clicked
     }
 
     // ------------------------------------------------------- Settings-Stage
@@ -406,19 +411,27 @@ impl ExportDialog {
         let shown_issues = self.issues.len().min(3);
         let footer_h = 52.0 + 22.0 + shown_issues as f32 * 18.0 + if shown_issues > 0 { 8.0 } else { 0.0 };
         let footer = area.cut_bottom(footer_h);
-        self.render_footer(ui, state, services, footer);
+        self.render_footer(ui, state, footer);
 
         // ---- Linke Spalte: Render-Presets ----
         let mut presets_col = area.cut_left(PRESET_COL_W);
         ui.vline(presets_col.right(), presets_col.y, presets_col.h, theme::LINE);
         presets_col = presets_col.inset_xy(8.0, 8.0);
+        // Festen Speicher-Bereich unten abschneiden (Name + Speichern/Löschen).
+        let save_area = presets_col.cut_bottom(64.0);
+        self.render_preset_save(ui, save_area);
+
         let head = presets_col.cut_top(20.0);
         ui.text_left("PRESETS", head.offset(4.0, 0.0), theme::TEXT_3, FontKind::Sans12Medium);
         let row_h = 26.0;
-        let content_h = PRESETS.len() as f32 * row_h + 8.0;
+        let user_n = self.user_presets.presets.len();
+        // Inhalt: eingebaute Presets + (Trenner + „EIGENE" + Nutzer-Presets).
+        let extra = if user_n > 0 { 24.0 + user_n as f32 * row_h } else { 0.0 };
+        let content_h = PRESETS.len() as f32 * row_h + 8.0 + extra;
         let view = self.preset_scroll.begin(ui, presets_col, presets_col.w, content_h);
         let mut y = view.origin_y;
         let mut clicked_preset: Option<usize> = None;
+        let mut clicked_user: Option<String> = None;
         for (i, preset) in PRESETS.iter().enumerate() {
             let row = Rect::new(view.viewport.x, y, view.viewport.w, row_h - 2.0);
             let id = ui.id(("export.preset", i));
@@ -437,9 +450,39 @@ impl ExportDialog {
             }
             y += row_h;
         }
+        if user_n > 0 {
+            y += 6.0;
+            let hr = Rect::new(view.viewport.x + 4.0, y, view.viewport.w - 8.0, 16.0);
+            ui.text_left("EIGENE", hr, theme::TEXT_3, FontKind::Sans12Medium);
+            y += 18.0;
+            let names: Vec<String> = self.user_presets.presets.iter().map(|p| p.name.clone()).collect();
+            for name in names {
+                let row = Rect::new(view.viewport.x, y, view.viewport.w, row_h - 2.0);
+                let id = ui.id(("export.userPreset", &name));
+                let it = ui.interact(id, row);
+                let active = self.user_preset.as_deref() == Some(name.as_str());
+                if active {
+                    ui.fill_rounded(row, theme::RADIUS_SM, theme::ACCENT_SOFT);
+                } else if it.hovered {
+                    ui.fill_rounded(row, theme::RADIUS_SM, theme::SURFACE_2);
+                    ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                }
+                let fg = if active { theme::TEXT_1 } else { theme::TEXT_2 };
+                let label = ui.font(FontKind::Sans12).ellipsize(&name, row.w - 16.0);
+                ui.text_left(&label, row.inset_xy(8.0, 0.0), fg, FontKind::Sans12);
+                if it.clicked {
+                    clicked_user = Some(name.clone());
+                }
+                y += row_h;
+            }
+        }
         self.preset_scroll.end(ui, presets_col, presets_col.w, content_h);
         if let Some(i) = clicked_preset {
             self.apply_preset(i, state);
+        }
+        if let Some(name) = clicked_user {
+            self.preset_name_input.set_text(name.clone());
+            self.apply_user_preset(&name, state);
         }
 
         // ---- Rechte Spalte: Einstellungen (scrollbar; Inhalt passt sich der
@@ -492,12 +535,17 @@ impl ExportDialog {
             } else {
                 s.video = None;
             }
-            let audio_ok = s
-                .audio
-                .as_ref()
-                .is_some_and(|a| c.audio_codecs.contains(&a.codec.id));
-            if !audio_ok {
-                s.audio = Some(make_audio(c.audio_codecs[0]));
+            // Bild-Sequenzen kennen kein Audio.
+            if c.audio_codecs.is_empty() {
+                s.audio = None;
+            } else {
+                let audio_ok = s
+                    .audio
+                    .as_ref()
+                    .is_some_and(|a| c.audio_codecs.contains(&a.codec.id));
+                if !audio_ok {
+                    s.audio = Some(make_audio(c.audio_codecs[0]));
+                }
             }
             s.output = replace_extension(&s.output, c.ext);
             changed = true;
@@ -588,6 +636,34 @@ impl ExportDialog {
                 layout_changed = true;
             }
 
+            // ---- Encoder (Software/Hardware) ----
+            // Nur anbieten, wenn die Codec-Familie mehrere Backends hat
+            // (H.264/HEVC). Nicht verfügbare Hardware-Encoder werden — sofern
+            // die Encoder-Liste vorliegt — ausgeblendet.
+            let backends = v.codec.encoders;
+            if backends.len() > 1 {
+                let shown = export::available_video_encoders(v.codec.id, encoders.as_ref());
+                if shown.len() > 1 {
+                    let r = labeled_row(ui, body, "Encoder");
+                    let labels: Vec<&str> = shown.iter().map(|e| e.label).collect();
+                    let current = shown.iter().position(|e| e.id == v.encoder.id).unwrap_or(0);
+                    if let Some(i) = select(ui, "export.encoder", r, &labels, current) {
+                        let enc = shown[i];
+                        if let Some(video) = &mut s.video {
+                            video.encoder = enc;
+                            // VideoToolbox kennt kein CRF → auf Bitrate zwingen.
+                            if matches!(enc.quality, EncoderQuality::BitrateOnly) {
+                                if let VideoQuality::Crf(_) = video.quality {
+                                    video.quality = VideoQuality::Bitrate(parse_mbits(&self.bitrate_input.text).max(1));
+                                }
+                            }
+                        }
+                        changed = true;
+                        layout_changed = true;
+                    }
+                }
+            }
+
             // ---- Auflösung ----
             let r = labeled_row(ui, body, "Auflösung");
             let seq = state.timeline.settings;
@@ -670,36 +746,87 @@ impl ExportDialog {
                 }
             }
 
-            // ---- Qualität ----
-            match v.codec.quality {
-                QualityKind::CrfOrBitrate { crf: (min, max, _) } => {
-                    let r = labeled_row(ui, body, "Qualität");
-                    let mode = match v.quality {
-                        VideoQuality::Crf(_) => 0,
-                        VideoQuality::Bitrate(_) => 1,
-                    };
+            // ---- Qualität / Bild-Sequenz ----
+            if s.container.image_sequence {
+                // PNG/TIFF verlustfrei; JPEG mit Qualitätsregler (q:v 2..31).
+                if v.codec.id == "mjpeg" {
+                    let r = labeled_row(ui, body, "JPEG-Qualität");
                     let mut rr = r;
-                    let mode_cell = rr.cut_left(190.0);
-                    if let Some(i) = select(
-                        ui,
-                        "export.qmode",
-                        mode_cell,
-                        &["Konstante Qualität (CRF)", "Ziel-Bitrate (VBR)"],
-                        mode,
-                    ) {
+                    let value_cell = rr.cut_right(120.0);
+                    rr.cut_right(8.0);
+                    self.crf = self.crf.clamp(2.0, 31.0);
+                    let before = self.crf;
+                    slider(ui, "export.jpegq", rr, &mut self.crf, 2.0, 31.0, theme::ACCENT);
+                    self.crf = self.crf.round();
+                    ui.text_right(
+                        &format!("q {} (2 = beste)", self.crf as i64),
+                        value_cell,
+                        theme::TEXT_2,
+                        FontKind::Sans12,
+                    );
+                    if (self.crf - before).abs() > 0.01 {
                         if let Some(v) = &mut s.video {
-                            v.quality = if i == 0 {
-                                VideoQuality::Crf(self.crf.round() as u32)
-                            } else {
-                                VideoQuality::Bitrate(parse_mbits(&self.bitrate_input.text))
-                            };
+                            v.quality = VideoQuality::Crf(self.crf as u32);
                         }
                         changed = true;
-                        layout_changed = true;
                     }
-                    rr.cut_left(12.0);
-                    match v.quality {
-                        VideoQuality::Crf(_) => {
+                } else {
+                    let r = labeled_row(ui, body, "Qualität");
+                    ui.text_left("Verlustfrei (RGB)", r, theme::TEXT_3, FontKind::Sans12);
+                }
+                // Startnummer der Sequenz.
+                let mut r = labeled_row(ui, body, "Startnummer");
+                let field = r.cut_left(90.0);
+                let res = self.start_num_input.show(ui, "export.startNum", field, "1");
+                r.cut_left(8.0);
+                let pat = export::image_sequence_pattern(&s.output);
+                let pat_name = std::path::Path::new(&pat)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or(pat);
+                ui.text_left(&pat_name, r, theme::TEXT_3, FontKind::Mono12);
+                if res.changed {
+                    s.image_start = self.start_num_input.text.trim().parse().unwrap_or(1);
+                    changed = true;
+                    keeps_preset = true;
+                }
+            } else {
+                match v.codec.quality {
+                    QualityKind::CrfOrBitrate { crf } => {
+                        let (min, max, _) = v.encoder.quality_range(crf);
+                        let supports_cq = v.encoder.supports_constant_quality();
+                        let q_label = v.encoder.quality_label();
+                        let r = labeled_row(ui, body, "Qualität");
+                        let mut rr = r;
+                        // Modus-Auswahl nur, wenn der Encoder konstante Qualität kann.
+                        if supports_cq {
+                            let mode = match v.quality {
+                                VideoQuality::Crf(_) => 0,
+                                VideoQuality::Bitrate(_) => 1,
+                            };
+                            let mode_cell = rr.cut_left(190.0);
+                            let cq = format!("Konstante Qualität ({q_label})");
+                            if let Some(i) = select(
+                                ui,
+                                "export.qmode",
+                                mode_cell,
+                                &[cq.as_str(), "Ziel-Bitrate (VBR)"],
+                                mode,
+                            ) {
+                                if let Some(v) = &mut s.video {
+                                    v.quality = if i == 0 {
+                                        VideoQuality::Crf(self.crf.round() as u32)
+                                    } else {
+                                        VideoQuality::Bitrate(parse_mbits(&self.bitrate_input.text))
+                                    };
+                                }
+                                changed = true;
+                                layout_changed = true;
+                            }
+                            rr.cut_left(12.0);
+                        }
+                        let show_cq = supports_cq && matches!(v.quality, VideoQuality::Crf(_));
+                        if show_cq {
                             let value_cell = rr.cut_right(34.0);
                             rr.cut_right(8.0);
                             self.crf = self.crf.clamp(min as f64, max as f64);
@@ -718,29 +845,30 @@ impl ExportDialog {
                                 }
                                 changed = true;
                             }
-                        }
-                        VideoQuality::Bitrate(_) => {
+                        } else {
                             let field = rr.cut_left(72.0);
                             rr.cut_left(8.0);
                             ui.text_left("Mbit/s", rr, theme::TEXT_3, FontKind::Sans12);
                             let res = self.bitrate_input.show(ui, "export.bitrate", field, "12");
-                            if res.changed {
+                            // Bei reinen Bitrate-Encodern sicherstellen, dass die
+                            // Qualität auch wirklich auf Bitrate steht.
+                            if res.changed || matches!(v.quality, VideoQuality::Crf(_)) {
                                 if let Some(v) = &mut s.video {
-                                    v.quality = VideoQuality::Bitrate(parse_mbits(&self.bitrate_input.text));
+                                    v.quality = VideoQuality::Bitrate(parse_mbits(&self.bitrate_input.text).max(1));
                                 }
                                 changed = true;
                             }
                         }
                     }
-                }
-                QualityKind::Profiles(profiles) => {
-                    let r = labeled_row(ui, body, "Profil");
-                    let labels: Vec<&str> = profiles.iter().map(|(_, l, _)| *l).collect();
-                    if let Some(i) = select(ui, "export.profile", r, &labels, v.profile.min(labels.len() - 1)) {
-                        if let Some(v) = &mut s.video {
-                            v.profile = i;
+                    QualityKind::Profiles(profiles) => {
+                        let r = labeled_row(ui, body, "Profil");
+                        let labels: Vec<&str> = profiles.iter().map(|(_, l, _)| *l).collect();
+                        if let Some(i) = select(ui, "export.profile", r, &labels, v.profile.min(labels.len() - 1)) {
+                            if let Some(v) = &mut s.video {
+                                v.profile = i;
+                            }
+                            changed = true;
                         }
-                        changed = true;
                     }
                 }
             }
@@ -762,22 +890,40 @@ impl ExportDialog {
                     changed = true;
                 }
             }
+
+            // ---- 10-Bit-Ausgabe (höhere Farbtiefe, weniger Banding) ----
+            // Nur CRF/Bitrate-Codecs mit 10-Bit-Pfad (HEVC main10, AV1, VP9,
+            // H.264 High 10). ProRes/DNxHR steuern die Bittiefe über das Profil.
+            if export::codec_supports_tenbit(v.codec.id) {
+                let row = body.cut_top(24.0);
+                if checkbox(ui, "export.tenbit", row, "10-Bit-Ausgabe (höhere Farbtiefe)", v.tenbit)
+                    .clicked
+                {
+                    if let Some(v) = &mut s.video {
+                        v.tenbit = !v.tenbit;
+                    }
+                    changed = true;
+                }
+            }
         }
 
         // ================= Audio =================
-        section(ui, body, "Audio");
-        if s.container.video {
-            let row = body.cut_top(24.0);
-            if checkbox(ui, "export.audioOn", row, "Audio exportieren", s.audio.is_some()).clicked {
-                s.audio = if s.audio.is_some() {
-                    None
-                } else {
-                    Some(make_audio(s.container.audio_codecs[0]))
-                };
-                changed = true;
-                layout_changed = true;
+        // Bild-Sequenzen haben keine Audiospur (audio_codecs leer).
+        if !s.container.audio_codecs.is_empty() {
+            section(ui, body, "Audio");
+            if s.container.video {
+                let row = body.cut_top(24.0);
+                if checkbox(ui, "export.audioOn", row, "Audio exportieren", s.audio.is_some()).clicked {
+                    s.audio = if s.audio.is_some() {
+                        None
+                    } else {
+                        Some(make_audio(s.container.audio_codecs[0]))
+                    };
+                    changed = true;
+                    layout_changed = true;
+                }
+                body.cut_top(8.0);
             }
-            body.cut_top(8.0);
         }
 
         if let Some(a) = s.audio.clone() {
@@ -943,7 +1089,57 @@ impl ExportDialog {
 
     // ----------------------------------------------------------- Fußbereich
 
-    fn render_footer(&mut self, ui: &mut Ui, state: &mut AppState, services: &Services, footer: Rect) {
+    /// Speicher-Bereich der Preset-Spalte: Namensfeld + Speichern/Überschreiben
+    /// und Löschen des gewählten Nutzer-Presets.
+    fn render_preset_save(&mut self, ui: &mut Ui, area: Rect) {
+        let mut a = area;
+        ui.hline(a.x, a.y, a.w, theme::LINE);
+        a.cut_top(8.0);
+        let name_row = a.cut_top(24.0);
+        let _ = self
+            .preset_name_input
+            .show(ui, "export.presetName", name_row, "Preset-Name …");
+        a.cut_top(6.0);
+        let btn_row = a.cut_top(24.0);
+
+        let name = self.preset_name_input.text.trim().to_string();
+        let exists = self.user_presets.contains(&name);
+        let can_save = !name.is_empty() && self.settings.is_some();
+        let save = TextButton::new(if exists { "Überschreiben" } else { "Speichern" })
+            .style(TextButtonStyle::Outline);
+        let sw = save.measure(ui);
+        if save
+            .disabled(!can_save)
+            .show(ui, "export.savePreset", Rect::new(btn_row.x, btn_row.y, sw, 24.0))
+            .clicked
+            && can_save
+        {
+            // Daten vor dem mutablen Borrow auf user_presets ableiten.
+            let data = self.settings.as_ref().map(PresetData::from_settings);
+            if let Some(data) = data {
+                self.user_presets.upsert(&name, data);
+                self.user_preset = Some(name.clone());
+                self.preset_idx = None;
+            }
+        }
+
+        // Löschen nur, wenn ein gespeichertes Nutzer-Preset gewählt ist.
+        if let Some(sel) = self.user_preset.clone() {
+            if self.user_presets.contains(&sel) {
+                let del = TextButton::new("Löschen").style(TextButtonStyle::Outline);
+                let dw = del.measure(ui);
+                if del
+                    .show(ui, "export.delPreset", Rect::new(btn_row.right() - dw, btn_row.y, dw, 24.0))
+                    .clicked
+                {
+                    self.user_presets.remove(&sel);
+                    self.user_preset = None;
+                }
+            }
+        }
+    }
+
+    fn render_footer(&mut self, ui: &mut Ui, state: &mut AppState, footer: Rect) {
         ui.hline(footer.x, footer.y, footer.w, theme::LINE);
         let mut f = footer.inset_xy(16.0, 0.0);
         f.cut_top(8.0);
@@ -1001,14 +1197,22 @@ impl ExportDialog {
             ui.text_left(&text, summary_row, theme::TEXT_3, FontKind::Sans12);
         }
 
-        // Buttons
+        // Buttons: „Exportieren" (in Queue + Queue-Tab) · „Hinzufügen"
+        // (in Queue, bleibt für weitere Jobs) · „Schließen".
         let btn_row = f.cut_top(40.0);
         let has_error = self.issues.iter().any(|i| i.severity == Severity::Error);
         let start_rect = Rect::new(btn_row.right() - 130.0, btn_row.y + 6.0, 130.0, 28.0);
         if primary_button(ui, "export.start", start_rect, "Exportieren", !has_error).clicked
             && !has_error
+            && self.enqueue(state)
         {
-            self.start_export(state, services);
+            self.tab = Tab::Queue;
+        }
+        let add = TextButton::new("Hinzufügen").icon("plus").style(TextButtonStyle::Outline);
+        let aw = add.measure(ui);
+        let add_rect = Rect::new(start_rect.x - 8.0 - aw, btn_row.y + 6.0, aw, 28.0);
+        if !has_error && add.show(ui, "export.enqueue", add_rect).clicked {
+            self.enqueue(state);
         }
         let cancel = TextButton::new("Schließen").style(TextButtonStyle::Outline);
         let cw = cancel.measure(ui);
@@ -1016,7 +1220,7 @@ impl ExportDialog {
             .show(
                 ui,
                 "export.cancelDialog",
-                Rect::new(start_rect.x - 8.0 - cw, btn_row.y + 6.0, cw, 28.0),
+                Rect::new(add_rect.x - 8.0 - cw, btn_row.y + 6.0, cw, 28.0),
             )
             .clicked
         {
@@ -1024,207 +1228,250 @@ impl ExportDialog {
         }
     }
 
-    fn start_export(&mut self, state: &mut AppState, services: &Services) {
-        // Letzte Prüfung direkt vor dem Start (Pfad kann sich geändert haben).
+    /// Aktuelle Einstellungen als neuen Job in die Warteschlange legen. Der
+    /// Renderplan ist bereits ein entkoppelter Snapshot — der Job läuft im
+    /// Hintergrund weiter, auch wenn die Timeline danach editiert wird.
+    fn enqueue(&mut self, state: &mut AppState) -> bool {
         self.revalidate(state);
         if self.issues.iter().any(|i| i.severity == Severity::Error) {
-            return;
+            return false;
         }
-        let Some(settings) = self.settings.clone() else { return };
-        // Wiedergabe stoppen — der Export soll alle Decode-Ressourcen haben.
-        state.playback.program_playing = false;
-        state.playback.source.playing = false;
-        match services.start_sequence_export(self.plan.clone(), settings) {
-            Ok(job_id) => {
-                self.job_id = Some(job_id);
-                self.stage = Stage::Running;
-                self.progress_pct = 0.0;
-                self.frames_done = 0;
-                self.frames_total = self.plan.total_frames;
-                self.render_fps = 0.0;
-                self.eta_sec = None;
-                self.error = None;
-                self.started_at = -1.0; // im Render-Pass mit ui.time initialisieren
-            }
-            Err(err) => {
-                self.stage = Stage::Failed;
-                self.error = Some(err);
-            }
-        }
-    }
-
-    // ------------------------------------------------------- Running-Stage
-
-    fn render_running(&mut self, ui: &mut Ui, services: &Services, area: Rect) {
-        if self.started_at < 0.0 {
-            self.started_at = ui.time;
-        }
-        let Some(s) = &self.settings else { return };
-        let panel = area.center_box(area.w - 120.0, 190.0);
-        let mut p = panel;
-
-        let name = std::path::Path::new(&s.output)
+        let Some(settings) = self.settings.clone() else { return false };
+        let name = std::path::Path::new(&settings.output)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| s.output.clone());
-        let head = p.cut_top(24.0);
-        ui.text_left(
-            &format!("Exportiere „{name}“"),
-            head,
-            theme::TEXT_1,
-            FontKind::Sans14Semibold,
+            .unwrap_or_else(|| settings.output.clone());
+        let summary = settings_summary(&settings, &self.plan);
+        state.render_queue.enqueue(
+            name,
+            summary,
+            settings.output.clone(),
+            self.plan.clone(),
+            settings,
         );
-        let phase_row = p.cut_top(20.0);
-        ui.text_left(
-            &format!("{} …", self.phase.label()),
-            phase_row,
-            theme::TEXT_2,
-            FontKind::Sans12,
-        );
-        p.cut_top(10.0);
+        true
+    }
 
-        // Fortschrittsbalken + Prozent
-        let bar_row = p.cut_top(22.0);
-        let mut bar = bar_row;
-        let pct_cell = bar.cut_right(52.0);
-        bar.cut_right(10.0);
-        let track = Rect::new(bar.x, bar.y + 7.0, bar.w, 8.0);
-        ui.fill_rounded(track, 4.0, theme::SURFACE_3);
-        let frac = (self.progress_pct / 100.0).clamp(0.0, 1.0) as f32;
-        if frac > 0.0 {
-            ui.fill_rounded(Rect::new(track.x, track.y, (track.w * frac).max(8.0), 8.0), 4.0, theme::ACCENT);
-        }
-        ui.text_right(
-            &format!("{:.0} %", self.progress_pct),
-            pct_cell,
-            theme::TEXT_1,
-            FontKind::Sans14Semibold,
-        );
-        p.cut_top(8.0);
+    // ------------------------------------------------------- Warteschlange-Tab
 
-        // Frames + Geschwindigkeit
-        let detail = p.cut_top(18.0);
-        let mut text = String::new();
-        if self.frames_total > 0 {
-            text.push_str(&format!(
-                "Frame {} / {}",
-                group_thousands(self.frames_done),
-                group_thousands(self.frames_total)
-            ));
-            if self.render_fps > 0.0 {
-                let target_fps = s.video.as_ref().map(|v| v.fps).unwrap_or(25.0);
-                text.push_str(&format!(
-                    "   ·   {:.0} fps ({}× Echtzeit)",
-                    self.render_fps,
-                    format!("{:.1}", self.render_fps / target_fps).replace('.', ",")
-                ));
-            }
-        }
-        ui.text_left(&text, detail, theme::TEXT_2, FontKind::Mono12);
+    fn render_queue(&mut self, ui: &mut Ui, state: &mut AppState, services: &Services, area: Rect) {
+        let mut area = area.inset_xy(16.0, 12.0);
 
-        // Zeiten
-        let times = p.cut_top(18.0);
-        let elapsed = (ui.time - self.started_at).max(0.0);
-        let eta = match self.eta_sec {
-            Some(e) if e.is_finite() => format!("Verbleibend ca. {}", format_duration(e)),
-            _ => "Verbleibend wird berechnet …".to_string(),
+        // ---- Kopf: Zusammenfassung + Steuerung ----
+        let head = area.cut_top(28.0);
+        let mut h = head;
+        let total = state.render_queue.jobs.len();
+        let active = state.render_queue.active_count();
+        let summary = if total == 0 {
+            "Keine Jobs — über „Einstellungen“ einen Export hinzufügen.".to_string()
+        } else {
+            format!("{total} Job(s) · {active} aktiv")
         };
-        ui.text_left(
-            &format!("Verstrichen {}   ·   {}", format_duration(elapsed), eta),
-            times,
-            theme::TEXT_2,
-            FontKind::Mono12,
-        );
-        p.cut_top(16.0);
+        ui.text_left(&summary, h.cut_left(360.0), theme::TEXT_2, FontKind::Sans12);
 
-        // Abbrechen
-        let btn_row = p.cut_top(28.0);
-        let cancel = TextButton::new("Abbrechen").icon("ban").style(TextButtonStyle::Outline);
-        let cw = cancel.measure(ui);
-        if cancel
-            .show(ui, "export.cancelJob", Rect::new(btn_row.x, btn_row.y, cw, 28.0))
-            .clicked
+        // „Fertige entfernen“ rechts.
+        let clear = TextButton::new("Fertige entfernen").style(TextButtonStyle::Outline);
+        let cw = clear.measure(ui);
+        let has_finished = state.render_queue.jobs.iter().any(|j| j.state.is_finished());
+        if has_finished
+            && clear
+                .show(ui, "queue.clearDone", Rect::new(h.right() - cw, h.y, cw, 24.0))
+                .clicked
         {
-            if let Some(id) = &self.job_id {
-                services.cancel_job(id);
+            state.render_queue.clear_finished();
+        }
+        // Pause/Fortsetzen links daneben.
+        let paused = state.render_queue.paused;
+        let pause = TextButton::new(if paused { "Fortsetzen" } else { "Pausieren" })
+            .icon(if paused { "play" } else { "pause" })
+            .style(TextButtonStyle::Outline);
+        let pw = pause.measure(ui);
+        let pause_x = if has_finished { h.right() - cw - 8.0 - pw } else { h.right() - pw };
+        if !state.render_queue.jobs.is_empty()
+            && pause
+                .show(ui, "queue.pause", Rect::new(pause_x, h.y, pw, 24.0))
+                .clicked
+        {
+            state.render_queue.paused = !paused;
+        }
+        area.cut_top(8.0);
+
+        // ---- Job-Liste (scrollbar) ----
+        let row_h = 86.0;
+        let count = state.render_queue.jobs.len();
+        let content_h = (count as f32 * row_h).max(area.h);
+        let view = self.queue_scroll.begin(ui, area, 0.0, content_h);
+        let mut y = view.origin_y;
+        let now = ui.time;
+
+        // Aktionen sammeln und nach der Iteration anwenden (Borrow).
+        let mut action: Option<QueueRowAction> = None;
+        let ids: Vec<u64> = state.render_queue.jobs.iter().map(|j| j.id).collect();
+        for id in ids {
+            let row = Rect::new(view.viewport.x, y, view.viewport.w, row_h - 8.0);
+            y += row_h;
+            if let Some(a) = self.render_queue_row(ui, state, id, row, now) {
+                action = Some(a);
+            }
+        }
+        self.queue_scroll.end(ui, area, 0.0, content_h);
+
+        if let Some(a) = action {
+            match a {
+                QueueRowAction::Cancel(id) => {
+                    if let Some(svc) = state.render_queue.cancel(id, now) {
+                        services.cancel_job(&svc);
+                    }
+                }
+                QueueRowAction::Restart(id) => state.render_queue.restart(id),
+                QueueRowAction::Remove(id) => state.render_queue.remove(id),
+                QueueRowAction::Up(id) => state.render_queue.move_up(id),
+                QueueRowAction::Down(id) => state.render_queue.move_down(id),
+                QueueRowAction::Reveal(path) => {
+                    let _ = services.reveal_in_file_manager(&path);
+                }
             }
         }
     }
 
-    // ---------------------------------------------------------- Done/Failed
+    /// Eine Job-Zeile (Name, Status, Fortschritt, Aktionen). Liefert die
+    /// angeforderte Aktion (außerhalb der Borrow-Schleife angewandt).
+    fn render_queue_row(
+        &self,
+        ui: &mut Ui,
+        state: &AppState,
+        id: u64,
+        row: Rect,
+        now: f64,
+    ) -> Option<QueueRowAction> {
+        let job = state.render_queue.job(id)?;
+        ui.fill_rounded(row, theme::RADIUS_SM, theme::SURFACE_0);
+        ui.stroke_rounded(row, theme::RADIUS_SM, 1.0, theme::LINE);
+        let mut p = row.inset_xy(12.0, 8.0);
 
-    fn render_done(&mut self, ui: &mut Ui, state: &mut AppState, services: &Services, area: Rect) {
-        let panel = area.center_box(area.w - 120.0, 150.0);
-        let mut p = panel;
-        let mut head = p.cut_top(26.0);
-        let icon_cell = head.cut_left(22.0);
-        ui.icon("circle-check", icon_cell, 20.0, theme::SUCCESS);
-        head.cut_left(8.0);
-        ui.text_left("Export abgeschlossen", head, theme::SUCCESS, FontKind::Sans16Semibold);
-        p.cut_top(8.0);
+        // Kopfzeile: Statuspunkt + Name + Statuslabel rechts.
+        let mut head = p.cut_top(20.0);
+        let (dot, color) = match job.state {
+            JobState::Waiting => ("clock", theme::TEXT_3),
+            JobState::Running => ("loader-circle", theme::ACCENT),
+            JobState::Done => ("circle-check", theme::SUCCESS),
+            JobState::Failed => ("circle-alert", theme::DANGER),
+            JobState::Cancelled => ("ban", theme::TEXT_3),
+        };
+        let icon_cell = head.cut_left(16.0);
+        ui.icon(dot, icon_cell, 14.0, color);
+        head.cut_left(6.0);
+        let status_cell = head.cut_right(110.0);
+        ui.text_right(job.state.label(), status_cell, color, FontKind::Sans12Medium);
+        let name = ui.font(FontKind::Sans12Medium).ellipsize(&job.name, head.w);
+        ui.text_left(&name, head, theme::TEXT_1, FontKind::Sans12Medium);
 
-        let path_row = p.cut_top(20.0);
-        let mut line = self.finished_output.clone();
-        if let Ok(meta) = std::fs::metadata(&self.finished_output) {
-            line.push_str(&format!("  ({})", export::format_bytes(meta.len())));
-        }
-        let line = ui.font(FontKind::Mono12).ellipsize(&line, path_row.w);
-        ui.text_left(&line, path_row, theme::TEXT_2, FontKind::Mono12);
-        p.cut_top(16.0);
+        // Zusammenfassung.
+        let sum_row = p.cut_top(16.0);
+        let sum = ui.font(FontKind::Sans12).ellipsize(&job.summary, sum_row.w);
+        ui.text_left(&sum, sum_row, theme::TEXT_3, FontKind::Sans12);
 
-        let btn_row = p.cut_top(28.0);
-        let reveal = TextButton::new("Im Dateimanager zeigen")
-            .icon("folder-open")
-            .style(TextButtonStyle::Outline);
-        let rw = reveal.measure(ui);
-        if reveal
-            .show(ui, "export.reveal", Rect::new(btn_row.x, btn_row.y, rw, 28.0))
-            .clicked
-        {
-            let _ = services.reveal_in_file_manager(&self.finished_output);
+        // Fortschritt / Detailzeile.
+        let bar_row = p.cut_top(16.0);
+        if job.state == JobState::Running {
+            let mut bar = bar_row;
+            let pct_cell = bar.cut_right(44.0);
+            bar.cut_right(8.0);
+            // Phase links neben dem Balken (Audio mischen / Video rendern / …).
+            let phase_cell = bar.cut_left(150.0);
+            bar.cut_left(8.0);
+            ui.text_left(job.phase.label(), phase_cell, theme::TEXT_3, FontKind::Sans12);
+            let track = Rect::new(bar.x, bar.y + 5.0, bar.w, 6.0);
+            ui.fill_rounded(track, 3.0, theme::SURFACE_3);
+            let frac = (job.progress_pct / 100.0).clamp(0.0, 1.0) as f32;
+            if frac > 0.0 {
+                ui.fill_rounded(Rect::new(track.x, track.y, (track.w * frac).max(6.0), 6.0), 3.0, theme::ACCENT);
+            }
+            ui.text_right(&format!("{:.0} %", job.progress_pct), pct_cell, theme::TEXT_1, FontKind::Sans12Medium);
+        } else if job.state == JobState::Failed {
+            let mut msg = job.error.clone().unwrap_or_else(|| "Unbekannter Fehler".into());
+            // Hardware-Encoder-Fehler: auf den Software-Fallback hinweisen.
+            if job.settings.video.as_ref().is_some_and(|v| v.encoder.is_hardware()) {
+                msg = format!("{msg}  · Tipp: Software-Encoder wählen");
+            }
+            let msg = ui.font(FontKind::Mono12).ellipsize(&msg, bar_row.w);
+            ui.text_left(&msg, bar_row, theme::DANGER, FontKind::Mono12);
+        } else {
+            let detail = match job.state {
+                JobState::Done => {
+                    let mut t = format!("Fertig in {}", format_duration(job.elapsed(now)));
+                    if let Ok(meta) = std::fs::metadata(&job.output) {
+                        t.push_str(&format!("  ·  {}", export::format_bytes(meta.len())));
+                    }
+                    t
+                }
+                JobState::Waiting => "Wartet auf einen freien Render-Slot …".to_string(),
+                _ => String::new(),
+            };
+            ui.text_left(&detail, bar_row, theme::TEXT_3, FontKind::Sans12);
         }
-        let close_rect = Rect::new(btn_row.x + rw + 8.0, btn_row.y, 110.0, 28.0);
-        if primary_button(ui, "export.doneClose", close_rect, "Schließen", true).clicked {
-            self.stage = Stage::Settings;
-            self.dirty = true;
-            state.app.open_dialog = None;
+
+        // Aktionszeile (rechtsbündig).
+        let btn_row = p.cut_top(20.0);
+        let mut bx = btn_row.right();
+        let mut act: Option<QueueRowAction> = None;
+        let icon_btn = |ui: &mut Ui, key: &'static str, icon: &str, tip: &str, bx: &mut f32| -> bool {
+            *bx -= 26.0;
+            let r = Rect::new(*bx, btn_row.y - 2.0, 24.0, 24.0);
+            IconButton::new(icon)
+                .tooltip(tip)
+                .show(ui, ("queue", id, key), r)
+                .clicked
+        };
+        match job.state {
+            JobState::Running => {
+                if icon_btn(ui, "cancel", "ban", "Abbrechen", &mut bx) {
+                    act = Some(QueueRowAction::Cancel(id));
+                }
+            }
+            JobState::Waiting => {
+                if icon_btn(ui, "cancel", "x", "Aus Warteschlange entfernen", &mut bx) {
+                    act = Some(QueueRowAction::Cancel(id));
+                }
+                if icon_btn(ui, "down", "chevron-down", "Nach unten", &mut bx) {
+                    act = Some(QueueRowAction::Down(id));
+                }
+                if icon_btn(ui, "up", "chevron-up", "Nach oben", &mut bx) {
+                    act = Some(QueueRowAction::Up(id));
+                }
+            }
+            JobState::Done => {
+                if icon_btn(ui, "remove", "trash-2", "Aus Liste entfernen", &mut bx) {
+                    act = Some(QueueRowAction::Remove(id));
+                }
+                if icon_btn(ui, "reveal", "folder-open", "Im Dateimanager zeigen", &mut bx) {
+                    act = Some(QueueRowAction::Reveal(job.output.clone()));
+                }
+                if icon_btn(ui, "restart", "rotate-ccw", "Erneut rendern", &mut bx) {
+                    act = Some(QueueRowAction::Restart(id));
+                }
+            }
+            JobState::Failed | JobState::Cancelled => {
+                if icon_btn(ui, "remove", "trash-2", "Aus Liste entfernen", &mut bx) {
+                    act = Some(QueueRowAction::Remove(id));
+                }
+                if icon_btn(ui, "restart", "rotate-ccw", "Erneut versuchen", &mut bx) {
+                    act = Some(QueueRowAction::Restart(id));
+                }
+            }
         }
+        act
     }
+}
 
-    fn render_failed(&mut self, ui: &mut Ui, area: Rect) {
-        let panel = area.center_box(area.w - 120.0, 220.0);
-        let mut p = panel;
-        let mut head = p.cut_top(26.0);
-        let icon_cell = head.cut_left(22.0);
-        ui.icon("circle-alert", icon_cell, 20.0, theme::DANGER);
-        head.cut_left(8.0);
-        ui.text_left("Export fehlgeschlagen", head, theme::DANGER, FontKind::Sans16Semibold);
-        p.cut_top(8.0);
-
-        let msg = self
-            .error
-            .clone()
-            .unwrap_or_else(|| "Unbekannter Fehler".to_string());
-        let box_rect = p.cut_top(96.0);
-        ui.fill_rounded(box_rect, theme::RADIUS_SM, theme::SURFACE_0);
-        ui.stroke_rounded(box_rect, theme::RADIUS_SM, 1.0, theme::with_alpha(theme::DANGER, 120));
-        let mut text_area = box_rect.inset_xy(10.0, 6.0);
-        for line in msg.lines().take(5) {
-            let row = text_area.cut_top(17.0);
-            let line = ui.font(FontKind::Mono12).ellipsize(line, row.w);
-            ui.text_left(&line, row, theme::TEXT_1, FontKind::Mono12);
-        }
-        p.cut_top(14.0);
-
-        let btn_row = p.cut_top(28.0);
-        let back_rect = Rect::new(btn_row.x, btn_row.y, 220.0, 28.0);
-        if primary_button(ui, "export.backToSettings", back_rect, "Zurück zu den Einstellungen", true)
-            .clicked
-        {
-            self.stage = Stage::Settings;
-            self.dirty = true;
-        }
-    }
+/// Aktion einer Warteschlangen-Zeile (außerhalb der Borrow-Schleife angewandt).
+enum QueueRowAction {
+    Cancel(u64),
+    Restart(u64),
+    Remove(u64),
+    Up(u64),
+    Down(u64),
+    Reveal(String),
 }
 
 // ------------------------------------------------------------ UI-Bausteine
@@ -1311,6 +1558,7 @@ fn make_video(codec_id: &str, width: u32, height: u32, fps: f64) -> VideoSetting
     };
     VideoSettings {
         codec,
+        encoder: &codec.encoders[0],
         width,
         height,
         fps,
@@ -1321,6 +1569,7 @@ fn make_video(codec_id: &str, width: u32, height: u32, fps: f64) -> VideoSetting
             "dnxhr" => 2,  // HQ
             _ => 0,
         },
+        tenbit: false,
     }
 }
 
@@ -1363,6 +1612,31 @@ fn replace_extension(path: &str, ext: &str) -> String {
 fn parse_mbits(text: &str) -> u32 {
     let v: f64 = text.trim().replace(',', ".").parse().unwrap_or(0.0);
     (v * 1000.0).round().max(0.0) as u32
+}
+
+/// Kompakte Job-Beschreibung für die Warteschlange (Container · Codec ·
+/// Auflösung · Dauer · Bereich).
+fn settings_summary(s: &ExportSettings, plan: &export::RenderPlan) -> String {
+    let mut parts: Vec<String> = vec![s.container.label.to_string()];
+    if let Some(v) = &s.video {
+        if s.container.image_sequence {
+            parts.push(format!("{}×{}", v.width, v.height));
+        } else {
+            parts.push(format!("{} · {}×{} @ {} fps", v.encoder.label, v.width, v.height, format_fps(v.fps)));
+        }
+    }
+    if let Some(a) = &s.audio {
+        parts.push(a.codec.label.to_string());
+    }
+    parts.push(format!(
+        "{} ({} Frames)",
+        format_duration(plan.duration),
+        group_thousands(plan.total_frames)
+    ));
+    if s.use_in_out {
+        parts.push("In/Out".to_string());
+    }
+    parts.join("  ·  ")
 }
 
 fn format_fps(fps: f64) -> String {

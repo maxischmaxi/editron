@@ -20,7 +20,6 @@ use crate::ui::widgets::text_input::TextInputState;
 use crate::ui::widgets::{slider, IconButton};
 use crate::ui::{FontKind, Ui};
 use raylib::consts::MouseCursor;
-use raylib::prelude::RaylibDraw;
 
 const ROW_H: f32 = 26.0;
 const SECTION_H: f32 = 32.0;
@@ -319,7 +318,7 @@ impl ColorPanel {
             let a0 = s as f32 / segments as f32 * 360.0;
             let a1 = (s + 1) as f32 / segments as f32 * 360.0;
             let color = raylib::color::Color::color_from_hsv(a0, 0.85, 0.9);
-            ui.d.draw_circle_sector(
+            ui.circle_sector(
                 v2(cx, cy),
                 radius,
                 a0,
@@ -329,7 +328,7 @@ impl ColorPanel {
             );
         }
         let inner_r = radius - 5.0;
-        ui.d.draw_circle_v(v2(cx, cy), inner_r, theme::SURFACE_2);
+        ui.circle(v2(cx, cy), inner_r, theme::SURFACE_2);
 
         // ---- Interaktion im Rad ----
         let hit = Rect::new(cx - radius, cy - radius, radius * 2.0, radius * 2.0);
@@ -359,15 +358,15 @@ impl ColorPanel {
         // ---- Marker (Fadenkreuz + Punkt an der Offset-Position) ----
         let mx = cx + (value.x as f32) * inner_r;
         let my = cy + (value.y as f32) * inner_r;
-        ui.d.draw_line_v(v2(cx - inner_r, cy), v2(cx + inner_r, cy), theme::with_alpha(theme::LINE_STRONG, 120));
-        ui.d.draw_line_v(v2(cx, cy - inner_r), v2(cx, cy + inner_r), theme::with_alpha(theme::LINE_STRONG, 120));
+        ui.line_thin(v2(cx - inner_r, cy), v2(cx + inner_r, cy), theme::with_alpha(theme::LINE_STRONG, 120));
+        ui.line_thin(v2(cx, cy - inner_r), v2(cx, cy + inner_r), theme::with_alpha(theme::LINE_STRONG, 120));
         let active = value.x != 0.0 || value.y != 0.0;
-        ui.d.draw_circle_v(
+        ui.circle(
             v2(mx, my),
             3.5,
             if active { theme::WHITE } else { theme::TEXT_2 },
         );
-        ui.d.draw_circle_lines(mx as i32, my as i32, 4.5, theme::SURFACE_0);
+        ui.circle_outline(v2(mx, my), 4.5, theme::SURFACE_0);
 
         // ---- Luma-Regler (vertikal, links vom Rad) ----
         let track_h = radius * 2.0 - 4.0;

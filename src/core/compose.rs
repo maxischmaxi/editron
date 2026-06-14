@@ -238,15 +238,19 @@ pub fn mask_to_pixels(
 }
 
 // ------------------------------------------------------- CPU-Compositing
-// Software-Renderer für den Export: Layer (RGBA-Puffer, die das volle Frame
-// in Decode-Auflösung repräsentieren — transparent gepolstert) werden per
-// inverser Abbildung (Rotation/Skalierung/Translation) bilinear gesampelt
-// und mit Src-over-Alpha auf das Canvas gemischt.
+// Software-Renderer für den Export: Layer (f32-RGBA-Puffer 0..1, die das volle
+// Frame in Decode-Auflösung repräsentieren — transparent gepolstert) werden per
+// inverser Abbildung (Rotation/Skalierung/Translation) bilinear gesampelt und
+// mit Src-over-Alpha auf das Canvas gemischt. Die gesamte Kette rechnet in f32
+// (display-referred Gamma, siehe `core/pixbuf.rs`) — quantisiert wird erst beim
+// Schreiben in die Encoder-Pipe (mit Dithering). So entsteht kein Banding mehr
+// auf 10-Bit-Verläufen, und der Look (Gamma-Blending) bleibt identisch.
 
 /// Ein zu komponierender Layer-Frame.
 pub struct CpuLayerFrame<'a> {
-    /// RGBA, `w`×`h`; repräsentiert das volle Zielframe (ggf. höher aufgelöst).
-    pub data: &'a [u8],
+    /// f32-RGBA 0..1, `w`×`h`; repräsentiert das volle Zielframe (ggf. höher
+    /// aufgelöst).
+    pub data: &'a [f32],
     pub w: usize,
     pub h: usize,
     pub quad: LayerQuad,
@@ -257,10 +261,10 @@ pub struct CpuLayerFrame<'a> {
     pub mask: Option<(usize, usize, usize, usize)>,
 }
 
-/// Alle Layer (unten → oben) auf ein opakes Canvas mischen; Zeilenbänder
+/// Alle Layer (unten → oben) auf ein opakes f32-Canvas mischen; Zeilenbänder
 /// laufen parallel auf `threads` Threads.
 pub fn composite_frame(
-    canvas: &mut [u8],
+    canvas: &mut [f32],
     w: usize,
     h: usize,
     layers: &[CpuLayerFrame],
@@ -283,7 +287,7 @@ pub fn composite_frame(
 }
 
 /// Einen Layer auf ein Zeilenband mischen (`band` beginnt bei Canvas-Zeile `y0`).
-fn composite_band(band: &mut [u8], w: usize, y0: usize, rows: usize, layer: &CpuLayerFrame) {
+fn composite_band(band: &mut [f32], w: usize, y0: usize, rows: usize, layer: &CpuLayerFrame) {
     if layer.opacity <= 0.0 || layer.quad.w <= 0.0 || layer.quad.h <= 0.0 {
         return;
     }
@@ -343,23 +347,173 @@ fn composite_band(band: &mut [u8], w: usize, y0: usize, rows: usize, layer: &Cpu
             let p11 = &layer.data[(iy1 * layer.w + ix1) * 4..(iy1 * layer.w + ix1) * 4 + 4];
             let mut sample = [0f32; 4];
             for c in 0..4 {
-                let top = p00[c] as f32 * (1.0 - tx) + p10[c] as f32 * tx;
-                let bot = p01[c] as f32 * (1.0 - tx) + p11[c] as f32 * tx;
+                let top = p00[c] * (1.0 - tx) + p10[c] * tx;
+                let bot = p01[c] * (1.0 - tx) + p11[c] * tx;
                 sample[c] = top * (1.0 - ty) + bot * ty;
             }
-            let alpha = sample[3] / 255.0 * opacity;
+            // Sample-Alpha ist bereits 0..1 (f32-Pipeline).
+            let alpha = sample[3] * opacity;
             if alpha <= 0.0 {
                 continue;
             }
             let dst = &mut row[x * 4..x * 4 + 4];
             for c in 0..3 {
-                let blended = sample[c] * alpha + dst[c] as f32 * (1.0 - alpha);
-                dst[c] = blended.round().clamp(0.0, 255.0) as u8;
+                dst[c] = sample[c] * alpha + dst[c] * (1.0 - alpha);
             }
             // Canvas bleibt opak (Hintergrund ist deckend schwarz).
-            dst[3] = 255;
+            dst[3] = 1.0;
         }
     }
+}
+
+// ----------------------------------------------------------- Nesting
+// Verschachtelte Sequenzen werden rekursiv aufgelöst: Eine Nest-Clip-Ebene
+// IST das (auf opakem Schwarz) komponierte Frame der inneren Sequenz an der
+// inneren Sequenzzeit `clip.media_time_at(t)`, auf das anschließend die
+// äußeren Clip-Parameter (Transform/Deckkraft/Übergang) wirken. Player und
+// Export teilen sich `composite_sequence_frame`, damit Vorschau und Export
+// pixelgleich sind.
+
+/// Auflösung verschachtelter Sequenzen für den rekursiven Compositor:
+/// liefert die Timeline einer (auch nicht-aktiven) Sequenz.
+pub trait NestResolver {
+    fn nested_timeline(&self, seq_id: &str) -> Option<&TimelineStore>;
+}
+
+/// Sicherheitsnetz gegen pathologische Tiefen (das Modell ist azyklisch).
+pub const MAX_NEST_DEPTH: usize = 16;
+
+/// Innere Sequenzzeit eines Nest-Clips zur äußeren Sequenzzeit `t`
+/// (speed-/rückwärts-/standbild-bewusst — dieselbe Abbildung wie für Medien).
+pub fn nest_inner_time(clip: &TimelineClip, t: f64) -> f64 {
+    clip.media_time_at(t).max(0.0)
+}
+
+/// Rekursive CPU-Komposition eines Sequenz-Frames (opakes RGBA, w×h). Player
+/// und Export teilen sich diese Funktion, damit Vorschau und Export
+/// pixelgleich sind. `fetch_leaf(clip, media_t, w, h)` liefert das volle
+/// Zielframe eines BLATT-Clips (Medien contain-fit + transparent gepolstert
+/// bzw. Titel-Raster, w×h); gibt es None zurück, wird die Ebene übersprungen.
+/// Nest-Clips löst der `resolver` rekursiv auf.
+pub fn composite_sequence_frame(
+    timeline: &TimelineStore,
+    resolver: &dyn NestResolver,
+    t: f64,
+    w: usize,
+    h: usize,
+    threads: usize,
+    fetch_leaf: &mut dyn FnMut(&TimelineClip, f64, usize, usize) -> Option<Vec<f32>>,
+    depth: usize,
+) -> Vec<f32> {
+    // Opak-schwarzes f32-Canvas (wie überall in der Sequenz-Komposition).
+    let mut canvas = vec![0f32; w * h * 4];
+    for px in canvas.chunks_exact_mut(4) {
+        px[3] = 1.0;
+    }
+    if depth >= MAX_NEST_DEPTH {
+        return canvas;
+    }
+
+    let layers = visible_program_layers(timeline, t);
+    // Layer-Puffer am Leben halten und am Ende in einem Rutsch komponieren.
+    let mut buffers: Vec<Vec<f32>> = Vec::new();
+    // (quad, opacity, mask, layer_w, layer_h)
+    type Meta = (LayerQuad, f64, Option<(usize, usize, usize, usize)>, usize, usize);
+    let mut metas: Vec<Meta> = Vec::new();
+
+    for layer in &layers {
+        match layer {
+            ProgramLayer::Solid { white, alpha } => {
+                if *alpha <= 0.0 {
+                    continue;
+                }
+                let c = if *white { 1.0f32 } else { 0.0f32 };
+                // 2×2 uniforme Fläche (bilinear = konstant), full-frame-Quad.
+                buffers.push(vec![
+                    c, c, c, 1.0, c, c, c, 1.0, c, c, c, 1.0, c, c, c, 1.0,
+                ]);
+                metas.push((
+                    LayerQuad {
+                        cx: w as f64 / 2.0,
+                        cy: h as f64 / 2.0,
+                        w: w as f64,
+                        h: h as f64,
+                        rot_deg: 0.0,
+                    },
+                    *alpha,
+                    None,
+                    2,
+                    2,
+                ));
+            }
+            ProgramLayer::Clip { clip, t_fx } => {
+                let media_t = clip_media_time(clip, t);
+                let fx = eval_fx(&clip.fx, media_t);
+                let opacity = fx.opacity * t_fx.opacity;
+                if opacity <= 0.0 {
+                    continue;
+                }
+                let data = if let Some(inner_id) = clip.nest_seq.as_deref() {
+                    let Some(inner) = resolver.nested_timeline(inner_id) else {
+                        continue;
+                    };
+                    composite_sequence_frame(
+                        inner,
+                        resolver,
+                        nest_inner_time(clip, t),
+                        w,
+                        h,
+                        threads,
+                        fetch_leaf,
+                        depth + 1,
+                    )
+                } else if let Some(mc) = &clip.multicam {
+                    // Multicam: aktiven Winkel auflösen und wie ein ganz normales
+                    // Blatt holen (Asset = Winkel-Asset, Medienzeit = τ − pos).
+                    let Some(angle) = resolver
+                        .nested_timeline(&mc.source)
+                        .and_then(|t| t.multicam.as_ref())
+                        .and_then(|s| s.angle(mc.angle))
+                    else {
+                        continue;
+                    };
+                    let mut leaf = (*clip).clone();
+                    leaf.multicam = None;
+                    leaf.asset_id = angle.asset_id.clone();
+                    let amt = (media_t - angle.pos).max(0.0);
+                    match fetch_leaf(&leaf, amt, w, h) {
+                        Some(d) if d.len() == w * h * 4 => d,
+                        _ => continue,
+                    }
+                } else {
+                    match fetch_leaf(clip, media_t, w, h) {
+                        Some(d) if d.len() == w * h * 4 => d,
+                        _ => continue,
+                    }
+                };
+                let mut quad = layer_quad(w as f64, h as f64, w as f64, h as f64, &fx);
+                apply_transition_to_quad(&mut quad, t_fx, w as f64, h as f64);
+                let mask = t_fx.mask.map(|m| mask_to_pixels(&m, w, h));
+                buffers.push(data);
+                metas.push((quad, opacity, mask, w, h));
+            }
+        }
+    }
+
+    let frames: Vec<CpuLayerFrame> = metas
+        .iter()
+        .enumerate()
+        .map(|(i, (quad, opacity, mask, lw, lh))| CpuLayerFrame {
+            data: &buffers[i],
+            w: *lw,
+            h: *lh,
+            quad: *quad,
+            opacity: *opacity,
+            mask: *mask,
+        })
+        .collect();
+    composite_frame(&mut canvas, w, h, &frames, threads);
+    canvas
 }
 
 /// Maximale visuelle Skalierung (X/Y, in %→Faktor) im Medienzeit-Fenster —
@@ -385,6 +539,116 @@ pub fn max_scale_in_window(fx: &ClipFx, t0: f64, t1: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::core::animation::AnimatedParam;
+    use crate::core::timeline::{TimelineStore, TrackKind};
+    use std::collections::HashMap;
+
+    /// Test-Resolver: Sequenz-ID → Timeline.
+    struct MapResolver<'a>(HashMap<String, &'a TimelineStore>);
+    impl NestResolver for MapResolver<'_> {
+        fn nested_timeline(&self, id: &str) -> Option<&TimelineStore> {
+            self.0.get(id).copied()
+        }
+    }
+
+    /// Einen Medien-Clip (asset_id = `tag`) auf der ersten Videospur einsetzen.
+    fn add_media_clip(tl: &mut TimelineStore, tag: &str, start: f64, dur: f64, src_in: f64) {
+        let track = tl.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().id.clone();
+        let mut c = crate::core::timeline::test_clip(&track);
+        c.asset_id = tag.to_string();
+        c.start = start;
+        c.duration = dur;
+        c.src_in = src_in;
+        c.src_duration = 1000.0;
+        tl.clips.push(c);
+    }
+
+    /// Blatt-Fetcher: füllt das Frame mit einer Farbe, die von `asset_id`
+    /// (R) und der gerundeten Medienzeit (G) abhängt — so lässt sich die
+    /// Frame-Zuordnung im komponierten Pixel ablesen (als f32-Marker, nicht
+    /// /255 normiert; bei Deckkraft 1 erscheint der Wert exakt im Canvas).
+    fn tag_fetch(clip: &TimelineClip, media_t: f64, w: usize, h: usize) -> Option<Vec<f32>> {
+        let r = clip.asset_id.bytes().next().unwrap_or(0) as f32;
+        let g = (media_t.round() as i64).clamp(0, 255) as f32;
+        Some(vec![[r, g, 0.0, 1.0]; w * h].concat())
+    }
+
+    #[test]
+    fn nested_sequence_composites_inner_frame_at_mapped_time() {
+        // Innere Sequenz: ein Clip „A" ab 0 s, src_in 0 (Medienzeit = t).
+        let mut inner = TimelineStore::default();
+        add_media_clip(&mut inner, "A", 0.0, 20.0, 0.0);
+        let inner_id = "inner".to_string();
+
+        // Äußere Sequenz: ein Nest-Clip auf die innere ab 3 s, src_in 5 s.
+        // Damit ist innere Sequenzzeit = 5 + (t - 3) (speed 1, vorwärts).
+        let mut outer = TimelineStore::default();
+        let track = outer.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().id.clone();
+        let mut nest = crate::core::timeline::test_clip(&track);
+        nest.asset_id = String::new();
+        nest.nest_seq = Some(inner_id.clone());
+        nest.start = 3.0;
+        nest.duration = 10.0;
+        nest.src_in = 5.0;
+        nest.src_duration = 20.0;
+        outer.clips.push(nest);
+
+        let resolver = MapResolver(HashMap::from([(inner_id.clone(), &inner)]));
+        let (w, h) = (4usize, 4usize);
+
+        // Äußere Zeit t = 7 → innere Sequenzzeit 5 + (7-3) = 9 → innerer Clip A
+        // bei Medienzeit 9.
+        let mut fetch = tag_fetch;
+        let frame = composite_sequence_frame(&outer, &resolver, 7.0, w, h, 2, &mut fetch, 0);
+        let center = (h / 2 * w + w / 2) * 4;
+        assert_eq!(frame[center], b'A' as f32, "innerer Clip A sichtbar");
+        assert_eq!(frame[center + 1], 9.0, "Frame-Zuordnung: Medienzeit 9");
+
+        // Außerhalb des Nest-Bereichs (t < 3) ist die äußere Sequenz leer →
+        // opakes Schwarz.
+        let empty = composite_sequence_frame(&outer, &resolver, 1.0, w, h, 1, &mut fetch, 0);
+        assert_eq!(&empty[center..center + 4], &[0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn doubly_nested_sequences_resolve_recursively() {
+        // C enthält Clip „Z"; B nestet C; A nestet B. Verifiziert transitive
+        // Auflösung (zwei Ebenen).
+        let mut c = TimelineStore::default();
+        add_media_clip(&mut c, "Z", 0.0, 50.0, 0.0);
+
+        let mut b = TimelineStore::default();
+        {
+            let track = b.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().id.clone();
+            let mut nest = crate::core::timeline::test_clip(&track);
+            nest.asset_id = String::new();
+            nest.nest_seq = Some("C".into());
+            nest.start = 0.0;
+            nest.duration = 50.0;
+            nest.src_in = 0.0;
+            nest.src_duration = 50.0;
+            b.clips.push(nest);
+        }
+        let mut a = TimelineStore::default();
+        {
+            let track = a.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().id.clone();
+            let mut nest = crate::core::timeline::test_clip(&track);
+            nest.asset_id = String::new();
+            nest.nest_seq = Some("B".into());
+            nest.start = 0.0;
+            nest.duration = 50.0;
+            nest.src_in = 10.0; // 10 s in B hinein
+            nest.src_duration = 50.0;
+            a.clips.push(nest);
+        }
+        let resolver = MapResolver(HashMap::from([("B".to_string(), &b), ("C".to_string(), &c)]));
+        let (w, h) = (4usize, 4usize);
+        let mut fetch = tag_fetch;
+        // t=2 in A → 12 in B → 12 in C → Clip Z bei Medienzeit 12.
+        let frame = composite_sequence_frame(&a, &resolver, 2.0, w, h, 1, &mut fetch, 0);
+        let center = (h / 2 * w + w / 2) * 4;
+        assert_eq!(frame[center], b'Z' as f32);
+        assert_eq!(frame[center + 1], 12.0, "zwei Ebenen Frame-Zuordnung");
+    }
 
     #[test]
     fn identity_quad_is_contain_fit() {
@@ -422,16 +686,16 @@ mod tests {
         assert_eq!(e.scale_y, 50.0);
     }
 
-    /// Opakes Canvas (schwarz) bauen.
-    fn black_canvas(w: usize, h: usize) -> Vec<u8> {
-        let mut c = vec![0u8; w * h * 4];
+    /// Opakes Canvas (schwarz) bauen (f32-RGBA 0..1).
+    fn black_canvas(w: usize, h: usize) -> Vec<f32> {
+        let mut c = vec![0f32; w * h * 4];
         for px in c.chunks_exact_mut(4) {
-            px[3] = 255;
+            px[3] = 1.0;
         }
         c
     }
 
-    fn px(canvas: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
+    fn px(canvas: &[f32], w: usize, x: usize, y: usize) -> [f32; 4] {
         let i = (y * w + x) * 4;
         [canvas[i], canvas[i + 1], canvas[i + 2], canvas[i + 3]]
     }
@@ -442,7 +706,7 @@ mod tests {
         // und zentriert → Mitte rot, Ecken schwarz.
         let (w, h) = (8usize, 8usize);
         let mut canvas = black_canvas(w, h);
-        let red: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255])
+        let red: Vec<f32> = std::iter::repeat([1.0f32, 0.0, 0.0, 1.0])
             .take(w * h)
             .flatten()
             .collect();
@@ -462,16 +726,16 @@ mod tests {
             &[CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0, mask: None }],
             2,
         );
-        assert_eq!(px(&canvas, w, 4, 4)[0], 255, "Mitte muss rot sein");
-        assert_eq!(px(&canvas, w, 0, 0), [0, 0, 0, 255], "Ecke bleibt schwarz");
-        assert_eq!(px(&canvas, w, 7, 7), [0, 0, 0, 255]);
+        assert_eq!(px(&canvas, w, 4, 4)[0], 1.0, "Mitte muss rot sein");
+        assert_eq!(px(&canvas, w, 0, 0), [0.0, 0.0, 0.0, 1.0], "Ecke bleibt schwarz");
+        assert_eq!(px(&canvas, w, 7, 7), [0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]
     fn composite_applies_opacity_blend() {
         let (w, h) = (4usize, 4usize);
         let mut canvas = black_canvas(w, h);
-        let white: Vec<u8> = std::iter::repeat([255u8; 4]).take(w * h).flatten().collect();
+        let white: Vec<f32> = std::iter::repeat([1.0f32; 4]).take(w * h).flatten().collect();
         let fx = eval_fx(&ClipFx::default(), 0.0);
         let quad = layer_quad(w as f64, h as f64, w as f64, h as f64, &fx);
         composite_frame(
@@ -482,8 +746,8 @@ mod tests {
             1,
         );
         let p = px(&canvas, w, 2, 2);
-        assert!((p[0] as i32 - 128).abs() <= 2, "50 % Weiß auf Schwarz ≈ 128: {p:?}");
-        assert_eq!(p[3], 255);
+        assert!((p[0] - 0.5).abs() <= 0.01, "50 % Weiß auf Schwarz ≈ 0,5: {p:?}");
+        assert_eq!(p[3], 1.0);
     }
 
     #[test]
@@ -491,7 +755,7 @@ mod tests {
         // Wipe-Halbzeit: weißer Layer nur in der linken Hälfte sichtbar.
         let (w, h) = (4usize, 4usize);
         let mut canvas = black_canvas(w, h);
-        let white: Vec<u8> = std::iter::repeat([255u8; 4]).take(w * h).flatten().collect();
+        let white: Vec<f32> = std::iter::repeat([1.0f32; 4]).take(w * h).flatten().collect();
         let fx = eval_fx(&ClipFx::default(), 0.0);
         let quad = layer_quad(w as f64, h as f64, w as f64, h as f64, &fx);
         let mask = mask_to_pixels(&[0.0, 0.0, 0.5, 1.0], w, h);
@@ -502,16 +766,16 @@ mod tests {
             &[CpuLayerFrame { data: &white, w, h, quad, opacity: 1.0, mask: Some(mask) }],
             1,
         );
-        assert_eq!(px(&canvas, w, 1, 2)[0], 255, "links sichtbar");
-        assert_eq!(px(&canvas, w, 2, 2), [0, 0, 0, 255], "rechts maskiert");
+        assert_eq!(px(&canvas, w, 1, 2)[0], 1.0, "links sichtbar");
+        assert_eq!(px(&canvas, w, 2, 2), [0.0, 0.0, 0.0, 1.0], "rechts maskiert");
     }
 
     #[test]
     fn composite_respects_layer_order() {
         let (w, h) = (4usize, 4usize);
         let mut canvas = black_canvas(w, h);
-        let red: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255]).take(w * h).flatten().collect();
-        let green: Vec<u8> = std::iter::repeat([0u8, 255, 0, 255]).take(w * h).flatten().collect();
+        let red: Vec<f32> = std::iter::repeat([1.0f32, 0.0, 0.0, 1.0]).take(w * h).flatten().collect();
+        let green: Vec<f32> = std::iter::repeat([0.0f32, 1.0, 0.0, 1.0]).take(w * h).flatten().collect();
         let fx = eval_fx(&ClipFx::default(), 0.0);
         let quad = layer_quad(w as f64, h as f64, w as f64, h as f64, &fx);
         composite_frame(
@@ -524,7 +788,7 @@ mod tests {
             ],
             1,
         );
-        assert_eq!(px(&canvas, w, 1, 1)[1], 255, "oberer Layer (grün) gewinnt");
+        assert_eq!(px(&canvas, w, 1, 1)[1], 1.0, "oberer Layer (grün) gewinnt");
     }
 
     #[test]

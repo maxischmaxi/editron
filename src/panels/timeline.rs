@@ -31,10 +31,10 @@ use crate::ui::widgets::IconButton;
 use crate::ui::{DragPayload, FontKind, Ui};
 use raylib::consts::MouseCursor;
 use raylib::math::Vector2;
-use raylib::prelude::RaylibDraw;
 
 const TRACK_HEADER_W: f32 = 144.0; // Platz für Patch-Chip + Target + Toggles
 const TOOLBAR_W: f32 = 36.0; // w-9
+const TABS_H: f32 = 28.0; // h-7 — Sequenz-Tab-Leiste (über der Kopfzeile)
 const HEADER_H: f32 = 36.0; // h-9
 const RULER_H: f32 = 28.0; // h-7
 const VIDEO_H: f32 = 48.0; // h-12
@@ -151,6 +151,19 @@ pub struct TimelinePanel {
     /// Audio-Spuren, deren Gummiband Pan statt Lautstärke bearbeitet (Vol/Pan-
     /// Umschalter im Lane-Eck).
     auto_pan: HashSet<String>,
+    /// Inline-Umbenennen eines Sequenz-Tabs (Eingabezustand; das Ziel steht in
+    /// `app.app.rename_sequence`).
+    tab_rename: Option<TextInputState>,
+    /// Laufendes Verschieben eines Sequenz-Tabs (Reihenfolge per Drag).
+    tab_drag: Option<TabDrag>,
+}
+
+/// Laufendes Ziehen eines Sequenz-Tabs (Reihenfolge umsortieren).
+struct TabDrag {
+    id: String,
+    origin_x: f32,
+    /// Erst nach kleiner Bewegung „echter“ Drag (sonst bleibt es ein Klick).
+    moved: bool,
 }
 
 /// Laufendes Ziehen eines Automations-Punkts auf einer Audiospur.
@@ -181,6 +194,8 @@ impl Default for TimelinePanel {
             trans_editor: None,
             auto_drag: None,
             auto_pan: HashSet::new(),
+            tab_rename: None,
+            tab_drag: None,
         }
     }
 }
@@ -435,6 +450,10 @@ impl Panel for TimelinePanel {
             }
             ty += 28.0 + 4.0; // gap-1
         }
+
+        // ---------------- Sequenz-Tabs (über der Kopfzeile, wie Premiere) ----
+        let tabbar = area.cut_top(TABS_H);
+        self.render_sequence_tabs(ui, app, tabbar);
 
         // ---------------- Kopfzeile (h-9: Timecode + Snapping/Zoom) ---------
         let header = area.cut_top(HEADER_H);
@@ -969,7 +988,7 @@ impl Panel for TimelinePanel {
                 theme::ACCENT,
             );
             let tri_y = viewport.y - scroll_y;
-            ui.d.draw_triangle(
+            ui.triangle(
                 v2(ph_x - 3.5, tri_y),
                 v2(ph_x + 4.5, tri_y),
                 v2(ph_x + 0.5, tri_y + 6.0),
@@ -1098,7 +1117,10 @@ impl TimelinePanel {
                     }
                     Some(_) => {}
                     None => {
-                        services.request_waveform(&asset.id, &asset.path, 1200);
+                        // Im Proxy-Modus aus der Proxy-Datei extrahieren (Audio
+                        // durchgereicht; spart das Seeken im großen Original).
+                        let src = asset.decode_path(app.media.use_proxies);
+                        services.request_waveform(&asset.id, src, 1200);
                     }
                 }
             }
@@ -1106,19 +1128,18 @@ impl TimelinePanel {
             // Thumbnail links (h-full w-auto, opacity-50)
             if rect.w > 48.0 {
                 if let Some(thumb) = &asset.thumbnail_path {
-                    if let Some(tex) = ui.textures.get(thumb) {
-                        let tw = tex.width as f32 / tex.height as f32 * rect.h;
+                    // Erst die Texturmaße (fordert die Texture bei Bedarf an),
+                    // dann zentral skaliert über `draw_texture_in` zeichnen.
+                    if let Some((tw_px, th_px)) = ui.texture_size(thumb) {
+                        let tw = tw_px / th_px * rect.h;
                         let dest = Rect::new(rect.x, rect.y, tw, rect.h);
-                        ui.d.draw_texture_pro(
-                            tex,
-                            Rect::new(0.0, 0.0, tex.width as f32, tex.height as f32),
+                        let src = Rect::new(0.0, 0.0, tw_px, th_px);
+                        ui.draw_texture_in(
+                            thumb,
+                            src,
                             dest,
-                            v2(0.0, 0.0),
-                            0.0,
                             raylib::color::Color::new(255, 255, 255, 128_u8.min(alpha)),
                         );
-                    } else {
-                        ui.texture_requests.push(thumb.clone());
                     }
                 }
             }
@@ -1175,7 +1196,7 @@ impl TimelinePanel {
         // Keyframe-Badge: Clip trägt animierte Parameter (Raute = 0°-Poly).
         if clip.fx.any_animated() || clip.effects.iter().any(|e| e.any_animated()) {
             let ic = inner.cut_left(10.0);
-            ui.d.draw_poly(
+            ui.poly(
                 crate::ui::geom::v2(ic.x + 5.0, ic.y + 8.0),
                 4,
                 4.0,
@@ -1240,7 +1261,7 @@ impl TimelinePanel {
                 let x = rect.x + frac * rect.w;
                 let col = theme::with_alpha(marker_color(m.color), alpha);
                 ui.fill(Rect::new(x - 0.5, rect.y, 1.0, rect.h), theme::with_alpha(col, 70_u8.min(alpha)));
-                ui.d.draw_triangle(
+                ui.triangle(
                     v2(x - 3.5, rect.bottom()),
                     v2(x, notch_y),
                     v2(x + 3.5, rect.bottom()),
@@ -1469,7 +1490,7 @@ impl TimelinePanel {
             let v = ap.eval(pointer_time(xx));
             let p = v2(xx, y_of(v));
             if let Some(pp) = prev {
-                ui.d.draw_line_ex(pp, p, 1.5, line_col);
+                ui.line(pp, p, 1.5, line_col);
             }
             prev = Some(p);
             xx += 3.0;
@@ -1482,8 +1503,8 @@ impl TimelinePanel {
             }
             let py = y_of(k.value);
             let hov = ui.mouse_in(Rect::new(px - 5.0, py - 5.0, 10.0, 10.0));
-            ui.d.draw_circle(px as i32, py as i32, 4.0, if hov { theme::TEXT_1 } else { theme::ACCENT });
-            ui.d.draw_circle_lines(px as i32, py as i32, 4.0, theme::SURFACE_0);
+            ui.circle(v2(px, py), 4.0, if hov { theme::TEXT_1 } else { theme::ACCENT });
+            ui.circle_outline(v2(px, py), 4.0, theme::SURFACE_0);
             if hov {
                 hit_point = Some(k.t);
             }
@@ -1750,9 +1771,15 @@ impl TimelinePanel {
                 return;
             }
 
-            // Doppelklick: in den Quellmonitor laden
+            // Doppelklick: Nest-Clip öffnet die innere Sequenz im Tab,
+            // sonst lädt der Clip in den Quellmonitor.
             if ui.input.double_click {
-                if app.media.asset(&clip.asset_id).is_some() {
+                if let Some(nested) = clip.nest_seq.clone() {
+                    ui.run_command_with(
+                        "sequence.open",
+                        serde_json::json!({ "sequenceId": nested }),
+                    );
+                } else if app.media.asset(&clip.asset_id).is_some() {
                     app.media.select(vec![clip.asset_id.clone()]);
                     ui.run_command_with(
                         "media.openInSource",
@@ -2283,6 +2310,41 @@ impl TimelinePanel {
             }
         }
 
+        // ---- Sequenz-Render-Cache-Leiste (Premiere-Pendant) ----
+        // rot = vorrender-relevant aber nicht gecacht, grün = gültig gecacht,
+        // gelb = wird gerade gerendert. Dünner Streifen über dem Marker-Band.
+        {
+            app.render_cache.refresh(&app.timeline, &app.media);
+            let fps = app.timeline.settings.rate.fps().max(1.0);
+            let bar_h = 3.0;
+            let bar_y = ruler.bottom() - MARKER_BAND_H - bar_h - 1.0;
+            for (a, b) in crate::core::render_cache::complex_spans(&app.timeline) {
+                let x0 = time_x(a);
+                let w = (time_x(b) - x0).max(1.0);
+                ui.fill(
+                    Rect::new(x0, bar_y, w, bar_h),
+                    theme::with_alpha(theme::DANGER, 200),
+                );
+            }
+            for (sf, ef) in app.render_cache.cached_spans() {
+                let x0 = time_x(sf as f64 / fps);
+                let w = (time_x(ef as f64 / fps) - x0).max(1.0);
+                ui.fill(Rect::new(x0, bar_y, w, bar_h), theme::SUCCESS);
+            }
+            if let Some(r) = &app.render_cache.rendering {
+                let x0 = time_x(r.start_frame as f64 / fps);
+                let full = (time_x(r.end_frame as f64 / fps) - x0).max(1.0);
+                ui.fill(
+                    Rect::new(x0, bar_y, full, bar_h),
+                    theme::with_alpha(theme::WARNING, 90),
+                );
+                ui.fill(
+                    Rect::new(x0, bar_y, full * r.pct.clamp(0.0, 1.0), bar_h),
+                    theme::WARNING,
+                );
+            }
+        }
+
         // Ticks
         let step = TICK_STEPS
             .iter()
@@ -2410,7 +2472,10 @@ impl TimelinePanel {
         if let Some(rd) = &mut self.ruler_drag {
             let t = pointer_time(mouse.x).max(0.0);
             match rd {
-                RulerDrag::Scrub => app.timeline.set_playhead(t),
+                RulerDrag::Scrub => {
+                    app.timeline.set_playhead(t);
+                    app.playback.scrub_active = true; // Audio-Scrubbing auslösen
+                }
                 RulerDrag::Range { origin_t } => {
                     app.timeline.set_in_out_range(*origin_t, t);
                 }
@@ -2452,6 +2517,13 @@ impl TimelinePanel {
         viewport: Rect,
     ) {
         self.drop_preview = None;
+        // Sequenz-Drop = Nesting (eigener Pfad, kein Asset-Insert).
+        if matches!(ui.drag_over(viewport), Some(DragPayload::Sequences(_))) {
+            if let Some(DragPayload::Sequences(ids)) = ui.accept_drop(viewport) {
+                self.insert_dropped_sequences(ui, app, &ids, &pointer_time, track_at_y);
+            }
+            return;
+        }
         let ids: Vec<String> = match ui.drag_over(viewport) {
             Some(DragPayload::Assets(ids)) => ids.clone(),
             _ => {
@@ -2500,6 +2572,213 @@ impl TimelinePanel {
         app.timeline
             .insert_assets(&assets, &ids, t, track.as_ref().map(|t| t.id.as_str()));
         self.drop_preview = None;
+    }
+
+    /// Eine oder mehrere Sequenzen als Nest-Clips einsetzen (Drop). Der
+    /// Rekursionsschutz lehnt Sequenzen ab, die sich (transitiv) selbst
+    /// enthalten würden.
+    fn insert_dropped_sequences(
+        &mut self,
+        ui: &Ui,
+        app: &mut AppState,
+        ids: &[String],
+        pointer_time: &impl Fn(f32) -> f64,
+        track_at_y: &impl Fn(f32) -> Option<TimelineTrack>,
+    ) {
+        self.collect_snap_targets(app, &[]);
+        let raw = pointer_time(ui.input.mouse.x).max(0.0);
+        let (delta, _) = self.snap_adjust(app, &[raw], 0.0);
+        let t = (raw + delta).max(0.0);
+        let track = track_at_y(ui.input.mouse.y);
+        let track_id = track.as_ref().map(|t| t.id.clone());
+        // Multicam-Quellen werden zu Multicam-Clips, normale Sequenzen zu Nests.
+        let mut cursor = t;
+        let mut nest_ids: Vec<String> = Vec::new();
+        for id in ids {
+            let mc = app
+                .timeline
+                .multicam_source(id)
+                .map(|src| (src.duration, src.angles.iter().any(|a| a.has_audio)));
+            if let Some((dur, has_audio)) = mc {
+                let dur = dur.max(crate::core::timeline::MIN_CLIP_DURATION);
+                let name = app.timeline.name_of(id).unwrap_or("Multicam").to_string();
+                app.timeline
+                    .insert_multicam_clip(id, &name, dur, has_audio, cursor, track_id.as_deref());
+                cursor += dur;
+            } else {
+                nest_ids.push(id.clone());
+            }
+        }
+        if !nest_ids.is_empty() {
+            let (inserted, rejected) =
+                app.timeline.insert_nests(&nest_ids, cursor, track_id.as_deref());
+            if rejected > 0 {
+                let msg = if inserted == 0 {
+                    "Verschachtelung abgelehnt: Eine Sequenz darf sich nicht selbst enthalten."
+                } else {
+                    "Einige Sequenzen abgelehnt (Selbst-Verschachtelung)."
+                };
+                app.app.set_status_message(Some(msg.to_string()), ui.time);
+            }
+        }
+        self.drop_preview = None;
+    }
+
+    // ----------------------------------------------------- Sequenz-Tabs
+
+    /// Sequenz-Tab-Leiste (Premiere-artig): offene Sequenzen als Tabs, Klick
+    /// wechselt, Mittelklick/× schließt (Sequenz bleibt im Projekt), Doppelklick
+    /// benennt inline um, Drag sortiert um, Rechtsklick öffnet das Menü, „+“
+    /// legt eine neue Sequenz an.
+    fn render_sequence_tabs(&mut self, ui: &mut Ui, app: &mut AppState, bar: Rect) {
+        ui.fill(bar, theme::SURFACE_1);
+        ui.hline(bar.x, bar.bottom() - 1.0, bar.w, theme::LINE);
+
+        // Inline-Rename initialisieren/aufräumen anhand des angeforderten Ziels.
+        match app.app.rename_sequence.clone() {
+            Some(target) if self.tab_rename.is_none() => {
+                let mut input = TextInputState::default();
+                input.set_text(app.timeline.name_of(&target).unwrap_or("").to_string());
+                input.sel_start = 0;
+                self.tab_rename = Some(input);
+                ui.persist.keyboard_focus = ui.id(("tl.tabrename", target.as_str()));
+            }
+            None => self.tab_rename = None,
+            _ => {}
+        }
+
+        let tabs = app.timeline.open_tabs().to_vec();
+        let renaming = app.app.rename_sequence.clone();
+        let active_id = app.timeline.active_id().to_string();
+        let font = FontKind::Sans12;
+        let pad = 10.0f32;
+        let close_w = 14.0f32;
+        let mouse = ui.input.mouse;
+        let mut x = bar.x + 6.0;
+        let mut tab_rects: Vec<(String, Rect)> = Vec::new();
+
+        ui.push_clip(bar);
+        for id in &tabs {
+            let name = app.timeline.name_of(id).unwrap_or("Sequenz").to_string();
+            let active = active_id == *id;
+            let is_rename = renaming.as_deref() == Some(id.as_str());
+            let text_w = ui.font(font).measure(&name).x.clamp(36.0, 150.0);
+            let tab_w = pad + text_w + close_w + 8.0;
+            let tab = Rect::new(x, bar.y + 3.0, tab_w, bar.h - 5.0);
+            tab_rects.push((id.clone(), tab));
+
+            let bg = if active { theme::SURFACE_0 } else { theme::SURFACE_2 };
+            ui.fill_rounded(tab, theme::RADIUS_SM, bg);
+            if active {
+                ui.fill(Rect::new(tab.x, tab.bottom() - 2.0, tab.w, 2.0), theme::ACCENT);
+            }
+
+            if is_rename {
+                let field = Rect::new(tab.x + 4.0, tab.y + 3.0, tab.w - 8.0, tab.h - 6.0);
+                if let Some(mut input) = self.tab_rename.take() {
+                    let r = input.show(ui, ("tl.tabrename", id.as_str()), field, "Name");
+                    let escaped = ui
+                        .input
+                        .keys
+                        .iter()
+                        .any(|k| k.key == raylib::consts::KeyboardKey::KEY_ESCAPE);
+                    let outside = ui.input.left_pressed && !field.contains(mouse);
+                    if r.submitted {
+                        let t = input.text.trim().to_string();
+                        if !t.is_empty() {
+                            app.timeline.rename(id, &t);
+                        }
+                    }
+                    if r.submitted || escaped || outside {
+                        app.app.rename_sequence = None;
+                        self.tab_rename = None;
+                    } else {
+                        self.tab_rename = Some(input);
+                    }
+                }
+            } else {
+                let ellip = ui.font(font).ellipsize(&name, text_w);
+                let label = Rect::new(tab.x + pad, tab.y, text_w + 2.0, tab.h);
+                ui.text_left(&ellip, label, if active { theme::TEXT_1 } else { theme::TEXT_2 }, font);
+
+                let close = Rect::new(
+                    tab.right() - close_w - 4.0,
+                    tab.y + (tab.h - close_w) / 2.0,
+                    close_w,
+                    close_w,
+                );
+                let body = Rect::new(tab.x, tab.y, tab.w - close_w - 2.0, tab.h);
+                let body_id = ui.id(("tl.tab", id.as_str()));
+                let close_id = ui.id(("tl.tabx", id.as_str()));
+                let body_it = ui.interact(body_id, body);
+                let close_it = ui.interact(close_id, close);
+                if close_it.hovered {
+                    ui.fill_rounded(close, theme::RADIUS_XS, theme::SURFACE_1);
+                }
+                ui.icon("x", close, 10.0, if close_it.hovered { theme::TEXT_1 } else { theme::TEXT_3 });
+                if body_it.hovered {
+                    ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                }
+                // Klick aktiviert (nur, wenn es kein Reorder-Drag war).
+                let was_drag = self.tab_drag.as_ref().is_some_and(|d| d.moved);
+                if body_it.clicked && !was_drag {
+                    app.timeline.set_active(id);
+                }
+                if body_it.double_clicked {
+                    app.app.rename_sequence = Some(id.clone());
+                }
+                if close_it.clicked || (ui.input.middle_pressed && tab.contains(mouse)) {
+                    app.timeline.close_tab(id);
+                }
+                if body_it.right_clicked {
+                    app.app.focused_panel = "timeline".into();
+                    let last = app.timeline.len() <= 1;
+                    app.context_menu.show(mouse.x, mouse.y, sequence_tab_menu(id, last));
+                }
+                if body_it.hovered && ui.input.left_pressed {
+                    self.tab_drag = Some(TabDrag { id: id.clone(), origin_x: mouse.x, moved: false });
+                }
+            }
+            x = tab.right() + 4.0;
+        }
+
+        // „+“ — neue Sequenz.
+        let plus = Rect::new(x + 2.0, bar.y + (bar.h - 20.0) / 2.0, 20.0, 20.0);
+        let plus_id = ui.id("tl.tabnew");
+        let plus_it = ui.interact(plus_id, plus);
+        if plus_it.hovered {
+            ui.fill_rounded(plus, theme::RADIUS_XS, theme::SURFACE_2);
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+            ui.tooltip(plus_id, plus, "Neue Sequenz");
+        }
+        ui.icon("plus", plus, 13.0, if plus_it.hovered { theme::TEXT_1 } else { theme::TEXT_3 });
+        if plus_it.clicked {
+            ui.run_command("sequence.new");
+        }
+        ui.pop_clip();
+
+        // Reorder: Bewegung erkennen; beim Loslassen einmalig umsortieren.
+        if let Some(drag) = self.tab_drag.as_mut() {
+            if (mouse.x - drag.origin_x).abs() > 4.0 {
+                drag.moved = true;
+            }
+        }
+        if !ui.input.left_down {
+            if let Some(drag) = self.tab_drag.take() {
+                if drag.moved {
+                    let mut target = 0usize;
+                    for (tid, r) in tab_rects.iter() {
+                        if tid == &drag.id {
+                            continue;
+                        }
+                        if mouse.x >= r.x + r.w / 2.0 {
+                            target += 1;
+                        }
+                    }
+                    app.timeline.reorder_tab(&drag.id, target);
+                }
+            }
+        }
     }
 
     // ------------------------------------------- Übergangs-Dauer-Eingabe
@@ -2584,7 +2863,7 @@ fn draw_transition_band(ui: &mut Ui, tr: &Transition, band: Rect, selected: bool
     ui.fill_rounded(band, theme::RADIUS_SM, theme::with_alpha(theme::SURFACE_0, 150));
     ui.fill_rounded(band, theme::RADIUS_SM, theme::with_alpha(theme::ACCENT, 46));
     // Diagonale von unten-links nach oben-rechts (Blendverlauf-Symbol).
-    ui.d.draw_line_ex(
+    ui.line(
         v2(band.x, band.bottom() - 1.0),
         v2(band.right(), band.y + 1.0),
         1.0,
@@ -2674,6 +2953,36 @@ fn draw_transition_drop_preview(
     ui.stroke_rounded(rect, theme::RADIUS_SM, 1.0, theme::ACCENT);
     // Schnittkante hervorheben.
     ui.fill(Rect::new(time_x(cut), lane.y + 2.0, 1.0, lane.h - 4.0), theme::ACCENT);
+}
+
+/// Kontextmenü eines Sequenz-Tabs: Umbenennen, Duplizieren, Einstellungen,
+/// Löschen (nur wenn mehr als eine Sequenz existiert).
+fn sequence_tab_menu(seq_id: &str, is_last: bool) -> Vec<MenuEntry> {
+    let arg = serde_json::json!({ "sequenceId": seq_id });
+    let mut items = vec![
+        MenuEntry::Item(
+            MenuItem::command("sequence.rename")
+                .with_icon("type")
+                .with_args(arg.clone()),
+        ),
+        MenuEntry::Item(
+            MenuItem::command("sequence.duplicate")
+                .with_icon("copy")
+                .with_args(arg.clone()),
+        ),
+        MenuEntry::Item(MenuItem::command("sequence.settings").with_icon("sliders-horizontal")),
+        MenuEntry::Separator,
+        MenuEntry::Item(MenuItem::command("sequence.new").with_icon("plus")),
+    ];
+    if !is_last {
+        items.push(MenuEntry::Separator);
+        items.push(MenuEntry::Item(
+            MenuItem::command("sequence.delete")
+                .with_icon("trash-2")
+                .with_args(arg),
+        ));
+    }
+    items
 }
 
 /// Kontextmenü eines Übergangs: Dauer, Ausrichtung, Richtung, Ersetzen,
@@ -3074,7 +3383,7 @@ fn draw_marker_symbol(ui: &mut Ui, x: f32, band_top: f32, col: raylib::prelude::
     let body_h = 6.0;
     ui.fill(Rect::new(x - hw, band_top, hw * 2.0, body_h), col);
     // Spitze nach unten.
-    ui.d.draw_triangle(
+    ui.triangle(
         v2(x - hw, band_top + body_h),
         v2(x, band_top + body_h + 4.5),
         v2(x + hw, band_top + body_h),
