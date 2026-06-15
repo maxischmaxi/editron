@@ -62,7 +62,7 @@ pub fn list_font_families() -> &'static [String] {
                     .collect()
             })
             .unwrap_or_default();
-        families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        families.sort_by_key(|a| a.to_lowercase());
         families.dedup();
         families
     })
@@ -189,9 +189,7 @@ impl TitleLayout {
                     .unwrap_or_else(|| {
                         // Innerhalb eines Clusters (Ligatur): nächster Stopp.
                         line.carets
-                            .iter()
-                            .filter(|(idx, _)| *idx <= byte_idx)
-                            .last()
+                            .iter().rfind(|(idx, _)| *idx <= byte_idx)
                             .map(|(_, x)| *x)
                             .unwrap_or(0.0)
                     });

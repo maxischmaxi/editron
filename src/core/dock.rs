@@ -198,8 +198,8 @@ impl DockManager {
             "audio" => self.three_column_layout("audioMixer", 0.24, "info", 0.22),
             "graphics" => self.three_column_layout("media", 0.20, "graphics", 0.28),
             _ => {
-                let g = self.group(&["media"], 0);
-                g
+                
+                self.group(&["media"], 0)
             }
         };
         self.root = Some(root);
@@ -403,6 +403,16 @@ impl DockManager {
     /// `target` andocken (center = als Tab, sonst Split an der Kante).
     pub fn move_panel(&mut self, panel: &str, target_group: GroupId, edge: DropEdge, tab_index: Option<usize>) {
         let Some((src_gid, _)) = self.find_panel(panel) else { return };
+        // No-op: einen ALLEINIGEN Tab auf eine KANTE seiner eigenen Gruppe ziehen.
+        // Die Quelle würde leer (und bliebe als Phantom-Gruppe stehen, weil sie
+        // == target ist und unten nicht entfernt wird), während ein neuer Split
+        // entstünde — effektiv ändert sich nichts.
+        if src_gid == target_group
+            && edge != DropEdge::Center
+            && self.group_mut(src_gid).is_some_and(|g| g.tabs.len() <= 1)
+        {
+            return;
+        }
         // No-op: Tab auf die eigene Gruppe (center) ziehen, wenn er allein ist.
         if src_gid == target_group && edge == DropEdge::Center {
             if let Some(g) = self.group_mut(src_gid) {

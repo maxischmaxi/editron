@@ -271,7 +271,7 @@ impl TimelinePanel {
             let moved = edge + delta;
             for &t in &self.snap_targets {
                 let dist = (moved - t).abs();
-                if dist <= threshold && best.map_or(true, |(d, _, _)| dist < d) {
+                if dist <= threshold && best.is_none_or(|(d, _, _)| dist < d) {
                     best = Some((dist, delta + (t - moved), t));
                 }
             }
@@ -925,7 +925,12 @@ impl Panel for TimelinePanel {
                 }
             }
         }
-        if let Some(crate::ui::DragPayload::Effect(kind)) = ui.accept_drop(viewport) {
+        // WICHTIG: accept_drop konsumiert JEDEN Drag über dem Viewport, egal
+        // welche Payload-Variante. Nur konsumieren, wenn wirklich ein Effekt
+        // schwebt — sonst verschluckt dieser Zweig den Asset-Drop aus dem
+        // Medien-Browser (handle_asset_drop bekäme dann None).
+        if matches!(ui.drag_over(viewport), Some(crate::ui::DragPayload::Effect(_))) {
+            if let Some(crate::ui::DragPayload::Effect(kind)) = ui.accept_drop(viewport) {
             let t = pointer_time(mouse.x);
             if let Some((clip, track, _)) =
                 clip_under_mouse(&preview, &lane_rects, mouse.y, t, zoom)
@@ -936,6 +941,7 @@ impl Panel for TimelinePanel {
                         app.timeline.selected_clip_ids = vec![target];
                     }
                 }
+            }
             }
         }
 
@@ -965,7 +971,9 @@ impl Panel for TimelinePanel {
                 }
             }
         }
-        if let Some(crate::ui::DragPayload::Transition(kind)) = ui.accept_drop(viewport) {
+        // Nur konsumieren, wenn wirklich ein Übergang schwebt (siehe Effekt-Drop oben).
+        if matches!(ui.drag_over(viewport), Some(crate::ui::DragPayload::Transition(_))) {
+            if let Some(crate::ui::DragPayload::Transition(kind)) = ui.accept_drop(viewport) {
             let t = pointer_time(mouse.x);
             if let Some((clip, _, edge)) =
                 transition_drop_target(&app.timeline.clips, &lane_rects, mouse.y, t, zoom, kind)
@@ -977,6 +985,7 @@ impl Panel for TimelinePanel {
                     let now = ui.time;
                     app.app.set_status_message(Some(err), now);
                 }
+            }
             }
         }
 
@@ -2010,6 +2019,14 @@ impl TimelinePanel {
                     let raw = (((mouse.x - *origin_x) / zoom as f32) as f64).max(-min_start);
                     let edges: Vec<f64> = moving.iter().flat_map(|c| [c.start, c.end()]).collect();
                     let (snapped, st) = self.snap_adjust(app, &edges, raw);
+                    // Frame-Genauigkeit: ohne aktiven Kanten-/Playhead-Snap die
+                    // Zielposition aufs Frame-Raster runden (ein NLE rastet jeden
+                    // Edit auf ganze Frames; Kanten/Playhead sind selbst frame-aligned).
+                    let snapped = if st.is_none() {
+                        app.timeline.snap_to_frame(min_start + snapped) - min_start
+                    } else {
+                        snapped
+                    };
                     *delta_sec = snapped.max(-min_start);
                     *lane_offset = offset;
                     *snap_time = st;
@@ -2047,6 +2064,11 @@ impl TimelinePanel {
                         TrimEdge::End => anchor.end(),
                     };
                     let (mut snapped, st) = self.snap_adjust(app, &[edge_time], delta);
+                    // Frame-Genauigkeit: ohne aktiven Snap die getrimmte Kante aufs
+                    // Frame-Raster runden, dann auf den legalen Bereich klemmen.
+                    if st.is_none() {
+                        snapped = app.timeline.snap_to_frame(edge_time + snapped) - edge_time;
+                    }
                     for c in &targets {
                         let (lo, hi) = trim_range(c, *edge, &app.timeline.clips, !*ripple);
                         snapped = snapped.clamp(lo, hi);
@@ -2103,8 +2125,11 @@ impl TimelinePanel {
                     let (lo_l, hi_l) = trim_range(left, TrimEdge::End, &app.timeline.clips, false);
                     let (lo_r, hi_r) =
                         trim_range(right, TrimEdge::Start, &app.timeline.clips, false);
-                    *delta_sec = (((mouse.x - *origin_x) / zoom as f32) as f64)
-                        .clamp(lo_l.max(lo_r), hi_l.min(hi_r));
+                    // Frame-Genauigkeit: die gemeinsame Schnittkante aufs Raster runden.
+                    let cut = left.end();
+                    let raw = ((mouse.x - *origin_x) / zoom as f32) as f64;
+                    let quantized = app.timeline.snap_to_frame(cut + raw) - cut;
+                    *delta_sec = quantized.clamp(lo_l.max(lo_r), hi_l.min(hi_r));
                 }
             }
             TlDrag::Slip {
@@ -2145,7 +2170,9 @@ impl TimelinePanel {
                     .collect();
                 if !targets.is_empty() {
                     let min_start = targets.iter().map(|c| c.start).fold(f64::INFINITY, f64::min);
-                    *delta_sec = (((mouse.x - *origin_x) / zoom as f32) as f64).max(-min_start);
+                    // Frame-Genauigkeit: die verschobene Position aufs Raster runden.
+                    let raw = ((mouse.x - *origin_x) / zoom as f32) as f64;
+                    *delta_sec = (app.timeline.snap_to_frame(min_start + raw) - min_start).max(-min_start);
                 }
             }
             TlDrag::Marquee {
@@ -2463,7 +2490,10 @@ impl TimelinePanel {
                         self.ruler_drag = Some(RulerDrag::Edge { is_in: false });
                     } else {
                         self.ruler_drag = Some(RulerDrag::Scrub);
-                        app.timeline.set_playhead(t);
+                        // Scrubbing rastet auf ganze Frames (wie in Premiere/Resolve);
+                        // die kontinuierliche Playback-Position bleibt unberührt.
+                        let snapped = app.timeline.snap_to_frame(t);
+                        app.timeline.set_playhead(snapped);
                     }
                 }
             }
@@ -2473,7 +2503,8 @@ impl TimelinePanel {
             let t = pointer_time(mouse.x).max(0.0);
             match rd {
                 RulerDrag::Scrub => {
-                    app.timeline.set_playhead(t);
+                    let snapped = app.timeline.snap_to_frame(t);
+                    app.timeline.set_playhead(snapped);
                     app.playback.scrub_active = true; // Audio-Scrubbing auslösen
                 }
                 RulerDrag::Range { origin_t } => {

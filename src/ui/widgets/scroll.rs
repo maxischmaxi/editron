@@ -137,15 +137,14 @@ pub fn scrollbar(
     };
 
     let it = ui.interact(id, thumb);
-    if it.hovered || it.held {
-        if ui.input.left_pressed && it.hovered {
+    if (it.hovered || it.held)
+        && ui.input.left_pressed && it.hovered {
             *drag = Some(if horizontal {
                 ui.input.mouse.x - thumb.x
             } else {
                 ui.input.mouse.y - thumb.y
             });
         }
-    }
     if it.held {
         if let Some(grab) = *drag {
             let mouse = if horizontal {

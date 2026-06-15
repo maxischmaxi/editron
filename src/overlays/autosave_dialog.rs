@@ -207,7 +207,7 @@ impl AutosaveDialog {
             .and_then(|p| version_dir_stem(p))
         {
             Some(ds) => ds,
-            None => autosave::target_for(state),
+            None => autosave::list_target_for(state),
         };
         self.versions = autosave::list_versions(&dir, &stem);
         self.project_name = if stem.is_empty() { "Unbenannt".into() } else { stem };

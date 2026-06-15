@@ -90,7 +90,7 @@ impl LayerQuad {
 /// Sichtbare Video-Clips am Zeitpunkt `t`, von der untersten zur obersten
 /// Spur (Zeichenreihenfolge). Mute/Solo der Spuren greifen wie im Player.
 /// OHNE Übergangs-Erweiterung — für Scopes/Farbe-Panel (ein Clip je Spur).
-pub fn visible_video_clips<'a>(timeline: &'a TimelineStore, t: f64) -> Vec<&'a TimelineClip> {
+pub fn visible_video_clips(timeline: &TimelineStore, t: f64) -> Vec<&TimelineClip> {
     let solo_any = timeline.tracks.iter().any(|tr| tr.solo);
     timeline
         .tracks
@@ -270,6 +270,11 @@ pub fn composite_frame(
     layers: &[CpuLayerFrame],
     threads: usize,
 ) {
+    // Degenerierte Auflösung (0×0, leerer Canvas) → nichts zu komponieren;
+    // chunks_mut(0) bei w==0 würde sonst paniken.
+    if w == 0 || h == 0 || canvas.is_empty() {
+        return;
+    }
     debug_assert_eq!(canvas.len(), w * h * 4);
     let threads = threads.clamp(1, 64);
     let band_rows = h.div_ceil(threads).max(1);

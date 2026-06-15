@@ -42,7 +42,9 @@ struct MeterState {
 impl MeterState {
     /// Peak (linear, 1.0 = 0 dBFS) → Meteranteil 0..1 auf der dB-Skala.
     fn norm(peak: f32) -> f32 {
-        if peak <= 0.0 {
+        // !is_finite zuerst: ein NaN-Peak liefe durch `peak <= 0.0` (NaN-Vergleich
+        // = false) und durch clamp (lässt NaN durch) bis in die Pegel-Rects.
+        if !peak.is_finite() || peak <= 0.0 {
             return 0.0;
         }
         ((20.0 * peak.log10() + METER_RANGE_DB) / METER_RANGE_DB).clamp(0.0, 1.0)
@@ -65,6 +67,7 @@ impl MeterState {
     }
 }
 
+#[derive(Default)]
 pub struct AudioMixerPanel {
     meters: HashMap<String, MeterState>,
     master_meter: MeterState,
@@ -73,16 +76,6 @@ pub struct AudioMixerPanel {
     scroll: ScrollState,
 }
 
-impl Default for AudioMixerPanel {
-    fn default() -> Self {
-        AudioMixerPanel {
-            meters: HashMap::new(),
-            master_meter: MeterState::default(),
-            gesture_pushed: false,
-            scroll: ScrollState::default(),
-        }
-    }
-}
 
 /// Werte eines Kanalzugs für den Render-Durchlauf (entkoppelt vom Store,
 /// damit Änderungen während der Schleife über die Store-API laufen können).

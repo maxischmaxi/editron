@@ -352,7 +352,8 @@ fn parse_track(
             };
             items.push(InteropItem::Transition(InteropTransition {
                 kind: kind_tr,
-                frames: pre + post,
+                // saturating: feindliche/korrupte OTIO-Offsets dürfen nicht paniken.
+                frames: pre.saturating_add(post),
                 pre,
                 post,
             }));

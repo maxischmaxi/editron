@@ -289,11 +289,9 @@ fn load_recent() -> Vec<String> {
 
 fn save_recent(recent: &[String]) {
     let path = recent_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     if let Ok(json) = serde_json::to_string(recent) {
-        let _ = std::fs::write(path, json);
+        // Atomar + fsync (siehe core::atomic_write).
+        let _ = crate::core::atomic_write(&path, json.as_bytes());
     }
 }
 
@@ -387,16 +385,13 @@ pub fn save_to(state: &mut AppState, path: &Path) -> Result<(), String> {
             std::fs::create_dir_all(dir).map_err(|e| format!("Ordner anlegen: {e}"))?;
         }
     }
-    // Temp-Datei im Zielordner (rename über Dateisystemgrenzen schlägt fehl).
-    let tmp = path.with_extension(format!("{PROJECT_EXT}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Schreiben: {e}"))?;
+    // Bestehende Datei vor dem Überschreiben als .bak sichern (Original noch intakt).
     if path.exists() {
         let _ = std::fs::copy(path, path.with_extension(format!("{PROJECT_EXT}.bak")));
     }
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("Speichern: {err}"));
-    }
+    // Durabel + atomar: tmp schreiben → fsync → rename → dir-fsync. Ein
+    // Stromausfall hinterlässt nie eine halbe/0-Byte-.etron.
+    crate::core::atomic_write(path, json.as_bytes()).map_err(|e| format!("Speichern: {e}"))?;
 
     state.project.path = Some(path.to_path_buf());
     state.project.push_recent(path);

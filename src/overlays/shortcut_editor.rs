@@ -26,6 +26,7 @@ struct RecorderTarget {
     chords: Vec<KeyChord>,
 }
 
+#[derive(Default)]
 pub struct ShortcutEditor {
     query: TextInputState,
     scroll: ScrollState,
@@ -33,16 +34,6 @@ pub struct ShortcutEditor {
     was_open: bool,
 }
 
-impl Default for ShortcutEditor {
-    fn default() -> Self {
-        ShortcutEditor {
-            query: TextInputState::default(),
-            scroll: ScrollState::default(),
-            recorder: None,
-            was_open: false,
-        }
-    }
-}
 
 impl ShortcutEditor {
     pub fn render(&mut self, ui: &mut Ui, state: &mut AppState, registry: &CommandRegistry) {

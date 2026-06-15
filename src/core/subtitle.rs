@@ -181,7 +181,9 @@ fn parse_srt_time(raw: &str) -> Option<f64> {
     if m >= 60 || s >= 60 {
         return None;
     }
-    Some((h * 3600 + m * 60 + s) as f64 + ms as f64 / 1000.0)
+    // saturating gegen pathologische Stundenwerte in fremden/korrupten SRTs.
+    let secs = h.saturating_mul(3600).saturating_add(m * 60).saturating_add(s);
+    Some(secs as f64 + ms as f64 / 1000.0)
 }
 
 /// Sekunden → `HH:MM:SS,mmm` (auf Millisekunden gerundet).

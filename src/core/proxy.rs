@@ -19,18 +19,15 @@ use std::path::{Path, PathBuf};
 /// damit ideal zum Scrubben/Schneiden — anders als Long-GOP-Material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum ProxyCodec {
     /// Apple ProRes 422 Proxy (`prores_ks`, Profil 0).
+    #[default]
     ProResProxy,
     /// Avid DNxHR LB (Low Bandwidth) (`dnxhd`, Profil `dnxhr_lb`).
     DnxhrLb,
 }
 
-impl Default for ProxyCodec {
-    fn default() -> Self {
-        ProxyCodec::ProResProxy
-    }
-}
 
 impl ProxyCodec {
     pub const ALL: [ProxyCodec; 2] = [ProxyCodec::ProResProxy, ProxyCodec::DnxhrLb];
@@ -60,18 +57,15 @@ impl ProxyCodec {
 /// Auflösungsteiler des Proxys relativ zum Original.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum ProxyScale {
     /// Halbe Kantenlänge (1/4 der Pixel) — der gängige Standard.
+    #[default]
     Half,
     /// Viertel Kantenlänge (1/16 der Pixel) — für sehr schwache Hardware.
     Quarter,
 }
 
-impl Default for ProxyScale {
-    fn default() -> Self {
-        ProxyScale::Half
-    }
-}
 
 impl ProxyScale {
     pub const ALL: [ProxyScale; 2] = [ProxyScale::Half, ProxyScale::Quarter];

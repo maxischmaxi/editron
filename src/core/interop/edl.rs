@@ -502,8 +502,15 @@ fn parse_tc(tc: &str, rate: FrameRate, df: bool) -> Option<i64> {
     let m: u64 = parts[1].parse().ok()?;
     let s: u64 = parts[2].parse().ok()?;
     let f: u64 = parts[3].parse().ok()?;
+    // Gültige Timecode-Komponenten — verwirft offensichtlich kaputte/feindliche
+    // Zeilen, statt absurde Frame-Werte zu liefern.
+    if m >= 60 || s >= 60 {
+        return None;
+    }
     let drop = df && rate.supports_drop_frame();
-    Some(crate::core::timecode::frames_of(h, m, s, f, rate, drop) as i64)
+    // frames_of sättigt bei riesigen Stundenwerten (kein Panic); auf den
+    // i64-Bereich klemmen hält das Ergebnis nicht-negativ.
+    Some(crate::core::timecode::frames_of(h, m, s, f, rate, drop).min(i64::MAX as u64) as i64)
 }
 
 #[cfg(test)]
@@ -523,5 +530,16 @@ mod tests {
         let r = FrameRate::new(30000, 1001);
         let f = parse_tc("01:00:00;00", r, true).unwrap();
         assert_eq!(format_frames(f as u64, r, true), "01:00:00;00");
+    }
+
+    #[test]
+    fn parse_tc_rejects_hostile_input_without_panicking() {
+        let r = FrameRate::PAL_25;
+        // Riesiger Stundenwert: kein Panic, Ergebnis bleibt nicht-negativ.
+        let f = parse_tc("99999999999999999:00:00:00", r, false);
+        assert!(f.map(|v| v >= 0).unwrap_or(true));
+        // Ungültige Minuten/Sekunden → None statt absurder Frame-Wert.
+        assert!(parse_tc("00:99:00:00", r, false).is_none());
+        assert!(parse_tc("00:00:99:00", r, false).is_none());
     }
 }

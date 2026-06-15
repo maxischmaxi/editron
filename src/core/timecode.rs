@@ -74,11 +74,17 @@ pub fn format_frames(frames: u64, rate: FrameRate, drop_frame: bool) -> String {
 /// SMPTE-Timecode → Frame-Nummer (Umkehrung von `format_frames`).
 pub fn frames_of(h: u64, m: u64, s: u64, f: u64, rate: FrameRate, drop_frame: bool) -> u64 {
     let nominal = rate.nominal().max(1);
-    let base = ((h * 3600 + m * 60 + s) * nominal) + f;
+    // Overflow-sicher: feindliche/korrupte Timecodes (riesige Stundenwerte aus
+    // fremden EDLs/OTIO-Dateien) dürfen nicht paniken, sondern müssen sättigen.
+    let total_s = h
+        .saturating_mul(3600)
+        .saturating_add(m.saturating_mul(60))
+        .saturating_add(s);
+    let base = total_s.saturating_mul(nominal).saturating_add(f);
     if drop_frame && rate.supports_drop_frame() {
         let drop = nominal / 15;
-        let total_min = h * 60 + m;
-        base - drop * (total_min - total_min / 10)
+        let total_min = h.saturating_mul(60).saturating_add(m);
+        base.saturating_sub(drop.saturating_mul(total_min - total_min / 10))
     } else {
         base
     }
@@ -191,6 +197,16 @@ mod tests {
                 assert_eq!(back, f, "Roundtrip für Frame {f} ({tc})");
             }
         }
+    }
+
+    #[test]
+    fn frames_of_saturates_instead_of_panicking_on_huge_hours() {
+        // Feindliche EDL-/OTIO-Zeile mit absurdem Stundenwert darf nicht paniken
+        // (dev-Profil läuft mit overflow-checks=on).
+        let huge = frames_of(99_999_999_999_999_999, 0, 0, 0, NTSC_30, false);
+        assert_eq!(huge, u64::MAX, "Stundenwert sättigt statt zu überlaufen");
+        // Auch mit Drop-Frame kein Panic.
+        let _ = frames_of(u64::MAX, 59, 29, 29, NTSC_30, true);
     }
 
     #[test]

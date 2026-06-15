@@ -851,11 +851,20 @@ struct ClipAudio {
     buf: Vec<f32>,
     eof: bool,
     fx_chain: Option<AudioFxChain>,
+    /// Aktuelle Audio-Effekt-Instanzen (zum Nachführen animierter Parameter in
+    /// `fill`, ohne sie pro Tick durchreichen zu müssen).
+    fx_effects: Vec<EffectInstance>,
+    /// In `fill` bereits durch die FX-Kette verarbeitete Output-Frames seit
+    /// Clip-Eintritt — bestimmt die Medienzeit, an der die FX-Parameter
+    /// nachgeführt werden (Keyframe-Automation), exakt wie der Export.
+    fx_pos: i64,
 }
 
 impl ClipAudio {
     /// Effekt-Kette mit dem Clip-Zustand abgleichen (Code wie zuvor).
     fn sync_effects(&mut self, effects: &[EffectInstance], media_t: f64) {
+        // Instanzen merken — `fill` führt animierte Parameter sub-blockweise nach.
+        self.fx_effects = effects.to_vec();
         let refs: Vec<&EffectInstance> = effects.iter().collect();
         let active = refs.iter().any(|e| e.enabled && e.kind.is_audio());
         if !active {
@@ -907,8 +916,29 @@ impl ClipAudio {
                     chunk
                 }
             };
-            if let Some(fx) = self.fx_chain.as_mut() {
-                fx.process(&mut chunk);
+            // FX in Sub-Blöcken (≤ ENV_BLOCK) verarbeiten und je Block an der
+            // exakten Medienzeit nachführen — sonst friert animierte Clip-Audio-
+            // FX-Automation in der Wiedergabe am Eintrittswert ein (der Export
+            // führt dieselben Parameter alle ENV_BLOCK_FRAMES nach: Parität).
+            let total = chunk.len() / AUDIO_CHANNELS;
+            let refs: Vec<&EffectInstance> = self.fx_effects.iter().collect();
+            if let Some(chain) = self.fx_chain.as_mut() {
+                let mut off = 0usize;
+                while off < total {
+                    let n = (total - off).min(ENV_BLOCK_FRAMES);
+                    let media_t =
+                        (self.media_enter + self.fx_pos as f64 * self.media_per_out).max(0.0);
+                    chain.retune(&refs, media_t);
+                    let s = off * AUDIO_CHANNELS;
+                    let e = (off + n) * AUDIO_CHANNELS;
+                    chain.process(&mut chunk[s..e]);
+                    self.fx_pos += n as i64;
+                    off += n;
+                }
+            } else {
+                // Position auch ohne aktive FX mitführen, damit ein FX-Toggle
+                // mitten in der Wiedergabe die Automation phasenrichtig fortsetzt.
+                self.fx_pos += total as i64;
             }
             self.buf.extend(chunk);
         }
@@ -1179,6 +1209,8 @@ fn build_clip_audio(w: &Want) -> Option<ClipAudio> {
         buf: Vec::new(),
         eof: false,
         fx_chain: None,
+        fx_effects: Vec::new(),
+        fx_pos: 0,
     };
     clip.sync_effects(&w.effects, w.media_enter);
     Some(clip)
@@ -1239,6 +1271,8 @@ fn build_scrub_voice(state: &AppState, pos: f64, master_out: u64) -> Option<Clip
         buf: Vec::new(),
         eof: false,
         fx_chain: None,
+        fx_effects: Vec::new(),
+        fx_pos: 0,
     })
 }
 
@@ -2892,6 +2926,8 @@ mod tests {
             buf: Vec::new(),
             eof: false,
             fx_chain: None,
+            fx_effects: Vec::new(),
+            fx_pos: 0,
         }
     }
 

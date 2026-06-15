@@ -170,7 +170,6 @@ impl InteropReportDialog {
             {
                 state.app.interop_report = None;
                 state.app.open_dialog = Some(DialogId::Relink);
-                return;
             }
         }
     }

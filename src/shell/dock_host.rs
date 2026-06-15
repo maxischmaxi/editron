@@ -34,6 +34,7 @@ struct SashLayout {
     total: f32,
 }
 
+#[derive(Default)]
 pub struct DockHost {
     sash_drag: Option<SashDrag>,
     /// Drop-Vorschau des laufenden Tab-Drags.
@@ -45,14 +46,6 @@ struct SashDrag {
     index: usize,
 }
 
-impl Default for DockHost {
-    fn default() -> Self {
-        DockHost {
-            sash_drag: None,
-            drop_preview: None,
-        }
-    }
-}
 
 fn collect_layout(
     node: &DockNode,
@@ -261,10 +254,16 @@ impl DockHost {
                             let delta_w = delta_px / sash.total.max(1.0) * weight_sum;
                             let a = children[drag_index].weight;
                             let b = children[drag_index + 1].weight;
-                            let min = min_w * weight_sum;
-                            let new_a = (a + delta_w).clamp(min, a + b - min);
-                            children[drag_index].weight = new_a;
-                            children[drag_index + 1].weight = a + b - new_a;
+                            let min = (min_w * weight_sum).max(0.0);
+                            let hi = a + b - min;
+                            // f32::clamp paniced bei min > max (Fenster schmaler als
+                            // 2×MIN_PANE) bzw. bei NaN-Grenzen (korruptes Layout-JSON).
+                            // Dann ist das Pane zu klein zum Teilen → Drag ignorieren.
+                            if delta_w.is_finite() && hi > min {
+                                let new_a = (a + delta_w).clamp(min, hi);
+                                children[drag_index].weight = new_a;
+                                children[drag_index + 1].weight = a + b - new_a;
+                            }
                         }
                     }
                 }

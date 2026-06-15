@@ -30,7 +30,7 @@ pub struct SpeedDialog {
 }
 
 /// Referenz-Clip der Auswahl: erster Nicht-Generator, Video bevorzugt.
-fn reference_clip<'a>(state: &'a AppState) -> Option<&'a TimelineClip> {
+fn reference_clip(state: &AppState) -> Option<&TimelineClip> {
     let selected: Vec<&TimelineClip> = state
         .timeline
         .clips

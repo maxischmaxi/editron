@@ -697,8 +697,12 @@ pub fn build_registry() -> CommandRegistry {
                 status(ctx, "Die letzte Sequenz kann nicht gelöscht werden");
                 return;
             }
-            // Wird die Sequenz als Nest verwendet, erst bestätigen lassen.
-            if ctx.state.timeline.nest_usage_count(&target) > 0 {
+            // Wird die Sequenz als Nest ODER als Multicam-Quelle verwendet, erst
+            // bestätigen lassen (beim Löschen werden Multicam-Clips auf ihren
+            // aktiven Winkel flachgeklopft, Nest-Clips entfernt).
+            if ctx.state.timeline.nest_usage_count(&target) > 0
+                || ctx.state.timeline.multicam_usage_count(&target) > 0
+            {
                 ctx.state.app.sequence_delete_target = Some(target);
                 ctx.state.app.open_dialog = Some(DialogId::ConfirmDeleteSequence);
                 return;

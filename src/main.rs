@@ -492,7 +492,7 @@ impl App {
                         if std::env::var("EDITRON_TEST_BINS").is_ok() {
                             let n = self.state.media.assets.len();
                             let label = crate::core::bin::MediaLabel::ALL[n % 8];
-                            if n % 2 == 0 {
+                            if n.is_multiple_of(2) {
                                 self.state.media.set_label(&[asset_id.clone()], Some(label));
                             }
                             self.state.media.clear_history();
@@ -1575,7 +1575,7 @@ fn main() {
         // docs/HIDPI_MACOS.md): einmal pro Sekunde die rohen raylib-Maße + die
         // abgeleiteten logischen Werte + die rohe vs. logische Maus loggen.
         // Auf X11 gilt screen == render; auf macOS+HIGHDPI render == screen×scale.
-        if frame_count % 60 == 0 && std::env::var("EDITRON_DPI_DEBUG").is_ok() {
+        if frame_count.is_multiple_of(60) && std::env::var("EDITRON_DPI_DEBUG").is_ok() {
             let raw_mouse = rl.get_mouse_position();
             eprintln!(
                 "[dpi] dpi={:.3} ui_scale={:.3} screen={}x{} render={}x{} logical={:.0}x{:.0} mouse_raw=({:.0},{:.0}) mouse_logical=({:.0},{:.0})",

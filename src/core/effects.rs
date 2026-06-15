@@ -527,11 +527,15 @@ impl EffectInstance {
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
-                    self.params
+                    let v = self
+                        .params
                         .get(i)
                         .map(|p| p.eval(media_t))
-                        .unwrap_or(s.default)
-                        .clamp(s.min, s.max)
+                        .unwrap_or(s.default);
+                    // NaN/Inf (korrupter Keyframe) würde clamp unverändert
+                    // durchreichen → auf den Default zurückfallen.
+                    let v = if v.is_finite() { v } else { s.default };
+                    v.clamp(s.min, s.max)
                 })
                 .collect(),
         }

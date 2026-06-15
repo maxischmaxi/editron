@@ -431,8 +431,8 @@ fn render_list(
             .map(|(i, _)| i)
             .collect();
         let active = menu.active_path[depth];
-        if keys.contains(&KeyboardKey::KEY_DOWN) || keys.contains(&KeyboardKey::KEY_UP) {
-            if !selectable.is_empty() {
+        if (keys.contains(&KeyboardKey::KEY_DOWN) || keys.contains(&KeyboardKey::KEY_UP))
+            && !selectable.is_empty() {
                 let dir: i32 = if keys.contains(&KeyboardKey::KEY_DOWN) { 1 } else { -1 };
                 let pos = selectable.iter().position(|i| *i as i32 == active);
                 let next = match pos {
@@ -451,9 +451,8 @@ fn render_list(
                 menu.active_path[depth] = next as i32;
                 menu.open_sub[depth] = -1;
             }
-        }
-        if keys.contains(&KeyboardKey::KEY_ENTER) || keys.contains(&KeyboardKey::KEY_RIGHT) {
-            if active >= 0 {
+        if (keys.contains(&KeyboardKey::KEY_ENTER) || keys.contains(&KeyboardKey::KEY_RIGHT))
+            && active >= 0 {
                 match items.get(active as usize) {
                     Some(MenuEntry::Submenu { .. }) => {
                         menu.open_sub[depth] = active;
@@ -473,7 +472,6 @@ fn render_list(
                     _ => {}
                 }
             }
-        }
     }
 
     let mut y = rect.y + 4.0; // py-1

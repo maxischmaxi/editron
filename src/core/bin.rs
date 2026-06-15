@@ -108,21 +108,20 @@ impl MediaLabel {
 /// Ansichtsmodus des Browsers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ViewMode {
+    #[default]
     Grid,
     List,
 }
 
-impl Default for ViewMode {
-    fn default() -> Self {
-        ViewMode::Grid
-    }
-}
 
 /// Sortierschlüssel der Listenansicht. `Name` ist die Standardsortierung.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum SortKey {
+    #[default]
     Name,
     Duration,
     Fps,
@@ -134,11 +133,6 @@ pub enum SortKey {
     Date,
 }
 
-impl Default for SortKey {
-    fn default() -> Self {
-        SortKey::Name
-    }
-}
 
 /// Spaltendefinition der Listenansicht: Sortierschlüssel, Kopf-Label und
 /// Standardbreite in Pixeln. Die Name-Spalte ist flexibel (füllt den Rest).

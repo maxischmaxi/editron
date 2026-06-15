@@ -817,7 +817,9 @@ impl ExportDialog {
                                     v.quality = if i == 0 {
                                         VideoQuality::Crf(self.crf.round() as u32)
                                     } else {
-                                        VideoQuality::Bitrate(parse_mbits(&self.bitrate_input.text))
+                                        // .max(1): ein leeres/0-Feld darf kein
+                                        // Bitrate(0) erzeugen (ungültig für ffmpeg).
+                                        VideoQuality::Bitrate(parse_mbits(&self.bitrate_input.text).max(1))
                                     };
                                 }
                                 changed = true;
@@ -1652,7 +1654,7 @@ fn group_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push('.');
         }
         out.push(c);

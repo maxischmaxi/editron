@@ -19,6 +19,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const AUTOSAVE_DIR_NAME: &str = ".etron-autosave";
 /// Länge des eingebetteten Zeitstempels `JJJJ-MM-TT_HH-MM-SS`.
 const STAMP_LEN: usize = 19;
+/// Basis-Stamm für noch nie gespeicherte Projekte. Geschrieben/rotiert wird
+/// pro Prozess als `Unbenannt-<pid>` (damit parallele Sessions sich nicht
+/// gegenseitig die Versionen wegrotieren), gelistet wird über den Basis-Stamm
+/// als Umbrella (damit die Recovery alle Sessions sieht).
+const UNSAVED_STEM_BASE: &str = "Unbenannt";
 
 // ----------------------------------------------------------- Zeitstempel
 
@@ -113,6 +118,24 @@ fn matches_stem(file_name: &str, stem: &str) -> bool {
     else {
         return false;
     };
+    // Umbrella: der Basis-Stamm "Unbenannt" matcht auch die session-spezifischen
+    // Varianten "Unbenannt-<pid>" — so sieht die Recovery ALLE ungespeicherten
+    // Sessions, während eine Rotation mit dem konkreten "Unbenannt-<pid>"-Stamm
+    // nur die eigenen Versionen trifft.
+    if stem == UNSAVED_STEM_BASE {
+        let Some(after) = rest.strip_prefix(UNSAVED_STEM_BASE) else {
+            return false;
+        };
+        // after = "_<STAMP>"  oder  "-<pid>_<STAMP>"
+        let stamp = match after.strip_prefix('_') {
+            Some(s) => s,
+            None => match after.strip_prefix('-').and_then(|s| s.split_once('_')) {
+                Some((pid, s)) if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) => s,
+                _ => return false,
+            },
+        };
+        return stamp.len() == STAMP_LEN;
+    }
     let prefix = format!("{stem}_");
     match rest.strip_prefix(&prefix) {
         Some(stamp) => stamp.len() == STAMP_LEN,
@@ -145,7 +168,13 @@ fn project_stem(project_path: Option<&Path>) -> String {
         .and_then(|p| p.file_stem())
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "Unbenannt".to_string())
+        .unwrap_or_else(|| UNSAVED_STEM_BASE.to_string())
+}
+
+/// Schreib-/Rotations-Stamm für ungespeicherte Projekte: pro Prozess eindeutig,
+/// damit parallele Sessions sich nicht gegenseitig die Versionen wegrotieren.
+fn unsaved_write_stem() -> String {
+    format!("{UNSAVED_STEM_BASE}-{}", std::process::id())
 }
 
 // ------------------------------------------------------------- Versionen
@@ -209,21 +238,30 @@ pub fn write_version(
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("Autosave-Ordner anlegen: {e}"))?;
     let final_path = dir.join(version_filename(stem, t));
-    let tmp = dir.join(format!(".autosave.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("Autosave schreiben: {e}"))?;
-    if let Err(e) = std::fs::rename(&tmp, &final_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("Autosave umbenennen: {e}"));
-    }
+    // Durabel + atomar (fsync), damit ein Absturz beim Autosave keine korrupte
+    // Versionsdatei hinterlässt.
+    crate::core::atomic_write(&final_path, json.as_bytes())
+        .map_err(|e| format!("Autosave schreiben: {e}"))?;
     rotate(dir, stem, max_versions);
     Ok(final_path)
 }
 
-/// Ablageort (Ordner + Stamm) der Versionen des aktuellen Projekts.
+/// Ablageort (Ordner + Stamm) zum SCHREIBEN/ROTIEREN der Versionen des
+/// aktuellen Projekts (ungespeichert ⇒ prozess-eindeutiger Stamm).
 pub fn target_for(state: &AppState) -> (PathBuf, String) {
     match state.project.path.as_deref() {
         Some(p) => (autosave_dir_for(p), project_stem(Some(p))),
-        None => (unsaved_versions_dir(), project_stem(None)),
+        None => (unsaved_versions_dir(), unsaved_write_stem()),
+    }
+}
+
+/// Ablageort (Ordner + Stamm) zum LISTEN/Wiederherstellen — ungespeichert über
+/// den Umbrella-Basis-Stamm, damit Versionen ALLER (auch abgestürzter) Sessions
+/// erscheinen, nicht nur die der aktuellen.
+pub fn list_target_for(state: &AppState) -> (PathBuf, String) {
+    match state.project.path.as_deref() {
+        Some(p) => (autosave_dir_for(p), project_stem(Some(p))),
+        None => (unsaved_versions_dir(), UNSAVED_STEM_BASE.to_string()),
     }
 }
 
@@ -248,10 +286,10 @@ pub fn write_timed_autosave(
 /// das auf einen Absturz nach dem letzten Autosave hin — beim normalen
 /// Beenden würde Editron die Projektdatei speichern und sie damit zur
 /// jüngsten Datei machen.
-pub fn recovery_candidate<'a>(
+pub fn recovery_candidate(
     project_mtime: SystemTime,
-    versions: &'a [Version],
-) -> Option<&'a Version> {
+    versions: &[Version],
+) -> Option<&Version> {
     let newest = versions.iter().max_by_key(|v| v.modified)?;
     if newest.modified > project_mtime {
         Some(newest)
@@ -286,6 +324,25 @@ mod tests {
         assert_eq!(format_timestamp(at(1_609_459_200)), "2021-01-01_00-00-00");
         // 2026-06-18 13:45:30 UTC = 1781790330.
         assert_eq!(format_timestamp(at(1_781_790_330)), "2026-06-18_13-45-30");
+    }
+
+    #[test]
+    fn unsaved_umbrella_matches_per_session_stems_but_rotation_is_isolated() {
+        // Drei ungespeicherte Versionen: zwei Sessions (pids) + ein Legacy-Name.
+        let a = version_filename("Unbenannt-1234", at(1_781_790_330));
+        let b = version_filename("Unbenannt-5678", at(1_781_790_331));
+        let legacy = version_filename(UNSAVED_STEM_BASE, at(1_781_790_332));
+        // Umbrella-Stamm "Unbenannt" sieht ALLE (Recovery über Sessions hinweg).
+        assert!(matches_stem(&a, UNSAVED_STEM_BASE));
+        assert!(matches_stem(&b, UNSAVED_STEM_BASE));
+        assert!(matches_stem(&legacy, UNSAVED_STEM_BASE));
+        // Der konkrete Session-Stamm trifft nur die EIGENEN (Rotation isoliert).
+        assert!(matches_stem(&a, "Unbenannt-1234"));
+        assert!(!matches_stem(&b, "Unbenannt-1234"));
+        assert!(!matches_stem(&legacy, "Unbenannt-1234"));
+        // Kein falsches Matching: anderer Name, Nicht-Ziffern-Suffix.
+        assert!(!matches_stem(&version_filename("Projekt", at(1)), UNSAVED_STEM_BASE));
+        assert!(!matches_stem(&version_filename("Unbenannt-abc", at(1)), UNSAVED_STEM_BASE));
     }
 
     #[test]

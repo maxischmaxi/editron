@@ -134,6 +134,10 @@ impl Biquad {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2;
+        // Selbstheilend: ein nicht-finites Ergebnis darf den Filterzustand
+        // (x1/x2/y1/y2 in der Rückkopplung) nicht dauerhaft vergiften.
+        let y = if y.is_finite() { y } else { 0.0 };
+        let x = if x.is_finite() { x } else { 0.0 };
         self.x2 = self.x1;
         self.x1 = x;
         self.y2 = self.y1;
@@ -463,8 +467,13 @@ impl AudioFxChain {
                     buf,
                     ..
                 } => {
-                    let max = buf[0].len();
-                    *delay_samples = ((v(0) / 1000.0 * rate as f64) as usize).clamp(1, max - 1);
+                    // Gegen leeren/zu kurzen Puffer absichern (max - 1 würde sonst
+                    // bei len 0 in usize unterlaufen).
+                    let max = buf.first().map(|b| b.len()).unwrap_or(0);
+                    if max >= 2 {
+                        *delay_samples =
+                            ((v(0) / 1000.0 * rate as f64) as usize).clamp(1, max - 1);
+                    }
                     *feedback = (v(1) / 100.0).clamp(0.0, 0.95) as f32;
                     *wet = (v(2) / 100.0).clamp(0.0, 1.0) as f32;
                 }
@@ -477,6 +486,14 @@ impl AudioFxChain {
         let ch = self.channels;
         if ch == 0 || samples.is_empty() {
             return;
+        }
+        // Nicht-finite Eingangssamples (Decoder-Glitch, vorheriger Effekt) würden
+        // Filter-/Hüllkurven-/Delay-Zustände dauerhaft vergiften → am Eingang auf
+        // 0 flushen, damit ein einzelnes NaN nicht die ganze Spur stummschaltet.
+        for s in samples.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
+            }
         }
         for stage in &mut self.stages {
             match &mut stage.stage {
@@ -752,6 +769,29 @@ mod tests {
 
     fn eq(values: &[(usize, f64)]) -> EffectInstance {
         instance(EffectKind::Equalizer, values)
+    }
+
+    #[test]
+    fn nan_input_does_not_permanently_poison_the_chain() {
+        // EQ-Filter (IIR, Rückkopplung) — ein einzelnes NaN/Inf darf den
+        // Zustand nicht dauerhaft vergiften und die Spur stummschalten.
+        let inst = eq(&[(0, 100.0), (1, 6.0)]);
+        let fx = [&inst];
+        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        // Block aus NaN/Inf durchschicken.
+        let mut bad = vec![f32::NAN; 256];
+        for (i, s) in bad.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *s = f32::INFINITY;
+            }
+        }
+        chain.process(&mut bad);
+        assert!(bad.iter().all(|s| s.is_finite()), "Ausgabe bleibt finit");
+        // Danach normales Audio: muss wieder durchkommen (nicht stumm).
+        let mut good = sine(440.0, RATE as usize);
+        chain.process(&mut good);
+        let tail = rms(&good[RATE as usize / 2..]);
+        assert!(tail > 0.1 && tail.is_finite(), "Audio nach NaN wieder hörbar: {tail}");
     }
 
     #[test]

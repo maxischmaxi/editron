@@ -24,6 +24,9 @@ use raylib::math::Vector2;
 
 /// Buckets für den Hover-Scrub (quantisierte Scrub-Position → Cache-Schlüssel).
 const SCRUB_BUCKETS: u32 = 16;
+/// Nach so vielen Sekunden ohne Ergebnis wird ein Scrub-Thumbnail erneut
+/// angefordert (Retry bei transientem Fehlschlag, kein dauerhafter Leak).
+const SCRUB_RETRY_SECS: f64 = 4.0;
 
 /// Inline-Umbenennung eines Bins oder Assets.
 struct RenameEdit {
@@ -48,7 +51,10 @@ pub struct MediaBrowserPanel {
     /// Auswahl-Lasso.
     marquee: Option<Marquee>,
     /// Laufende Hover-Scrub-Anforderungen (asset_id, bucket) — Drosselung.
-    scrub_pending: std::collections::HashSet<(String, u32)>,
+    /// Angeforderte, noch nicht eingetroffene Scrub-Thumbnails → Anforderungszeit.
+    /// Map (statt Set), damit eine fehlgeschlagene Generierung nach `SCRUB_RETRY_SECS`
+    /// erneut versucht wird (und der Eintrag nicht dauerhaft leakt/blockiert).
+    scrub_pending: std::collections::HashMap<(String, u32), f64>,
     /// Spalte, deren Breite gerade gezogen wird (Index in COLUMNS).
     col_drag: Option<usize>,
 }
@@ -64,7 +70,7 @@ impl Default for MediaBrowserPanel {
             edit: None,
             anchor: None,
             marquee: None,
-            scrub_pending: std::collections::HashSet::new(),
+            scrub_pending: std::collections::HashMap::new(),
             col_drag: None,
         }
     }
@@ -1446,10 +1452,17 @@ impl MediaBrowserPanel {
             return Some(p.clone());
         }
         let key = (asset_id.to_string(), bucket);
-        if !self.scrub_pending.contains(&key) {
+        // Erneut anfordern, wenn noch nie oder vor mehr als SCRUB_RETRY_SECS (eine
+        // fehlgeschlagene Generierung kommt nie in scrub_thumbs → Eintrag würde
+        // sonst dauerhaft hängen und den Bucket für immer blockieren).
+        let stale = self
+            .scrub_pending
+            .get(&key)
+            .is_none_or(|t0| ui.time - *t0 > SCRUB_RETRY_SECS);
+        if stale {
             let t = (bucket as f64 / (SCRUB_BUCKETS - 1) as f64) * duration;
             ui.request_scrub(asset_id, path, t, bucket);
-            self.scrub_pending.insert(key);
+            self.scrub_pending.insert(key, ui.time);
         }
         None
     }

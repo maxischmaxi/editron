@@ -283,11 +283,10 @@ impl AppSettings {
     /// geändert hat (sonst würden Env-Overrides in die Datei einsickern).
     pub fn save(&self) {
         let path = settings_path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
+            // Atomar + fsync: ein abgebrochener Write darf die settings.json (und
+            // damit den serde(flatten)-`extra`-Vorwärtskompat-Bucket) nicht zerstören.
+            let _ = crate::core::atomic_write(&path, json.as_bytes());
         }
     }
 

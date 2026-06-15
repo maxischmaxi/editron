@@ -154,8 +154,10 @@ enum ProxyCmd {
     Enqueue(ProxyTask),
     Cancel(String),
     CancelAll,
-    /// Worker meldet Abschluss (Asset-ID) — Slot freigeben.
-    Finished(String),
+    /// Worker meldet Abschluss (Asset-ID + Run-ID) — Slot freigeben. Die Run-ID
+    /// unterscheidet einen verspäteten Abschluss eines abgebrochenen Workers vom
+    /// Abschluss eines neuen Laufs desselben Assets.
+    Finished(String, u64),
 }
 
 /// Ein laufender Proxy-Transcode: Abbruch-Flag + Kindprozess-Handle (für
@@ -163,6 +165,10 @@ enum ProxyCmd {
 struct RunningProxy {
     cancel: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
+    /// Eindeutige, monoton steigende Kennung dieses Laufs. Ein verspätetes
+    /// `Finished` eines abgebrochenen Vorgänger-Laufs trägt eine ältere Run-ID
+    /// und darf den neuen Lauf nicht aus `running` entfernen.
+    run: u64,
 }
 
 /// Laufender Sequenz-Export: Abbruch-Flag + Kindprozesse für hartes Beenden.
@@ -648,7 +654,7 @@ impl Services {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let picked = rfd::FileDialog::new()
-                .set_title(&format!("{} importieren", format.label()))
+                .set_title(format!("{} importieren", format.label()))
                 .add_filter(format.label(), &[format.extension()])
                 .add_filter("Alle Dateien", &["*"])
                 .pick_file();
@@ -666,7 +672,7 @@ impl Services {
         let default_name = default_name.to_string();
         std::thread::spawn(move || {
             let picked = rfd::FileDialog::new()
-                .set_title(&format!("{} exportieren", format.label()))
+                .set_title(format!("{} exportieren", format.label()))
                 .set_file_name(&default_name)
                 .add_filter(format.label(), &[format.extension()])
                 .save_file();
@@ -793,7 +799,7 @@ fn match_relink_candidates(
             break;
         }
         scanned_dirs += 1;
-        if scanned_dirs % 64 == 0 {
+        if scanned_dirs.is_multiple_of(64) {
             on_progress(scanned_dirs);
         }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -997,6 +1003,7 @@ fn proxy_dispatcher(
     let mut queue: VecDeque<ProxyTask> = VecDeque::new();
     let mut running: std::collections::HashMap<String, RunningProxy> =
         std::collections::HashMap::new();
+    let mut next_run: u64 = 0;
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
@@ -1031,8 +1038,14 @@ fn proxy_dispatcher(
                     }
                 }
             }
-            ProxyCmd::Finished(id) => {
-                running.remove(&id);
+            ProxyCmd::Finished(id, run) => {
+                // Nur entfernen, wenn der EINTRAG zu genau diesem Lauf gehört.
+                // Ein verspätetes Finished eines abgebrochenen/ersetzten Workers
+                // (ältere Run-ID) würde sonst den neuen, noch laufenden Lauf
+                // desselben Assets aus `running` löschen → Slot-Leak + Doppel-Worker.
+                if running.get(&id).is_some_and(|r| r.run == run) {
+                    running.remove(&id);
+                }
             }
         }
         // Auffüllen, solange Slots frei sind.
@@ -1040,11 +1053,14 @@ fn proxy_dispatcher(
             let Some(task) = queue.pop_front() else { break };
             let cancel = Arc::new(AtomicBool::new(false));
             let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+            let run = next_run;
+            next_run += 1;
             running.insert(
                 task.asset_id.clone(),
                 RunningProxy {
                     cancel: Arc::clone(&cancel),
                     child: Arc::clone(&child_slot),
+                    run,
                 },
             );
             let ev = event_tx.clone();
@@ -1052,7 +1068,7 @@ fn proxy_dispatcher(
             let id = task.asset_id.clone();
             std::thread::spawn(move || {
                 run_proxy_transcode(task, cancel, child_slot, &ev);
-                let _ = done_tx.send(ProxyCmd::Finished(id));
+                let _ = done_tx.send(ProxyCmd::Finished(id, run));
             });
         }
     }
@@ -1606,7 +1622,17 @@ pub fn extract_waveform(path: &str, samples: u32) -> Result<Vec<f32>, String> {
     let mut index: u64 = 0;
     let mut fallback: Vec<u8> = Vec::new();
     loop {
-        let n = stdout.read(&mut chunk).map_err(|e| e.to_string())?;
+        // Read-Fehler (ffmpeg bricht mitten im Stream ab, Pipe-Fehler) darf die
+        // Funktion nicht ohne Reaping verlassen → sonst ffmpeg-Zombie.
+        let n = match stdout.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_task.join();
+                return Err(e.to_string());
+            }
+        };
         if n == 0 {
             break;
         }

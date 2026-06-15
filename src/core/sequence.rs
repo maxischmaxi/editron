@@ -56,7 +56,7 @@ impl FrameRate {
 
     /// Drop-Frame-Timecode ist nur für 29,97 und 59,94 definiert.
     pub fn supports_drop_frame(&self) -> bool {
-        self.den == 1001 && self.num % 30000 == 0
+        self.den == 1001 && self.num.is_multiple_of(30000)
     }
 
     /// Nominale ganzzahlige Rate (30 für 29,97, 60 für 59,94) — Basis der

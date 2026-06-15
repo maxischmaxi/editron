@@ -296,7 +296,7 @@ impl SequenceStore {
         use crate::core::timeline::TrackKind;
         let active = self.active;
         // 1. Betroffene Multicam-Clips der aktiven Sequenz.
-        let targets: Vec<(String, String, u32)> = self.sequences[active]
+        let targets: Vec<(String, String, u32, bool)> = self.sequences[active]
             .timeline
             .clips
             .iter()
@@ -305,18 +305,24 @@ impl SequenceStore {
             .filter_map(|c| {
                 c.multicam
                     .as_ref()
-                    .map(|mc| (c.id.clone(), mc.source.clone(), mc.angle))
+                    .map(|mc| (c.id.clone(), mc.source.clone(), mc.angle, c.kind == TrackKind::Audio))
             })
             .collect();
         if targets.is_empty() {
             return 0;
         }
-        // 2. Winkeldaten aus den Quell-Sequenzen auflösen.
+        // 2. Winkeldaten aus den Quell-Sequenzen auflösen. AUDIO-Clips folgen dem
+        // festen Audio-Winkel (audio_angle_idx), nicht dem Video-Winkel.
         let mut resolved: std::collections::HashMap<String, (String, f64, f64, String)> =
             std::collections::HashMap::new();
-        for (clip_id, source, angle) in &targets {
+        for (clip_id, source, angle, is_audio) in &targets {
             if let Some(src) = self.get(source).and_then(|s| s.timeline.multicam.as_ref()) {
-                if let Some(a) = src.angle(*angle) {
+                let idx = if *is_audio {
+                    src.audio_angle_idx(*angle) as u32
+                } else {
+                    *angle
+                };
+                if let Some(a) = src.angle(idx) {
                     resolved.insert(
                         clip_id.clone(),
                         (a.asset_id.clone(), a.pos, a.duration, a.name.clone()),
@@ -391,6 +397,9 @@ impl SequenceStore {
         let Some(pos) = self.sequences.iter().position(|s| s.id == id) else {
             return false;
         };
+        // Multicam-Clips, die diese Sequenz als Quelle nutzen, vor dem Löschen
+        // auf ihren aktiven Winkel flachklopfen → Material verwaist nicht.
+        self.flatten_multicam_clips_of(id);
         // Verwaiste Nest-Clips in den verbleibenden Sequenzen aufräumen.
         for seq in self.sequences.iter_mut() {
             if seq.id == id {
@@ -500,6 +509,77 @@ impl SequenceStore {
             .flat_map(|s| s.timeline.clips.iter())
             .filter(|c| c.nest_seq.as_deref() == Some(id))
             .count()
+    }
+
+    /// Anzahl Multicam-Clips über alle Sequenzen, die `id` als Multicam-Quelle
+    /// nutzen — für die Lösch-Warnung (analog zu `nest_usage_count`).
+    pub fn multicam_usage_count(&self, id: &str) -> usize {
+        self.sequences
+            .iter()
+            .flat_map(|s| s.timeline.clips.iter())
+            .filter(|c| c.multicam.as_ref().is_some_and(|m| m.source == id))
+            .count()
+    }
+
+    /// Alle Multicam-Clips (in ALLEN Sequenzen), die `source_id` als Quelle
+    /// nutzen, auf ihren aktiven Winkel flachklopfen — wie `flatten_multicam`,
+    /// aber gezielt vor dem Löschen der Quell-Sequenz, damit das Material
+    /// erhalten bleibt statt zu verwaisen. Liefert die Anzahl. Bewusst OHNE
+    /// History-Eintrag: die Sequenz-Löschung selbst ist nicht undobar, sonst
+    /// würde ein Undo den Clip wieder auf die gelöschte Quelle zeigen lassen.
+    fn flatten_multicam_clips_of(&mut self, source_id: &str) -> usize {
+        // 1. Plan bauen (Winkeldaten der Quelle pro betroffenem Clip auflösen).
+        let mut plan: Vec<(usize, String, bool, (String, f64, f64, String))> = Vec::new();
+        {
+            let Some(src) = self.get(source_id).and_then(|s| s.timeline.multicam.as_ref()) else {
+                return 0;
+            };
+            for (si, seq) in self.sequences.iter().enumerate() {
+                for c in seq.timeline.clips.iter() {
+                    let Some(mc) = c.multicam.as_ref() else { continue };
+                    if mc.source != source_id {
+                        continue;
+                    }
+                    // AUDIO-Clips folgen dem festen Audio-Winkel.
+                    let is_audio = c.kind == crate::core::timeline::TrackKind::Audio;
+                    let idx = if is_audio {
+                        src.audio_angle_idx(mc.angle) as u32
+                    } else {
+                        mc.angle
+                    };
+                    if let Some(a) = src.angle(idx) {
+                        plan.push((
+                            si,
+                            c.id.clone(),
+                            is_audio,
+                            (a.asset_id.clone(), a.pos, a.duration, a.name.clone()),
+                        ));
+                    }
+                }
+            }
+        }
+        // 2. Anwenden.
+        let mut count = 0usize;
+        for (si, clip_id, is_audio, (asset_id, pos, duration, name)) in &plan {
+            if let Some(c) = self.sequences[*si]
+                .timeline
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == clip_id)
+            {
+                c.asset_id = asset_id.clone();
+                c.src_in = (c.src_in - pos).max(0.0);
+                c.src_duration = *duration;
+                c.name = if *is_audio {
+                    format!("{name} (Audio)")
+                } else {
+                    name.clone()
+                };
+                c.multicam = None;
+                count += 1;
+            }
+        }
+        count
     }
 
     // --------------------------------------------------------------- Helfer

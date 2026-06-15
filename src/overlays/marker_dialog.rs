@@ -209,7 +209,6 @@ impl MarkerDialog {
         {
             delete(state, &target);
             self.close(state);
-            return;
         }
     }
 

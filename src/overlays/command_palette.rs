@@ -59,6 +59,7 @@ pub fn shortcut_chip(ui: &mut Ui, x: f32, center_y: f32, keys: &str, conflict: b
     w
 }
 
+#[derive(Default)]
 pub struct CommandPalette {
     query: TextInputState,
     selected: usize,
@@ -66,16 +67,6 @@ pub struct CommandPalette {
     was_open: bool,
 }
 
-impl Default for CommandPalette {
-    fn default() -> Self {
-        CommandPalette {
-            query: TextInputState::default(),
-            selected: 0,
-            scroll: ScrollState::default(),
-            was_open: false,
-        }
-    }
-}
 
 impl CommandPalette {
     pub fn render(

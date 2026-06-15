@@ -182,7 +182,10 @@ pub fn key_name(key: KeyboardKey, shift: bool) -> Option<&'static str> {
         KEY_P => "p", KEY_Q => "q", KEY_R => "r", KEY_S => "s", KEY_T => "t",
         KEY_U => "u", KEY_V => "v", KEY_W => "w", KEY_X => "x", KEY_Y => "y",
         KEY_Z => "z",
-        KEY_ZERO => if shift { "=" } else { "0" },
+        // KEY_ZERO liefert IMMER "0" (wie KEY_ONE..KEY_NINE), damit shift-Ziffern-
+        // Chords wie "Shift+0" (multicam.toggleMonitor) und "Alt+Shift+0"
+        // (workspace.resetLayout) überhaupt erzeugbar sind. "=" kommt über KEY_EQUAL.
+        KEY_ZERO => "0",
         KEY_ONE => "1", KEY_TWO => "2", KEY_THREE => "3", KEY_FOUR => "4",
         KEY_FIVE => "5", KEY_SIX => "6", KEY_SEVEN => "7", KEY_EIGHT => "8",
         KEY_NINE => "9",

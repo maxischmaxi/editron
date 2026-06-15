@@ -99,19 +99,25 @@ impl AnimatedParam {
         if keys.is_empty() {
             return self.value;
         }
+        // NaN/Inf-Zeit (korrupter Clip-/Medienzustand) darf nicht über
+        // partial_cmp().unwrap() im binary_search paniken — Randwert halten.
+        if !t.is_finite() {
+            return keys[0].value;
+        }
         if t <= keys[0].t {
             return keys[0].value;
         }
         if t >= keys[keys.len() - 1].t {
             return keys[keys.len() - 1].value;
         }
-        // Segment [i, i+1] mit keys[i].t <= t < keys[i+1].t suchen.
-        let i = match keys.binary_search_by(|k| k.t.partial_cmp(&t).unwrap()) {
+        // Segment [i, i+1] mit keys[i].t <= t < keys[i+1].t suchen. total_cmp
+        // statt partial_cmp().unwrap(), damit auch NaN-Keyframes nicht paniken.
+        let i = match keys.binary_search_by(|k| k.t.total_cmp(&t)) {
             Ok(i) => return keys[i].value,
-            Err(i) => i - 1,
+            Err(i) => i.saturating_sub(1),
         };
         let a = &keys[i];
-        let b = &keys[i + 1];
+        let b = keys.get(i + 1).unwrap_or(a);
         let span = b.t - a.t;
         if span <= 0.0 {
             return b.value;

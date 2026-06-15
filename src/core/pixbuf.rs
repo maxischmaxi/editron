@@ -78,7 +78,7 @@ pub fn f32_to_rgba64le(src: &[f32]) -> Vec<u8> {
 #[inline]
 fn ign(x: u32, y: u32) -> f32 {
     let v = 0.06711056 * x as f32 + 0.00583715 * y as f32;
-    (52.9829189 * (v - v.floor())).fract()
+    (52.982_918 * (v - v.floor())).fract()
 }
 
 #[inline]
