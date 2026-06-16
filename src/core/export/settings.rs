@@ -56,6 +56,71 @@ pub struct AudioSettings {
     pub channels: u32,
 }
 
+/// Lautheits-Normalisierung der Tonspur beim Export (ffmpeg `loudnorm`,
+/// 2-Pass: erst die integrierte Lautheit/True-Peak messen, dann linear auf
+/// das Ziel bringen). In [`ExportSettings::loudness`] steht `None` für „aus“.
+/// Delivery-Spezifikationen (EBU R128, ATSC A/85, Streaming-Plattformen)
+/// verlangen ein definiertes Ziel-Lautheitsmaß plus True-Peak-Obergrenze.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct LoudnessNorm {
+    /// Integriertes Ziel-Lautheitsmaß (LUFS bzw. LKFS), typ. −14 … −24.
+    pub target_i: f64,
+    /// True-Peak-Obergrenze in dBTP (z. B. −1,0).
+    pub true_peak: f64,
+    /// Ziel-Lautheitsumfang (LRA) in LU.
+    pub lra: f64,
+}
+
+impl LoudnessNorm {
+    /// EBU R128 (−23 LUFS, −1 dBTP) — europäischer Broadcast-Standard.
+    pub const EBU_R128: LoudnessNorm = LoudnessNorm {
+        target_i: -23.0,
+        true_peak: -1.0,
+        lra: 18.0,
+    };
+
+    /// Sinnvolle Schranken für frei eingestellte Werte (ffmpeg `loudnorm`
+    /// akzeptiert I −70…−5, TP −9…0, LRA 1…50).
+    pub fn clamped(self) -> LoudnessNorm {
+        LoudnessNorm {
+            target_i: self.target_i.clamp(-70.0, -5.0),
+            true_peak: self.true_peak.clamp(-9.0, 0.0),
+            lra: self.lra.clamp(1.0, 50.0),
+        }
+    }
+}
+
+/// Benanntes Lautheits-Preset für den Export-Dialog (delivery-konforme Ziele).
+pub struct LoudnessPreset {
+    pub label: &'static str,
+    pub norm: LoudnessNorm,
+}
+
+pub const LOUDNESS_PRESETS: &[LoudnessPreset] = &[
+    LoudnessPreset {
+        label: "EBU R128 (−23 LUFS)",
+        norm: LoudnessNorm { target_i: -23.0, true_peak: -1.0, lra: 18.0 },
+    },
+    LoudnessPreset {
+        label: "−16 LUFS (Podcast / Mobil)",
+        norm: LoudnessNorm { target_i: -16.0, true_peak: -1.0, lra: 11.0 },
+    },
+    LoudnessPreset {
+        label: "−14 LUFS (Streaming)",
+        norm: LoudnessNorm { target_i: -14.0, true_peak: -1.0, lra: 11.0 },
+    },
+    LoudnessPreset {
+        label: "ATSC A/85 (−24 LKFS)",
+        norm: LoudnessNorm { target_i: -24.0, true_peak: -2.0, lra: 7.0 },
+    },
+];
+
+/// Index des Presets, dessen Zielwerte exakt zu `norm` passen (für die
+/// Auswahl im Dialog); `None` = frei eingestellt.
+pub fn loudness_preset_index(norm: &LoudnessNorm) -> Option<usize> {
+    LOUDNESS_PRESETS.iter().position(|p| p.norm == *norm)
+}
+
 /// Umgang mit sichtbaren Untertitel-Spuren beim Sequenz-Export.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,8 +161,19 @@ pub struct ExportSettings {
     pub video: Option<VideoSettings>,
     /// None = ohne Tonspur.
     pub audio: Option<AudioSettings>,
+    /// Lautheits-Normalisierung der Tonspur (None = aus). Wirkt nur, wenn
+    /// auch `audio` gesetzt ist.
+    pub loudness: Option<LoudnessNorm>,
     /// Nur den Bereich zwischen Sequenz-In/Out exportieren.
     pub use_in_out: bool,
+    /// Audiospuren getrennt als Stems ausgeben: je Audiospur ein eigener
+    /// Audio-Stream im Container (mit Spurname-Titel) statt einer summierten
+    /// Stereo-Master-Spur. Bus-FX, Automation, Spur-Gain/Pan und Master bleiben
+    /// pro Spur angewandt (die Summe aller Stems ergibt den Master-Mix).
+    /// Wirkt nur, wenn auch `audio` gesetzt ist und der Container mehrere
+    /// Audio-Streams trägt ([`ContainerDef::multi_audio`]) — siehe
+    /// [`stems_enabled`].
+    pub audio_stems: bool,
     /// Sichtbare Untertitel-Spuren: ignorieren, Sidecar, muxen, einbrennen.
     pub subtitles: SubtitleMode,
     /// Startnummer der Bild-Sequenz (nur bei `container.image_sequence`).
@@ -193,11 +269,22 @@ fn preset_settings(
         container: container(container_id),
         video,
         audio,
+        loudness: None,
         use_in_out: false,
+        audio_stems: false,
         subtitles: SubtitleMode::None,
         image_start: 1,
         output: String::new(),
     }
+}
+
+/// Werden beim Export getrennte Audio-Stems (je Spur einer) ausgegeben? Nur,
+/// wenn der Nutzer es gewählt hat, es überhaupt eine Tonspur gibt und der
+/// Zielcontainer mehrere Audio-Streams tragen kann. EINE Quelle für die
+/// Renderplan-Routing-Entscheidung (`build_render_plan`) und den Worker
+/// (Mischen/Muxen) — sonst liefen Plan und Worker auseinander.
+pub fn stems_enabled(settings: &ExportSettings) -> bool {
+    settings.audio_stems && settings.audio.is_some() && settings.container.multi_audio()
 }
 
 pub const PRESETS: &[ExportPreset] = &[

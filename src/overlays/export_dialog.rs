@@ -10,9 +10,9 @@
 //! Schließen gesperrt — nur „Abbrechen“ beendet den Job.
 
 use crate::core::export::{
-    self, build_render_plan, validate, AudioSettings, EncoderQuality, ExportSettings, QualityKind,
-    Severity, VideoQuality, VideoSettings, CONTAINERS, FRAMERATES, PRESETS, RESOLUTIONS,
-    SAMPLE_RATES,
+    self, build_render_plan, loudness_preset_index, validate, AudioSettings, EncoderQuality,
+    ExportSettings, LoudnessNorm, QualityKind, Severity, VideoQuality, VideoSettings, CONTAINERS,
+    FRAMERATES, LOUDNESS_PRESETS, PRESETS, RESOLUTIONS, SAMPLE_RATES,
 };
 use crate::core::export_preset::{PresetData, UserPresets};
 use crate::core::render_queue::JobState;
@@ -140,6 +140,22 @@ impl ExportDialog {
         if let Some(s) = &mut self.settings {
             if s.output.is_empty() {
                 s.output = default_output_path(state, s.container.ext);
+            }
+            // Testmodus: Lautheits-Normalisierung vorbelegen
+            // (EDITRON_TEST_LOUDNESS=ebu|-14|-16,-1,11 …) — für Screenshots des
+            // Dialogabschnitts und die Delivery-Verifikation per
+            // EDITRON_TEST_EXPORT.
+            if s.audio.is_some() {
+                if let Ok(spec) = std::env::var("EDITRON_TEST_LOUDNESS") {
+                    s.loudness = parse_test_loudness(&spec);
+                }
+                // Stems-Export vorbelegen (EDITRON_TEST_STEMS=1) — für die
+                // Delivery-Verifikation per EDITRON_TEST_EXPORT (je Audiospur
+                // ein eigener Stream). Nur bei Containern mit mehreren Streams.
+                if s.container.multi_audio() && std::env::var("EDITRON_TEST_STEMS").is_ok() {
+                    s.audio_stems = true;
+                    s.loudness = None;
+                }
             }
         }
         self.dirty = true;
@@ -516,6 +532,11 @@ impl ExportDialog {
         if let Some(i) = select(ui, "export.container", r, &labels, current) {
             let c = &CONTAINERS[i];
             s.container = c;
+            // Container ohne Mehrstrom-Audio kann keine Stems tragen — Flag
+            // zurücksetzen, damit es nicht unsichtbar „hängen“ bleibt.
+            if !c.multi_audio() {
+                s.audio_stems = false;
+            }
             // Codecs auf erlaubte Werte des Containers clampen.
             if c.video {
                 let seq = state.timeline.settings;
@@ -1005,6 +1026,103 @@ impl ExportDialog {
                 }
                 changed = true;
             }
+
+            // ---- Stems: Audiospuren getrennt ausgeben ----
+            // Nur bei Containern mit mehreren Audio-Streams (MP4/MOV/MKV/WebM/
+            // M4A); WAV/MP3/FLAC tragen nur einen Stream.
+            if s.container.multi_audio() {
+                body.cut_top(8.0);
+                let row = body.cut_top(24.0);
+                let on = s.audio_stems;
+                if checkbox(
+                    ui,
+                    "export.audioStems",
+                    row,
+                    "Audiospuren getrennt exportieren (Stems)",
+                    on,
+                )
+                .clicked
+                {
+                    s.audio_stems = !on;
+                    // Stems und Lautheits-Normalisierung schließen sich aus —
+                    // loudnorm ist eine Master-Bus-Operation und würde die
+                    // relativen Stem-Pegel verfälschen.
+                    if s.audio_stems {
+                        s.loudness = None;
+                    }
+                    changed = true;
+                    layout_changed = true;
+                }
+                if on {
+                    let hint = body.cut_top(16.0);
+                    ui.text_left(
+                        "Je Audiospur ein eigener Stream (Spurname als Titel) — Bus-FX, Automation und Master bleiben angewandt.",
+                        hint,
+                        theme::TEXT_3,
+                        FontKind::Sans12,
+                    );
+                }
+            }
+        }
+
+        // ================= Lautheit =================
+        // Nur bei vorhandener Tonspur (Normalisierung wirkt auf den Mixdown);
+        // bei aktiven Stems ausgeblendet (loudnorm ist eine Master-Bus-
+        // Operation und mit getrennten Stems unvereinbar).
+        if s.audio.is_some() && !export::stems_enabled(&s) {
+            section(ui, body, "Lautheit");
+            let row = body.cut_top(24.0);
+            let on = s.loudness.is_some();
+            if checkbox(ui, "export.loudOn", row, "Lautheit normalisieren", on).clicked {
+                s.loudness = if on { None } else { Some(LoudnessNorm::EBU_R128) };
+                changed = true;
+                layout_changed = true;
+            }
+            body.cut_top(8.0);
+
+            if let Some(mut norm) = s.loudness {
+                // ---- Vorgabe (Preset) bzw. Benutzerdefiniert ----
+                let r = labeled_row(ui, body, "Vorgabe");
+                let mut labels: Vec<&str> = LOUDNESS_PRESETS.iter().map(|p| p.label).collect();
+                labels.push("Benutzerdefiniert");
+                let custom_idx = LOUDNESS_PRESETS.len();
+                let current = loudness_preset_index(&norm).unwrap_or(custom_idx);
+                if let Some(i) = select(ui, "export.loudPreset", r, &labels, current) {
+                    if i < LOUDNESS_PRESETS.len() {
+                        norm = LOUDNESS_PRESETS[i].norm;
+                        s.loudness = Some(norm);
+                        changed = true;
+                    }
+                }
+
+                // ---- Frei einstellbare Zielwerte (Slider mit Wert-Anzeige) ----
+                let mut field_changed = false;
+                field_changed |= loudness_slider(
+                    ui, body, "Ziel-Lautheit", "export.loudI",
+                    &mut norm.target_i, -36.0, -9.0, 0.5, "LUFS", 1,
+                );
+                field_changed |= loudness_slider(
+                    ui, body, "True-Peak", "export.loudTp",
+                    &mut norm.true_peak, -9.0, 0.0, 0.1, "dBTP", 1,
+                );
+                field_changed |= loudness_slider(
+                    ui, body, "Lautheitsumfang", "export.loudLra",
+                    &mut norm.lra, 1.0, 30.0, 1.0, "LU", 0,
+                );
+                if field_changed {
+                    s.loudness = Some(norm);
+                    changed = true;
+                }
+
+                let hint = body.cut_top(16.0);
+                ui.text_left(
+                    "2-Pass-Messung über ffmpeg loudnorm (integriertes LUFS-Ziel + True-Peak-Limit).",
+                    hint,
+                    theme::TEXT_3,
+                    FontKind::Sans12,
+                );
+                body.cut_top(8.0);
+            }
         }
 
         // ================= Untertitel =================
@@ -1184,9 +1302,10 @@ impl ExportDialog {
             }
             if let Some(a) = &s.audio {
                 parts.push(format!(
-                    "{} {}",
+                    "{} {}{}",
                     a.codec.label,
-                    if a.channels == 1 { "Mono" } else { "Stereo" }
+                    if a.channels == 1 { "Mono" } else { "Stereo" },
+                    if export::stems_enabled(s) { " · Stems" } else { "" }
                 ));
             }
             let size = match export::estimate_size(s, self.plan.duration) {
@@ -1530,6 +1649,34 @@ fn checkbox(ui: &mut Ui, id_src: impl std::hash::Hash, row: Rect, label: &str, c
     it
 }
 
+/// Labeled-Row mit Slider + rechtsbündiger Wertanzeige (Einheit). Rastet auf
+/// `step` und meldet, ob sich der Wert geändert hat. Für die frei
+/// einstellbaren Lautheits-Zielwerte (LUFS/dBTP/LU).
+#[allow(clippy::too_many_arguments)]
+fn loudness_slider(
+    ui: &mut Ui,
+    body: &mut Rect,
+    label: &str,
+    id: &str,
+    value: &mut f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    unit: &str,
+    decimals: usize,
+) -> bool {
+    let mut rr = labeled_row(ui, body, label);
+    let value_cell = rr.cut_right(76.0);
+    rr.cut_right(8.0);
+    let before = ((*value / step).round() * step).clamp(min, max);
+    *value = before;
+    slider(ui, id, rr, value, min, max, theme::ACCENT);
+    *value = ((*value / step).round() * step).clamp(min, max);
+    let text = format!("{:.*} {}", decimals, *value, unit).replace('.', ",");
+    ui.text_right(&text, value_cell, theme::TEXT_1, FontKind::Mono12);
+    (*value - before).abs() > step / 2.0
+}
+
 /// Akzentfarbener Primär-Button.
 fn primary_button(ui: &mut Ui, id_src: impl std::hash::Hash, rect: Rect, label: &str, enabled: bool) -> Interaction {
     let id = ui.id(id_src);
@@ -1616,6 +1763,36 @@ fn parse_mbits(text: &str) -> u32 {
     (v * 1000.0).round().max(0.0) as u32
 }
 
+/// Test-Hook `EDITRON_TEST_LOUDNESS`: `off`/leer = aus; Preset-Schlüssel
+/// (`ebu`/`r128`, `-16`, `-14`, `atsc`/`-24`); `I[,TP[,LRA]]` = frei (Komma
+/// oder Doppelpunkt getrennt). Liefert `None` für „aus“.
+fn parse_test_loudness(spec: &str) -> Option<LoudnessNorm> {
+    let s = spec.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "off" || s == "aus" || s == "0" {
+        return None;
+    }
+    match s.as_str() {
+        "ebu" | "r128" | "-23" => return Some(LOUDNESS_PRESETS[0].norm),
+        "-16" | "podcast" => return Some(LOUDNESS_PRESETS[1].norm),
+        "-14" | "streaming" => return Some(LOUDNESS_PRESETS[2].norm),
+        "atsc" | "a85" | "-24" => return Some(LOUDNESS_PRESETS[3].norm),
+        _ => {}
+    }
+    let nums: Vec<f64> = s
+        .split([',', ':'])
+        .filter_map(|p| p.trim().parse::<f64>().ok())
+        .collect();
+    let i = *nums.first()?;
+    Some(
+        LoudnessNorm {
+            target_i: i,
+            true_peak: nums.get(1).copied().unwrap_or(-1.0),
+            lra: nums.get(2).copied().unwrap_or(11.0),
+        }
+        .clamped(),
+    )
+}
+
 /// Kompakte Job-Beschreibung für die Warteschlange (Container · Codec ·
 /// Auflösung · Dauer · Bereich).
 fn settings_summary(s: &ExportSettings, plan: &export::RenderPlan) -> String {
@@ -1629,6 +1806,9 @@ fn settings_summary(s: &ExportSettings, plan: &export::RenderPlan) -> String {
     }
     if let Some(a) = &s.audio {
         parts.push(a.codec.label.to_string());
+    }
+    if export::stems_enabled(s) {
+        parts.push("Stems".to_string());
     }
     parts.push(format!(
         "{} ({} Frames)",

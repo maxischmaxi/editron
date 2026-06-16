@@ -97,6 +97,40 @@ impl TimelineStore {
         self.attr_clipboard.is_some()
     }
 
+    /// Eine kopierte Farbkorrektur auf alle angegebenen Clips übertragen
+    /// (Premiere-/Resolve-Workflow „Grade einfügen“). Wirkt nur auf sichtbare
+    /// Clips (Video/Untertitel) auf entsperrten Spuren — Audio-Clips tragen
+    /// keine sichtbare Farbkorrektur und werden übersprungen. Ein einziger
+    /// Undo-Schnappschuss für die gesamte Mehrfachauswahl. Liefert die Anzahl
+    /// der tatsächlich geänderten Clips.
+    pub fn paste_grade(&mut self, grade: &ColorGrade, ids: &[String]) -> usize {
+        let locked = locked_track_ids(&self.tracks);
+        // Nur Clips, die sich tatsächlich ändern: Trägt ein Ziel den Grade
+        // schon, bleibt es unangetastet — so entsteht kein leerer Undo-Schritt
+        // (z. B. beim Einfügen auf den Quell-Clip selbst).
+        let affected: Vec<String> = self
+            .clips
+            .iter()
+            .filter(|c| {
+                ids.contains(&c.id)
+                    && c.kind != TrackKind::Audio
+                    && !locked.contains(&c.track_id)
+                    && c.grade != *grade
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        if affected.is_empty() {
+            return 0;
+        }
+        self.push_history();
+        for c in &mut self.clips {
+            if affected.contains(&c.id) {
+                c.grade = grade.clone();
+            }
+        }
+        affected.len()
+    }
+
     // ------------------------------------------------------------- Verlauf
 
     /// Sequenz der zuletzt rückgängig machbaren Timeline-Operation (für die

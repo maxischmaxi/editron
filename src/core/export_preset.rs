@@ -9,7 +9,7 @@
 //! unbekannte Ids fallen auf den Katalog-Standard zurück.
 
 use crate::core::export::{
-    self, AudioSettings, ExportSettings, SubtitleMode, VideoQuality, VideoSettings,
+    self, AudioSettings, ExportSettings, LoudnessNorm, SubtitleMode, VideoQuality, VideoSettings,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -51,6 +51,15 @@ pub struct AudioData {
     pub channels: u32,
 }
 
+/// Serialisierbare Lautheits-Normalisierung (siehe [`LoudnessNorm`]).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LoudnessData {
+    pub target_i: f64,
+    pub true_peak: f64,
+    pub lra: f64,
+}
+
 fn default_image_start() -> u32 {
     1
 }
@@ -64,6 +73,12 @@ pub struct PresetData {
     pub video: Option<VideoData>,
     #[serde(default)]
     pub audio: Option<AudioData>,
+    /// Lautheits-Normalisierung (None = aus).
+    #[serde(default)]
+    pub loudness: Option<LoudnessData>,
+    /// Audiospuren getrennt als Stems ausgeben (je Spur ein Audio-Stream).
+    #[serde(default)]
+    pub audio_stems: bool,
     #[serde(default)]
     pub subtitles: SubtitleMode,
     #[serde(default = "default_image_start")]
@@ -99,6 +114,12 @@ impl PresetData {
                 sample_rate: a.sample_rate,
                 channels: a.channels,
             }),
+            loudness: s.loudness.map(|l| LoudnessData {
+                target_i: l.target_i,
+                true_peak: l.true_peak,
+                lra: l.lra,
+            }),
+            audio_stems: s.audio_stems,
             subtitles: s.subtitles,
             image_start: s.image_start,
         }
@@ -136,11 +157,21 @@ impl PresetData {
                 channels: a.channels,
             }
         });
+        let loudness = self.loudness.map(|l| {
+            LoudnessNorm {
+                target_i: l.target_i,
+                true_peak: l.true_peak,
+                lra: l.lra,
+            }
+            .clamped()
+        });
         ExportSettings {
             container,
             video,
             audio,
+            loudness,
             use_in_out: false,
+            audio_stems: self.audio_stems,
             subtitles: self.subtitles,
             image_start: self.image_start,
             output,
@@ -222,7 +253,30 @@ impl UserPresets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::export::PRESETS;
+    use crate::core::export::{LoudnessNorm, PRESETS};
+
+    #[test]
+    fn roundtrip_preserves_loudness() {
+        // Lautheits-Einstellung übersteht Settings → Daten → JSON → Settings.
+        let mut original = (PRESETS[0].build)((1920, 1080), 25.0);
+        original.loudness = Some(LoudnessNorm { target_i: -16.0, true_peak: -1.5, lra: 11.0 });
+        let json = serde_json::to_string(&PresetData::from_settings(&original)).unwrap();
+        let back: PresetData = serde_json::from_str(&json).unwrap();
+        let l = back.to_settings(String::new()).loudness.expect("loudness erhalten");
+        assert!((l.target_i - (-16.0)).abs() < 1e-9);
+        assert!((l.true_peak - (-1.5)).abs() < 1e-9);
+        assert!((l.lra - 11.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loudness_defaults_to_off_for_legacy_presets() {
+        // Altes Preset-JSON ohne `loudness`-Feld lädt fehlerfrei als „aus“.
+        let data: PresetData =
+            serde_json::from_str(r#"{"container":"mp4","subtitles":"none","imageStart":1}"#)
+                .unwrap();
+        assert!(data.loudness.is_none());
+        assert!(data.to_settings(String::new()).loudness.is_none());
+    }
 
     #[test]
     fn roundtrip_preserves_settings() {
@@ -267,6 +321,8 @@ mod tests {
                 tenbit: false,
             }),
             audio: None,
+            loudness: None,
+            audio_stems: false,
             subtitles: SubtitleMode::None,
             image_start: 1,
         };

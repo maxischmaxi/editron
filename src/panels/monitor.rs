@@ -41,6 +41,10 @@ pub struct ResolvedLayer {
     pub alpha: u8,
     /// Farbkorrektur des Clips (Identität = ungegradet).
     pub grade: crate::core::grade::GradeParams,
+    /// Input-/Look-3D-LUT (Pfad + Stärke 0…1) — am Programm-Compositing über
+    /// den Grade-Shader gebunden (GPU-Texturen im `lut_textures`-Cache).
+    pub input_lut: Option<(String, f32)>,
+    pub look_lut: Option<(String, f32)>,
     /// Sichtbarer Canvas-Ausschnitt (Wipe-Übergang); None = voll sichtbar.
     pub mask: Option<Rect>,
     /// Titel-Layer: vertikaler Raster-Erweiterungsfaktor (Abspann-Rolle);
@@ -175,6 +179,10 @@ fn render_monitor(
                             q.rot_deg as f32,
                             layer.alpha,
                             &layer.grade,
+                            crate::ui::GradeLutRefs {
+                                input: layer.input_lut.as_ref().map(|(p, s)| (p.as_str(), *s)),
+                                look: layer.look_lut.as_ref().map(|(p, s)| (p.as_str(), *s)),
+                            },
                         );
                         if layer.mask.is_some() {
                             ui.pop_clip();
@@ -344,7 +352,11 @@ fn render_monitor(
     if let Some(loop_on) = chrome.loop_button {
         buttons.push(Btn {
             icon: "repeat",
-            tip: "Loop-Wiedergabe (zwischen In/Out)",
+            tip: if chrome.monitor == "program" {
+                "Loop-Wiedergabe (In/Out oder ganze Sequenz)"
+            } else {
+                "Loop-Wiedergabe (In/Out oder ganzer Clip)"
+            },
             enabled: has,
             active: loop_on,
             action_id: 9,
@@ -752,12 +764,22 @@ fn resolve_program_layers(
                 },
                 alpha: (opacity * 255.0).round().clamp(0.0, 255.0) as u8,
                 grade: crate::core::grade::precompute(&clip.grade),
+                input_lut: lut_ref(&clip.grade.input_lut),
+                look_lut: lut_ref(&clip.grade.look_lut),
                 mask,
                 extend_k,
                 is_title: clip.is_title(),
             }))
         })
         .collect()
+}
+
+/// LUT-Slot eines Grades → (Pfad, Stärke 0…1) für den Programmmonitor; None
+/// wenn leer/inaktiv.
+fn lut_ref(slot: &Option<crate::core::grade::LutSlot>) -> Option<(String, f32)> {
+    slot.as_ref()
+        .filter(|s| s.is_active())
+        .map(|s| (s.path.clone(), s.strength01()))
 }
 
 /// Einen Rahmen der Stärke `th` um `r` zeichnen (vier dünne Flächen).
@@ -995,6 +1017,8 @@ impl Panel for ProgramMonitorPanel {
                 },
                 alpha: 255,
                 grade: crate::core::grade::precompute(&crate::core::grade::ColorGrade::default()),
+                input_lut: None,
+                look_lut: None,
                 mask: None,
                 extend_k: 1.0,
                 is_title: false,
@@ -1018,7 +1042,7 @@ impl Panel for ProgramMonitorPanel {
             has_media: has_clips,
             in_point: app.timeline.in_point,
             out_point: app.timeline.out_point,
-            loop_button: None,
+            loop_button: Some(app.playback.program_looping),
             empty_hint:
                 "Keine Clips in der Sequenz — Medien aus dem Medien-Browser in die Timeline ziehen.",
             stage: if has_clips {
@@ -1317,7 +1341,9 @@ impl Panel for ProgramMonitorPanel {
                 app.timeline.set_out_point(Some(t));
             }
             MonitorAction::ClearMarks => app.timeline.clear_in_out(),
-            MonitorAction::ToggleLoop => {}
+            MonitorAction::ToggleLoop => {
+                app.playback.program_looping = !app.playback.program_looping;
+            }
             MonitorAction::SetScale(v) => app.monitor.program_scale = v,
             // Insert/Overwrite gibt es nur im Quellmonitor.
             MonitorAction::Insert | MonitorAction::Overwrite => {}

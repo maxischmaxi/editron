@@ -74,6 +74,9 @@ pub enum DialogId {
     /// Sequenz löschen, die als Nest verwendet wird (Warnung). Ziel in
     /// `AppStore::sequence_delete_target`.
     ConfirmDeleteSequence,
+    /// Belegte Spur entfernen bestätigen (Clips würden mit gelöscht). Ziel in
+    /// `AppStore::remove_track_target`.
+    ConfirmRemoveTrack,
     /// Ergebnis eines Interop-Import/-Exports (Kennzahlen + Auslassungen).
     /// Inhalt in `AppStore::interop_report`.
     InteropReport,
@@ -159,6 +162,8 @@ pub struct AppStore {
     pub rename_sequence: Option<String>,
     /// Ziel des „Sequenz löschen“-Bestätigungsdialogs (als Nest verwendet).
     pub sequence_delete_target: Option<String>,
+    /// Ziel des „Spur entfernen“-Bestätigungsdialogs (belegte Spur).
+    pub remove_track_target: Option<String>,
     /// Ergebnis-Bericht des letzten Interop-Import/-Exports (vom Vorgang
     /// gesetzt, vom Ergebnis-Dialog gelesen). Nicht persistiert.
     pub interop_report: Option<crate::core::interop::InteropReport>,
@@ -174,6 +179,10 @@ pub struct AppStore {
     /// Projektdatei (mutmaßlicher Absturz). Der Autosave-Dialog zeigt dann
     /// einen Wiederherstellungs-Hinweis auf diese Datei.
     pub autosave_recover_hint: Option<std::path::PathBuf>,
+    /// Von [`crate::core::project::apply`] gesetzt, wenn ein Projekt mit einer
+    /// NEUEREN Formatversion geladen wurde (best-effort statt Abbruch). Der
+    /// Mainloop surft den Hinweis einmalig in die Statusleiste.
+    pub load_warning: Option<String>,
 }
 
 /// Ziel einer Farbaufnahme: drei aufeinanderfolgende Effekt-Parameter
@@ -205,10 +214,12 @@ impl Default for AppStore {
             quit_requested: false,
             rename_sequence: None,
             sequence_delete_target: None,
+            remove_track_target: None,
             interop_report: None,
             ui_scale: 1.0,
             autosave_open_request: None,
             autosave_recover_hint: None,
+            load_warning: None,
         }
     }
 }
@@ -913,9 +924,16 @@ pub struct PlaybackStore {
     /// Asset, das aktuell im Quellmonitor geladen ist.
     pub source_asset_id: Option<String>,
     pub source: SourcePlayerState,
+    /// Unbekannte Felder einer neueren Version im Quellmonitor-Block der
+    /// Projektdatei (siehe `core::project::ProjectFile::extra`). Verlustfrei
+    /// beim Speichern zurückgeschrieben.
+    pub source_extra: serde_json::Map<String, serde_json::Value>,
     /// Programm (Timeline): Position = timeline.playhead_sec.
     pub program_playing: bool,
     pub program_rate: f64,
+    /// Loop-Wiedergabe im Programmmonitor: zwischen In/Out, sonst über die
+    /// ganze Sequenz. Laufzeit-Zustand (nicht persistiert, wie `program_rate`).
+    pub program_looping: bool,
     /// Transient: Playhead wird gerade per Lineal/Scrubber gezogen (für
     /// Audio-Scrubbing). Panels setzen das pro UI-Frame, der Mainloop reseted es.
     pub scrub_active: bool,
@@ -927,12 +945,14 @@ impl Default for PlaybackStore {
     fn default() -> Self {
         PlaybackStore {
             source_asset_id: None,
+            source_extra: serde_json::Map::new(),
             source: SourcePlayerState {
                 rate: 1.0,
                 ..Default::default()
             },
             program_playing: false,
             program_rate: 1.0,
+            program_looping: false,
             scrub_active: false,
             audio_scrub_enabled: true,
         }
@@ -1059,6 +1079,7 @@ mod tests {
 
     fn asset(id: &str, name: &str) -> MediaAsset {
         MediaAsset {
+            extra: Default::default(),
             id: id.into(),
             path: format!("/tmp/{id}.mp4"),
             name: name.into(),

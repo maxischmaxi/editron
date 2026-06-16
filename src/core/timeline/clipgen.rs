@@ -244,6 +244,7 @@ impl TimelineStore {
             });
 
         let clip = TimelineClip {
+            extra: Default::default(),
             id: new_id(),
             track_id,
             asset_id: String::new(),
@@ -400,6 +401,7 @@ impl TimelineStore {
     fn make_subtitle_clip(track_id: &str, text: &str, start: f64, duration: f64) -> TimelineClip {
         let spec = SubtitleSpec::new(text);
         TimelineClip {
+            extra: Default::default(),
             id: new_id(),
             track_id: track_id.to_string(),
             asset_id: String::new(),
@@ -536,6 +538,175 @@ impl TimelineStore {
             .collect();
         cues.sort_by(|a, b| a.start.total_cmp(&b.start));
         cues
+    }
+
+    /// Text eines Segments an einer Wort-/Zeilengrenze möglichst nah am
+    /// Anteil `frac` (0–1) zweiteilen — verteilt die Lesezeit gleichmäßig,
+    /// ohne ein Wort zu zerschneiden. Beide Hälften werden getrimmt; kein
+    /// Wort geht verloren (Whitespace an der Grenze wird konsumiert).
+    fn split_subtitle_text(text: &str, frac: f64) -> (String, String) {
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        if n == 0 {
+            return (String::new(), String::new());
+        }
+        let target = ((frac.clamp(0.0, 1.0) * n as f64).round() as usize).min(n);
+        // Whitespace-Position mit dem kleinsten Abstand zum Zielindex; ohne
+        // jeglichen Whitespace (Einzelwort) am Zielindex hart trennen.
+        let split = chars
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_whitespace())
+            .min_by_key(|(i, _)| target.abs_diff(*i))
+            .map(|(i, _)| i)
+            .unwrap_or(target);
+        let left: String = chars[..split].iter().collect();
+        let right: String = chars[split..].iter().collect();
+        (left.trim().to_string(), right.trim().to_string())
+    }
+
+    /// Untertitel-Segment unter dem Playhead (auf der aktiven Spur) am
+    /// Playhead in zwei teilen: das Timing wird frame-genau an der Kante
+    /// geteilt, der Text proportional zur Lesezeit auf beide Hälften
+    /// verteilt. Ein Undo-Schritt; liefert die ID der rechten Hälfte.
+    pub fn subtitle_split_at_playhead(&mut self) -> Result<String, String> {
+        let track_id = self
+            .active_subtitle_track()
+            .map(|t| t.id.clone())
+            .ok_or_else(|| "Keine Untertitel-Spur vorhanden".to_string())?;
+        let locked = locked_track_ids(&self.tracks);
+        if locked.contains(&track_id) {
+            return Err("Die Untertitel-Spur ist gesperrt".to_string());
+        }
+        let rate = self.settings.rate;
+        let at = rate.time_of_frame(rate.frame_round(self.playhead_sec.max(0.0)).max(0) as f64);
+        // Segment, das beidseitig Platz für mindestens eine Frame-Hälfte lässt.
+        let Some(idx) = self.clips.iter().position(|c| {
+            c.track_id == track_id
+                && c.subtitle.is_some()
+                && at > c.start + MIN_CLIP_DURATION - EPS
+                && at < c.end() - MIN_CLIP_DURATION + EPS
+        }) else {
+            return Err("Kein teilbares Untertitel-Segment am Playhead".to_string());
+        };
+
+        self.push_history();
+        let original = self.clips[idx].clone();
+        let left_len = at - original.start;
+        let frac = (left_len / original.duration).clamp(0.0, 1.0);
+        let text = original
+            .subtitle
+            .as_ref()
+            .map(|s| s.text.clone())
+            .unwrap_or_default();
+        let (left_text, right_text) = Self::split_subtitle_text(&text, frac);
+
+        let mut left = original.clone();
+        left.duration = left_len;
+        if let Some(spec) = left.subtitle.as_mut() {
+            spec.text = left_text;
+            left.name = spec.display_name();
+        }
+
+        let mut right = original.clone();
+        right.id = new_id();
+        right.start = at;
+        right.duration = original.end() - at;
+        if let Some(spec) = right.subtitle.as_mut() {
+            spec.text = right_text;
+            right.name = spec.display_name();
+        }
+
+        let right_id = right.id.clone();
+        self.clips[idx] = left;
+        self.clips.insert(idx + 1, right);
+        self.selected_clip_ids = vec![right_id.clone()];
+        self.selected_transition_ids.clear();
+        Ok(right_id)
+    }
+
+    /// Das ausgewählte (sonst das am Playhead liegende) Untertitel-Segment
+    /// mit seinem Nachbarn auf derselben Spur verschmelzen — bevorzugt mit
+    /// dem nächsten, sonst dem vorherigen. Das Ergebnis spannt von der
+    /// frühen Start- bis zur späten Endkante, die Texte werden zeilenweise
+    /// verbunden. Ein Undo-Schritt; liefert die ID des Ergebnis-Segments.
+    pub fn subtitle_merge(&mut self) -> Result<String, String> {
+        // Anker: erstes ausgewähltes Untertitel-Segment, sonst das Segment
+        // unter dem Playhead auf der aktiven Spur.
+        let anchor = self
+            .selected_clip_ids
+            .iter()
+            .find_map(|id| self.clips.iter().find(|c| &c.id == id && c.subtitle.is_some()))
+            .or_else(|| {
+                let track_id = self.active_subtitle_track().map(|t| t.id.clone())?;
+                let at = self.playhead_sec;
+                self.clips.iter().find(|c| {
+                    c.track_id == track_id
+                        && c.subtitle.is_some()
+                        && at >= c.start - EPS
+                        && at < c.end() + EPS
+                })
+            })
+            .map(|c| (c.track_id.clone(), c.id.clone()));
+        let Some((track_id, anchor_id)) = anchor else {
+            return Err("Kein Untertitel-Segment ausgewählt".to_string());
+        };
+        if locked_track_ids(&self.tracks).contains(&track_id) {
+            return Err("Die Untertitel-Spur ist gesperrt".to_string());
+        }
+
+        // Segmente der Spur nach Start sortiert; Nachbar des Ankers bestimmen.
+        let mut seg: Vec<(String, f64)> = self
+            .clips
+            .iter()
+            .filter(|c| c.track_id == track_id && c.subtitle.is_some())
+            .map(|c| (c.id.clone(), c.start))
+            .collect();
+        seg.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let pos = seg.iter().position(|(id, _)| *id == anchor_id).unwrap();
+        let neighbor = if pos + 1 < seg.len() {
+            pos + 1
+        } else if pos > 0 {
+            pos - 1
+        } else {
+            return Err("Kein Nachbarsegment zum Zusammenführen".to_string());
+        };
+        let first_id = seg[pos.min(neighbor)].0.clone();
+        let second_id = seg[pos.max(neighbor)].0.clone();
+
+        self.push_history();
+        let first = self.clips.iter().find(|c| c.id == first_id).cloned().unwrap();
+        let second = self.clips.iter().find(|c| c.id == second_id).cloned().unwrap();
+        let new_start = first.start;
+        let new_end = second.end();
+        let trim = |c: &TimelineClip| {
+            c.subtitle
+                .as_ref()
+                .map(|s| s.text.trim().to_string())
+                .unwrap_or_default()
+        };
+        let (a, b) = (trim(&first), trim(&second));
+        let merged_text = match (a.is_empty(), b.is_empty()) {
+            (true, _) => b,
+            (_, true) => a,
+            _ => format!("{a}\n{b}"),
+        };
+
+        self.clips.retain(|c| c.id != second_id);
+        if let Some(c) = self.clips.iter_mut().find(|c| c.id == first_id) {
+            c.start = new_start;
+            c.duration = new_end - new_start;
+            if let Some(spec) = c.subtitle.as_mut() {
+                spec.text = merged_text;
+                c.name = spec.display_name();
+            }
+        }
+        self.selected_clip_ids = vec![first_id.clone()];
+        self.selected_transition_ids.clear();
+        // Falls je ein Übergang an dem entfernten Segment hing, bereinigen
+        // (Untertitel tragen normalerweise keine — defensiv wie beim Löschen).
+        self.reconcile_transitions();
+        Ok(first_id)
     }
 
     pub fn remove_clips_for_assets(&mut self, asset_ids: &[String]) {

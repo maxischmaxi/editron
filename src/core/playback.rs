@@ -16,6 +16,7 @@ pub enum PlaybackCmd {
     MarkIn,
     MarkOut,
     ClearMarks,
+    ToggleLoop,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +118,7 @@ fn source_dispatch(state: &mut AppState, cmd: PlaybackCmd) {
             s.in_mark = None;
             s.out_mark = None;
         }
+        PlaybackCmd::ToggleLoop => s.looping = !s.looping,
     }
 }
 
@@ -161,6 +163,9 @@ fn program_dispatch(state: &mut AppState, cmd: PlaybackCmd) {
             state.timeline.set_out_point(Some(t));
         }
         PlaybackCmd::ClearMarks => state.timeline.clear_in_out(),
+        PlaybackCmd::ToggleLoop => {
+            state.playback.program_looping = !state.playback.program_looping;
+        }
     }
 }
 
@@ -195,24 +200,144 @@ pub fn tick(state: &mut AppState, dt: f64) {
     // Programm (Timeline)
     if state.playback.program_playing {
         let end = sequence_end(&state.timeline.clips);
-        let mut t = state.timeline.playhead_sec + dt * state.playback.program_rate;
-        // Loop über die Sequenz-In/Out-Punkte
-        if let (Some(i), Some(o)) = (state.timeline.in_point, state.timeline.out_point) {
-            if o > i {
-                if state.playback.program_rate > 0.0 && t >= o {
-                    t = i + (t - o) % (o - i);
-                } else if state.playback.program_rate < 0.0 && t < i {
-                    t = o - (i - t) % (o - i);
-                }
-            }
-        } else if t >= end && state.playback.program_rate > 0.0 {
+        let (t, playing) = advance_program(
+            state.timeline.playhead_sec,
+            dt,
+            state.playback.program_rate,
+            state.playback.program_looping,
+            state.timeline.in_point,
+            state.timeline.out_point,
+            end,
+        );
+        state.timeline.playhead_sec = t;
+        state.playback.program_playing = playing;
+    }
+}
+
+/// Reine Programm-Transport-Mathematik für einen Tick: schreibt die Position
+/// fort und behandelt entweder den Loop (zwischen In/Out, sonst über die ganze
+/// Sequenz `0..end`) oder das Anhalten an den Sequenzgrenzen. Gibt die neue
+/// Position (≥ 0) und zurück, ob die Wiedergabe weiterläuft.
+fn advance_program(
+    playhead: f64,
+    dt: f64,
+    rate: f64,
+    looping: bool,
+    in_point: Option<f64>,
+    out_point: Option<f64>,
+    end: f64,
+) -> (f64, bool) {
+    let mut t = playhead + dt * rate;
+    let mut playing = true;
+    // Loop-Grenzen: gesetzte In/Out-Punkte, sonst die ganze Sequenz.
+    let (lo, hi) = match (in_point, out_point) {
+        (Some(i), Some(o)) if o > i => (i, o),
+        _ => (0.0, end),
+    };
+    if looping && hi > lo {
+        // Loop aktiv: an den Grenzen umschlagen statt anhalten. Der Modulo
+        // fängt auch große Sprünge (hohe Rate, Playhead außerhalb) korrekt ab.
+        if rate > 0.0 && t >= hi {
+            t = lo + (t - hi) % (hi - lo);
+        } else if rate < 0.0 && t < lo {
+            t = hi - (lo - t) % (hi - lo);
+        }
+    } else {
+        // Kein Loop: am Sequenzende bzw. -anfang anhalten.
+        if t >= end && rate > 0.0 {
             t = end;
-            state.playback.program_playing = false;
+            playing = false;
         }
-        if t <= 0.0 && state.playback.program_rate < 0.0 {
+        if t <= 0.0 && rate < 0.0 {
             t = 0.0;
-            state.playback.program_playing = false;
+            playing = false;
         }
-        state.timeline.playhead_sec = t.max(0.0);
+    }
+    (t.max(0.0), playing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_program;
+
+    const DT: f64 = 0.1;
+
+    #[test]
+    fn no_loop_stops_at_sequence_end() {
+        // Ohne Loop läuft das Programm bis zum Sequenzende und hält an —
+        // auch wenn In/Out gesetzt sind (In/Out stoppen die Wiedergabe nicht).
+        let (t, playing) = advance_program(9.97, DT, 1.0, false, Some(2.0), Some(5.0), 10.0);
+        assert_eq!(t, 10.0);
+        assert!(!playing);
+    }
+
+    #[test]
+    fn no_loop_does_not_wrap_past_out_point() {
+        // Ohne Loop ignoriert der Out-Punkt das Umschlagen: der Playhead läuft
+        // einfach über den Out-Punkt hinaus weiter.
+        let (t, playing) = advance_program(4.95, DT, 1.0, false, Some(2.0), Some(5.0), 10.0);
+        assert!((t - 5.05).abs() < 1e-9, "t = {t}");
+        assert!(playing);
+    }
+
+    #[test]
+    fn loop_wraps_between_in_and_out() {
+        // Loop an + In/Out: am Out-Punkt zurück zum In-Punkt umschlagen.
+        let (t, playing) = advance_program(4.95, DT, 1.0, true, Some(2.0), Some(5.0), 10.0);
+        assert!((t - 2.05).abs() < 1e-9, "t = {t}");
+        assert!(playing);
+    }
+
+    #[test]
+    fn loop_wraps_over_whole_sequence_without_marks() {
+        // Loop an, keine In/Out: über die ganze Sequenz umschlagen (end -> 0).
+        let (t, playing) = advance_program(9.95, DT, 1.0, true, None, None, 10.0);
+        assert!((t - 0.05).abs() < 1e-9, "t = {t}");
+        assert!(playing);
+    }
+
+    #[test]
+    fn loop_backward_wraps_to_out_point() {
+        // Rückwärts-Loop: am In-Punkt zurück zum Out-Punkt umschlagen.
+        let (t, playing) = advance_program(2.05, DT, -1.0, true, Some(2.0), Some(5.0), 10.0);
+        assert!((t - 4.95).abs() < 1e-9, "t = {t}");
+        assert!(playing);
+    }
+
+    #[test]
+    fn loop_backward_over_whole_sequence_wraps_to_end() {
+        // Rückwärts-Loop ohne Marken: am Anfang zurück zum Sequenzende.
+        let (t, playing) = advance_program(0.05, DT, -1.0, true, None, None, 10.0);
+        assert!((t - 9.95).abs() < 1e-9, "t = {t}");
+        assert!(playing);
+    }
+
+    #[test]
+    fn loop_handles_jump_larger_than_region() {
+        // Sprung > Loop-Länge (hohe Rate / Playhead weit außerhalb): der Modulo
+        // bringt die Position korrekt in den Loop-Bereich, ohne zu überlaufen.
+        let region = 5.0 - 2.0;
+        let (t, playing) = advance_program(8.0, DT, 100.0, true, Some(2.0), Some(5.0), 10.0);
+        assert!(t >= 2.0 && t < 5.0, "t = {t} außerhalb [2,5)");
+        // 8 + 0.1*100 = 18; (18 - 5) % 3 = 1 -> lo + 1 = 3
+        assert!((t - (2.0 + (18.0 - 5.0) % region)).abs() < 1e-9, "t = {t}");
+        assert!(playing);
+    }
+
+    #[test]
+    fn loop_on_empty_sequence_does_not_panic_and_stops() {
+        // Leere Sequenz (end == 0): kein Loop-Bereich (hi == lo), kein
+        // Div-by-Zero; die Wiedergabe hält an.
+        let (t, playing) = advance_program(0.0, DT, 1.0, true, None, None, 0.0);
+        assert_eq!(t, 0.0);
+        assert!(!playing);
+    }
+
+    #[test]
+    fn loop_ignores_inverted_marks() {
+        // Ungültige Marken (Out <= In): fallen auf die ganze Sequenz zurück.
+        let (t, playing) = advance_program(9.95, DT, 1.0, true, Some(5.0), Some(2.0), 10.0);
+        assert!((t - 0.05).abs() < 1e-9, "t = {t}");
+        assert!(playing);
     }
 }

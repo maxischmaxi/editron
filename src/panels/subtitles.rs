@@ -6,10 +6,11 @@
 //! Farbe, Position, Box/Kontur) — Änderungen sind undo-fähig
 //! (Gesten-Snapshots wie im Grafik-Panel).
 
-use crate::core::subtitle::SUBTITLE_POS_PRESETS;
+use crate::core::subtitle::{readability, SUBTITLE_POS_PRESETS};
+use crate::core::text_raster::list_font_families;
 use crate::core::timecode::format_sequence_timecode;
 use crate::core::timeline::SelectMode;
-use crate::core::title::RgbaColor;
+use crate::core::title::{RgbaColor, TitleWeight};
 use crate::panels::color::slider_row;
 use crate::panels::Panel;
 use crate::services::Services;
@@ -218,6 +219,18 @@ impl Panel for SubtitlesPanel {
                 command: "subtitle.addAtPlayhead",
                 active: false,
             },
+            BarBtn {
+                icon: "scissors",
+                tip: "Untertitel am Playhead teilen",
+                command: "subtitle.split",
+                active: false,
+            },
+            BarBtn {
+                icon: "link-2",
+                tip: "Untertitel mit Nachbarn zusammenführen",
+                command: "subtitle.merge",
+                active: false,
+            },
         ];
         let mut bx = bar.right();
         for (i, b) in buttons.iter().enumerate() {
@@ -262,13 +275,58 @@ impl Panel for SubtitlesPanel {
         if self.style_open {
             let style = app.timeline.subtitle_style(&track_id);
             let pad = 12.0;
-            let style_h = 18.0 + (ROW_H + GAP) * 5.0 + 12.0;
+            let style_h = 18.0 + (ROW_H + GAP) * 7.0 + 12.0;
             let panel = area.cut_top(style_h);
             let x = panel.x + pad;
             let w = panel.w - 2.0 * pad;
             let mut y = panel.y + 6.0;
             section(ui, x, y, w, "Spurstil");
             y += 18.0;
+
+            // Schriftfamilie (fontconfig-Liste; „Standard" = leeres Feld).
+            let families = list_font_families();
+            let mut row = Rect::new(x, y, w, ROW_H);
+            let label_cell = row.cut_left(88.0);
+            ui.text_left("Schriftfamilie", label_cell, theme::TEXT_2, FontKind::Sans12);
+            row.cut_left(8.0);
+            let mut options: Vec<&str> = vec!["Standard (Sans)"];
+            options.extend(families.iter().map(|f| f.as_str()));
+            let family_idx = if style.font_family.is_empty() {
+                0
+            } else {
+                families
+                    .iter()
+                    .position(|f| *f == style.font_family)
+                    .map(|i| i + 1)
+                    .unwrap_or(0)
+            };
+            let family_rect = Rect::new(row.x, y + 1.0, row.w, ROW_H - 2.0);
+            if let Some(idx) = select(ui, "subtitles.family", family_rect, &options, family_idx) {
+                let family = if idx == 0 {
+                    String::new()
+                } else {
+                    families[idx - 1].clone()
+                };
+                app.timeline.subtitle_style_update(&track_id, move |s| s.font_family = family);
+            }
+            y += ROW_H + GAP;
+
+            // Schriftschnitt (Gewicht).
+            let mut row = Rect::new(x, y, w, ROW_H);
+            let label_cell = row.cut_left(88.0);
+            ui.text_left("Schriftschnitt", label_cell, theme::TEXT_2, FontKind::Sans12);
+            row.cut_left(8.0);
+            let weights: Vec<&str> = TitleWeight::ALL.iter().map(|wt| wt.label()).collect();
+            let weight_idx = TitleWeight::ALL
+                .iter()
+                .position(|v| *v == style.weight)
+                .unwrap_or(0);
+            let weight_rect = Rect::new(row.x, y + 1.0, row.w, ROW_H - 2.0);
+            if let Some(idx) = select(ui, "subtitles.weight", weight_rect, &weights, weight_idx) {
+                let value = TitleWeight::ALL[idx];
+                app.timeline.subtitle_style_update(&track_id, move |s| s.weight = value);
+            }
+            y += ROW_H + GAP;
 
             let mut size = style.size;
             slider_row(ui, "subtitles.size", Rect::new(x, y, w, ROW_H), "Schriftgröße", &mut size, 16.0, 120.0, 48.0);
@@ -424,8 +482,20 @@ impl Panel for SubtitlesPanel {
                 ui.fill_rounded(Rect::new(r.x, r.y, 3.0, r.h), 1.5, theme::ACCENT);
             }
 
-            // Kopfzeile: Index + In/Out-Timecode.
-            let head = Rect::new(r.x + 10.0, r.y + 3.0, r.w - 20.0, 14.0);
+            // Kopfzeile: Index + In/Out-Timecode (links), Lesbarkeit (rechts).
+            let mut head = Rect::new(r.x + 10.0, r.y + 3.0, r.w - 20.0, 14.0);
+            // Lesbarkeit: Zeichen-pro-Sekunde + längste Zeile — rot über der
+            // Profi-Norm (>17 CPS bzw. >42 Zeichen je Zeile).
+            let dur = (row.end - row.start).max(0.0);
+            let (cps, max_line, over) = readability(&row.text, dur);
+            let badge = format!("{cps:.0} CPS · {max_line} Z.");
+            let badge_cell = head.cut_right(116.0);
+            ui.text_right(
+                &badge,
+                badge_cell,
+                if over { theme::DANGER } else { theme::TEXT_3 },
+                FontKind::Mono12,
+            );
             let tc = format!(
                 "{:>3}  {} → {}",
                 idx + 1,

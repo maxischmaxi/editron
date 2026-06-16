@@ -90,6 +90,7 @@ impl TimelineStore {
                 })
                 .unwrap_or_default();
             inserted.push(TimelineClip {
+                extra: Default::default(),
                 id: new_id(),
                 track_id,
                 asset_id: p.asset_id.clone(),
@@ -646,6 +647,191 @@ impl TimelineStore {
             })
             .collect();
         self.reconcile_transitions();
+    }
+
+    /// Verschiebt die selektierten Clips per Tastatur um exakt `frames` Frames
+    /// (negativ = nach links) — frame-quantisiert über die Sequenzrate
+    /// (NTSC-driftfrei). Reiner Frame-Versatz ohne Magnetismus, das Snapping
+    /// ist also bewusst wirkungslos. Verknüpfte Clips wandern mit (Link-
+    /// Expansion), gesperrte Spuren bleiben unberührt; ein Undo-Schritt pro
+    /// Aufruf (über `move_clips`).
+    pub fn nudge_selected_clips(&mut self, frames: f64) {
+        if self.selected_clip_ids.is_empty() {
+            return;
+        }
+        let dt = self.settings.rate.time_of_frame(frames);
+        let ids = expand_links(&self.clips, &self.selected_clip_ids);
+        self.move_clips(&ids, dt, 0);
+    }
+
+    /// Trimmt im Trim-Werkzeug-Kontext (Ripple/Rolling) die dem Playhead
+    /// nächstgelegene Kante des primär selektierten Clips per Tastatur um
+    /// exakt `frames` Frames (negativ = nach links). `rolling` rollt die
+    /// gemeinsame Schnittkante mit dem bündigen Nachbarn (Sequenzdauer bleibt);
+    /// sonst (oder ohne Nachbarn) Ripple-Trim. Frame-quantisiert, ein
+    /// Undo-Schritt; gesperrte Spuren / fehlende Auswahl ⇒ no-op.
+    pub fn nudge_active_edge(&mut self, frames: f64, rolling: bool) {
+        let dt = self.settings.rate.time_of_frame(frames);
+        let locked = locked_track_ids(&self.tracks);
+        let ph = self.playhead_sec;
+        // Aus der Auswahl die „aktive" Kante bestimmen: die dem Playhead
+        // nächstgelegene Kante über ALLE selektierten Clips (deterministisch
+        // auch bei Mehrfachauswahl; gesperrte/Untertitel-Spuren scheiden aus).
+        let sel = self.selected_clip_ids.clone();
+        let mut best: Option<(String, TrimEdge, f64)> = None;
+        for id in &sel {
+            let Some(c) = self.clip(id) else { continue };
+            if c.kind == TrackKind::Subtitle || locked.contains(&c.track_id) {
+                continue;
+            }
+            for (edge, pos) in [(TrimEdge::Start, c.start), (TrimEdge::End, c.end())] {
+                let dist = (pos - ph).abs();
+                if best.as_ref().is_none_or(|(_, _, d)| dist < *d) {
+                    best = Some((c.id.clone(), edge, dist));
+                }
+            }
+        }
+        let Some((clip_id, edge, _)) = best else {
+            return;
+        };
+        if rolling {
+            // Rolling rollt die gemeinsame Schnittkante mit dem bündig
+            // anschließenden Nachbarn auf derselben Spur (Sequenzdauer bleibt).
+            let Some(clip) = self.clip(&clip_id).cloned() else {
+                return;
+            };
+            let neighbor = self
+                .clips
+                .iter()
+                .find(|c| {
+                    c.track_id == clip.track_id
+                        && c.id != clip.id
+                        && match edge {
+                            TrimEdge::Start => (c.end() - clip.start).abs() < EPS,
+                            TrimEdge::End => (c.start - clip.end()).abs() < EPS,
+                        }
+                })
+                .map(|c| c.id.clone());
+            match neighbor {
+                Some(neighbor_id) => {
+                    let (left, right) = match edge {
+                        TrimEdge::Start => (neighbor_id, clip_id),
+                        TrimEdge::End => (clip_id, neighbor_id),
+                    };
+                    self.roll_edit(&left, &right, dt);
+                }
+                // Offene Kante (kein Nachbar): nur die Kante trimmen, ohne zu
+                // rippeln — nichts Nachgelagertes verschiebt sich (Sync bleibt).
+                None => self.trim_clip(&clip_id, edge, dt),
+            }
+        } else {
+            self.ripple_trim_clip(&clip_id, edge, dt);
+        }
+    }
+
+    /// Extend Edit (Premiere „E" / FCP „Shift+X"): zieht die Schnittkante, die
+    /// dem Playhead am nächsten liegt, exakt auf den (frame-gerasteten)
+    /// Playhead. Es zählen nur die anvisierten, ungesperrten Ziel-Spuren
+    /// (`targeted_track_ids`) — Lock und Targeting werden damit respektiert.
+    /// An der gefundenen Position werden ALLE betroffenen Kanten dieser Spuren
+    /// gemeinsam (ein History-Schritt) um dasselbe, gemeinsam geklemmte Delta
+    /// bewegt:
+    ///   • Liegt auf der Gegenseite derselben Spur ein bündig anschließender
+    ///     Clip → Roll (Sequenzdauer bleibt, ein Clip länger, der andere kürzer).
+    ///   • Sonst wird die offene Kante in die Lücke / ans Sequenzende getrimmt
+    ///     (kein Ripple, Nachbarn werden nicht überschrieben ⇒ Sync bleibt
+    ///     gewahrt, nichts Nachgelagertes verschiebt sich).
+    /// Verknüpfte A/V-Clips (oder mehrere Ziel-Spuren mit Schnitt an derselben
+    /// Stelle) bleiben synchron, weil ihre Kanten dieselbe Position teilen und
+    /// dasselbe Delta erhalten. Liefert `false`, wenn keine Kante auf den Ziel-
+    /// Spuren existiert (sonst `true`, auch wenn die Kante mangels Spielraum
+    /// stehen bleibt).
+    pub fn extend_edit(&mut self) -> bool {
+        let targets = self.targeted_track_ids();
+        if targets.is_empty() {
+            return false;
+        }
+        let ph = self.snap_to_frame(self.playhead_sec);
+
+        // 1) Kantenposition auf den Ziel-Spuren, die dem Playhead am nächsten
+        //    liegt (Kanten direkt am Playhead scheiden aus — kein Delta). Ties
+        //    behalten die erste Position, damit Through-Edits (beide Kanten an
+        //    derselben Stelle) stabil zusammenfallen.
+        let mut best_pos: Option<f64> = None;
+        for c in &self.clips {
+            if !targets.contains(&c.track_id) {
+                continue;
+            }
+            for pos in [c.start, c.end()] {
+                if (pos - ph).abs() < EPS {
+                    continue;
+                }
+                let closer = best_pos.is_none_or(|bp| (pos - ph).abs() + EPS < (bp - ph).abs());
+                if closer {
+                    best_pos = Some(pos);
+                }
+            }
+        }
+        let Some(pos) = best_pos else {
+            return false;
+        };
+
+        // 2) Alle Kanten an dieser Position auf den Ziel-Spuren einsammeln. Pro
+        //    Clip höchstens eine Kante (Start ODER Ende — sie liegen > MIN_CLIP_
+        //    DURATION auseinander). `rolling` = auf der Gegenseite derselben Spur
+        //    schließt ein weiterer Clip bündig an (Through-Edit).
+        let mut edges: Vec<(String, TrimEdge, bool)> = Vec::new();
+        for c in &self.clips {
+            if !targets.contains(&c.track_id) {
+                continue;
+            }
+            if (c.end() - pos).abs() < EPS {
+                let rolling = self.clips.iter().any(|o| {
+                    o.id != c.id && o.track_id == c.track_id && (o.start - pos).abs() < EPS
+                });
+                edges.push((c.id.clone(), TrimEdge::End, rolling));
+            } else if (c.start - pos).abs() < EPS {
+                let rolling = self.clips.iter().any(|o| {
+                    o.id != c.id && o.track_id == c.track_id && (o.end() - pos).abs() < EPS
+                });
+                edges.push((c.id.clone(), TrimEdge::Start, rolling));
+            }
+        }
+        if edges.is_empty() {
+            return false;
+        }
+
+        // 3) Gemeinsames Delta: jede betroffene Kante muss es zulassen. Roll-
+        //    Kanten ignorieren Nachbarn (die Gegenkante rückt mit), offene
+        //    Kanten respektieren sie (nicht überschreiben). So bleiben alle
+        //    Kanten — auch verknüpfte A/V — auf gleicher Höhe.
+        let mut delta = ph - pos;
+        for (id, edge, rolling) in &edges {
+            if let Some(clip) = self.clips.iter().find(|c| &c.id == id) {
+                let (lo, hi) = trim_range(clip, *edge, &self.clips, !rolling);
+                delta = delta.clamp(lo, hi);
+            }
+        }
+        if delta.abs() < EPS {
+            // Kante existiert, lässt sich aber nicht bewegen (kein Spielraum) —
+            // kein Undo-Schritt, aber auch keine Fehlermeldung.
+            return true;
+        }
+
+        // 4) Anwenden — genau ein History-Schritt für alle Kanten zusammen.
+        self.push_history();
+        let actions: std::collections::HashMap<String, TrimEdge> =
+            edges.into_iter().map(|(id, edge, _)| (id, edge)).collect();
+        self.clips = self
+            .clips
+            .iter()
+            .map(|c| match actions.get(&c.id) {
+                Some(edge) => apply_trim(c, *edge, delta),
+                None => c.clone(),
+            })
+            .collect();
+        self.reconcile_transitions();
+        true
     }
 
     pub fn slide_clip(&mut self, id: &str, delta: f64) {

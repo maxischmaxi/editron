@@ -5,7 +5,7 @@ use crate::core::effects::{self, EffectInstance};
 use crate::core::grade::ColorGrade;
 use crate::core::sequence::SequenceSettings;
 use crate::core::timeline::{
-    sequence_end, TimelineClip, TimelineStore, TimelineTrack, TrackKind,
+    sequence_end, track_name, TimelineClip, TimelineStore, TimelineTrack, TrackKind,
 };
 use crate::core::transitions::{
     self, Transition, TransitionDirection, TransitionFx, TransitionKind, TransitionRole,
@@ -152,6 +152,8 @@ pub struct AudioClipPlan {
 /// (`RenderPlan::audio`, Gains fertig eingebacken).
 #[derive(Clone, Debug)]
 pub struct AudioTrackPlan {
+    /// Spurname (A1, A2, …) — Stream-Titel bzw. Stem-Label.
+    pub name: String,
     /// Clips der Spur; `gain_l`/`gain_r` enthalten NUR den Clip-Anteil
     /// (Clip-Gain), Spur-Gain/Pan und Master folgen in der Bus-Verarbeitung.
     pub clips: Vec<AudioClipPlan>,
@@ -268,6 +270,15 @@ impl RenderPlan {
     /// Mindestens ein echtes Video-Segment (kein reines Schwarzbild)?
     pub fn has_video_media(&self) -> bool {
         self.segments.iter().any(|s| !s.layers.is_empty())
+    }
+
+    /// Mindestens ein hörbarer Audio-Clip? Berücksichtigt BEIDE Pfade: den
+    /// Schnellpfad (`audio`) UND die getrennt verarbeiteten Spuren
+    /// (`audio_tracks`, Bus-FX/Automation oder Stems). Spuren landen nur in
+    /// `audio_tracks`, wenn sie tatsächlich Clips tragen — eine nicht-leere
+    /// Liste bedeutet also hörbares Material.
+    pub fn has_audio_media(&self) -> bool {
+        !self.audio.is_empty() || !self.audio_tracks.is_empty()
     }
 
     /// Gesamte Audio-Arbeitseinheiten (Frames) für den Fortschritt: einfache
@@ -580,6 +591,11 @@ pub fn build_render_plan(
     }
 
     if settings.audio.is_some() {
+        // Stems-Export: jede Audiospur als eigener Stream/Stem. Erzwingt die
+        // getrennte Bus-Verarbeitung für ALLE Spuren (kein Schnellpfad-Master),
+        // damit jede Spur einzeln ausgegeben werden kann; die Summe der Stems
+        // ergibt exakt den Master-Mix.
+        let stems = stems_enabled(settings);
         for track in timeline
             .tracks
             .iter()
@@ -588,8 +604,9 @@ pub fn build_render_plan(
             // Spuren mit Bus-FX oder Automation brauchen die getrennte Bus-
             // Verarbeitung (Effekte/Automation wirken auf die Spur-SUMME);
             // alle anderen laufen über den Schnellpfad mit fertig
-            // eingebackenen Gains.
-            let processed = track.has_audio_effects() || track.has_automation();
+            // eingebackenen Gains. Im Stems-Modus geht IMMER jede Spur durch
+            // die Bus-Verarbeitung.
+            let processed = stems || track.has_audio_effects() || track.has_automation();
             let track_gain = db_to_linear(track.gain_db);
             let (pan_l, pan_r) = pan_gains(track.pan);
             let mut track_clips: Vec<AudioClipPlan> = Vec::new();
@@ -612,20 +629,39 @@ pub fn build_render_plan(
                         let hi = clip.end().min(end);
                         if hi - lo > 1e-9 {
                             let cg = db_to_linear(clip.gain_db);
-                            let gl = master * track_gain * pan_l * cg;
-                            let gr = master * track_gain * pan_r * cg;
-                            flatten_nest_audio(
-                                inner,
-                                media,
-                                nests,
-                                clip.media_time_at(lo).max(0.0),
-                                hi - lo,
-                                lo - start,
-                                gl,
-                                gr,
-                                1,
-                                &mut plan.audio,
-                            );
+                            if stems {
+                                // Stems: inneres Audio nur mit dem Nest-Clip-Gain
+                                // (mono) einflachen — Spur-Gain/Pan + Master folgen
+                                // in der Bus-Verarbeitung, damit es im Stem DIESER
+                                // Spur landet (Stem-Summe = Master).
+                                flatten_nest_audio(
+                                    inner,
+                                    media,
+                                    nests,
+                                    clip.media_time_at(lo).max(0.0),
+                                    hi - lo,
+                                    lo - start,
+                                    cg,
+                                    cg,
+                                    1,
+                                    &mut track_clips,
+                                );
+                            } else {
+                                let gl = master * track_gain * pan_l * cg;
+                                let gr = master * track_gain * pan_r * cg;
+                                flatten_nest_audio(
+                                    inner,
+                                    media,
+                                    nests,
+                                    clip.media_time_at(lo).max(0.0),
+                                    hi - lo,
+                                    lo - start,
+                                    gl,
+                                    gr,
+                                    1,
+                                    &mut plan.audio,
+                                );
+                            }
                         }
                     }
                     continue;
@@ -711,6 +747,7 @@ pub fn build_render_plan(
             if processed && !track_clips.is_empty() {
                 track_clips.sort_by(|a, b| a.start_in_mix.total_cmp(&b.start_in_mix));
                 plan.audio_tracks.push(AudioTrackPlan {
+                    name: track_name(track, &timeline.tracks),
                     clips: track_clips,
                     effects: track
                         .effects

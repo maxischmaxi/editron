@@ -9,6 +9,7 @@ pub mod fx_shader;
 pub mod geom;
 pub mod grade_shader;
 pub mod icons;
+pub mod lut_gpu;
 pub mod icons_data;
 pub mod input;
 pub mod text;
@@ -104,6 +105,15 @@ pub struct ScrubRequest {
     pub bucket: u32,
 }
 
+/// Input-/Look-LUT-Referenzen (Pfad + Stärke 0…1) eines gegradeten Quads.
+/// `draw_texture_quad_graded` schlägt die GPU-Texturen über den Pfad im
+/// `lut_textures`-Cache nach. Leer ⇒ kein LUT-Slot.
+#[derive(Clone, Copy, Default)]
+pub struct GradeLutRefs<'a> {
+    pub input: Option<(&'a str, f32)>,
+    pub look: Option<(&'a str, f32)>,
+}
+
 pub struct Ui<'f, 'rl> {
     pub d: &'f mut RaylibDrawHandle<'rl>,
     pub input: InputState,
@@ -127,6 +137,9 @@ pub struct Ui<'f, 'rl> {
     /// Vorschau, z. B. wenn die Kompilierung fehlschlug). Wird in main()
     /// nach `Ui::new` gesetzt.
     pub grade_shader: Option<&'f mut grade_shader::GradeShader>,
+    /// Hochgeladene 3D-LUT-Texturen (pfad-indiziert); wird in main() nach
+    /// `Ui::new` gesetzt. Der Programmmonitor bindet sie an den Grade-Shader.
+    pub lut_textures: Option<&'f lut_gpu::LutGpuCache>,
     /// Effekt-Renderer (Lesezugriff auf die `fx://`-Ergebnis-Texturen);
     /// wird in main() nach `Ui::new` gesetzt.
     pub fx_outputs: Option<&'f fx_shader::EffectChainRenderer>,
@@ -173,6 +186,7 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             screen,
             scale,
             grade_shader: None,
+            lut_textures: None,
             fx_outputs: None,
             effect_requests: Vec::new(),
             scrub_requests: Vec::new(),
@@ -719,6 +733,7 @@ impl<'f, 'rl> Ui<'f, 'rl> {
         rot_deg: f32,
         alpha: u8,
         grade: &crate::core::grade::GradeParams,
+        luts: GradeLutRefs<'_>,
     ) -> bool {
         use raylib::prelude::RaylibShaderModeExt;
         struct RawTex(ffi::Texture2D);
@@ -749,10 +764,58 @@ impl<'f, 'rl> Ui<'f, 'rl> {
         let dst = self.rpf(Rect::new(cx, cy, w, h));
         let origin = self.pv(v2(w / 2.0, h / 2.0));
         let tint = Color::new(255, 255, 255, alpha);
-        match self.grade_shader.as_mut().filter(|_| !grade.is_identity()) {
+
+        // LUT-Texturen auflösen (kopiert die Option<&Cache>, hält keinen
+        // self-Borrow ⇒ verträgt sich mit dem späteren &mut grade_shader).
+        use crate::ui::grade_shader::LutUniform;
+        let cache = self.lut_textures;
+        let input = luts
+            .input
+            .and_then(|(p, s)| cache.and_then(|c| c.get(p)).map(|lt| (lt, s)));
+        let look = luts
+            .look
+            .and_then(|(p, s)| cache.and_then(|c| c.get(p)).map(|lt| (lt, s)));
+        let uni = |slot: Option<(&lut_gpu::LutTexture, f32)>| match slot {
+            Some((lt, s)) => LutUniform {
+                mode: lt.mode,
+                size: lt.size,
+                dmin: lt.dmin,
+                dmax: lt.dmax,
+                strength: s,
+            },
+            None => LutUniform::OFF,
+        };
+        let input_uni = uni(input);
+        let look_uni = uni(look);
+        let any_lut = input_uni.is_active() || look_uni.is_active();
+
+        match self
+            .grade_shader
+            .as_mut()
+            .filter(|_| !grade.is_identity() || any_lut)
+        {
             Some(gs) => {
                 gs.apply(grade);
+                gs.apply_luts(input_uni, look_uni);
+                // Roh-Handles VOR dem Shader-Modus ziehen (danach ist
+                // gs.shader mutabel ausgeliehen).
+                let (raw_shader, loc_in, loc_look) = gs.raw_and_lut_locs();
+                let in_tex = input.filter(|_| input_uni.is_active()).map(|(lt, _)| *lt.tex.as_ref());
+                let look_tex = look.filter(|_| look_uni.is_active()).map(|(lt, _)| *lt.tex.as_ref());
                 let mut mode = self.d.begin_shader_mode(&mut gs.shader);
+                // Zusatztexturen binden (raylib bindet sie beim Draw) — wie fx_shader.
+                unsafe {
+                    if let Some(t) = in_tex {
+                        if loc_in >= 0 {
+                            ffi::SetShaderValueTexture(raw_shader, loc_in, t);
+                        }
+                    }
+                    if let Some(t) = look_tex {
+                        if loc_look >= 0 {
+                            ffi::SetShaderValueTexture(raw_shader, loc_look, t);
+                        }
+                    }
+                }
                 mode.draw_texture_pro(tex, src, dst, origin, rot_deg, tint);
             }
             None => {

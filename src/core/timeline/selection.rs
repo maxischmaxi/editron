@@ -134,6 +134,7 @@ impl TimelineStore {
             let link_id = if *has_audio { Some(new_id()) } else { None };
             clips = overwrite_range(clips, &video_track, cursor, cursor + dur);
             let vid = TimelineClip {
+                extra: Default::default(),
                 id: new_id(),
                 track_id: video_track.clone(),
                 asset_id: String::new(),
@@ -173,6 +174,7 @@ impl TimelineStore {
                 };
                 clips = overwrite_range(clips, &atr, cursor, cursor + dur);
                 let aud = TimelineClip {
+                    extra: Default::default(),
                     id: new_id(),
                     track_id: atr,
                     asset_id: String::new(),
@@ -314,6 +316,46 @@ impl TimelineStore {
             // (bewusst ohne History-Snapshot, wie In-/Out-Punkte).
             self.revision += 1;
         }
+    }
+
+    /// Spurhöhe (logische Pixel) während eines Sash-Drags live setzen, geklemmt
+    /// auf den zulässigen Bereich. Schreibt bewusst OHNE `revision`-Bump und ohne
+    /// History-Snapshot — wie die Mixer-/Automations-Gesten (`set_track_gain_db`,
+    /// `track_auto_replace_live`): die laufende Geste darf den Undo-Stack nicht
+    /// fluten UND nicht pro Frame das Projekt dirty machen bzw. die Render-Cache-
+    /// Revalidierung (`render_cache::refresh` schlägt auf jede Revisionsänderung
+    /// an) auslösen. Den einmaligen Dirty-Vermerk übernimmt [`mark_track_resized`]
+    /// beim Loslassen. Die Spurhöhe ist reiner View-State und beeinflusst die
+    /// gerenderten Pixel nicht — daher kein Undo.
+    pub fn set_track_height_live(&mut self, track_id: &str, height: f32) {
+        if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+            t.height = Some(height.clamp(MIN_TRACK_HEIGHT, MAX_TRACK_HEIGHT));
+        }
+    }
+
+    /// Eine abgeschlossene Sash-Drag-Geste als Projektänderung verbuchen:
+    /// markiert das Projekt einmalig als ungespeichert (Dirty/Autosave), ohne
+    /// Undo-Snapshot. Beim Loslassen aufzurufen, NACHDEM die Höhe sich geändert
+    /// hat (siehe [`set_track_height_live`]).
+    pub fn mark_track_resized(&mut self) {
+        self.revision += 1;
+    }
+
+    /// Anzahl Clips auf einer Spur (Schutz-/Prompt-Entscheidung beim Entfernen).
+    pub fn track_clip_count(&self, track_id: &str) -> usize {
+        self.clips.iter().filter(|c| c.track_id == track_id).count()
+    }
+
+    /// Spur, auf die sich ein argumentloses „Spur entfernen“ bezieht (Tastatur):
+    /// die Spur des ersten ausgewählten Clips, sonst eine anvisierte Spur.
+    /// `None`, wenn nichts Eindeutiges fokussiert ist (Aufrufer zeigt Hinweis).
+    pub fn focused_track_id(&self) -> Option<String> {
+        if let Some(cid) = self.selected_clip_ids.first() {
+            if let Some(c) = self.clip(cid) {
+                return Some(c.track_id.clone());
+            }
+        }
+        self.tracks.iter().find(|t| t.targeted).map(|t| t.id.clone())
     }
 
     /// Spur als Source-Patch-Ziel ihrer Art setzen (Radio: höchstens eine

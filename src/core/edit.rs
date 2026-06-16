@@ -207,6 +207,7 @@ mod tests {
 
     fn av_asset(id: &str, dur: f64, with_audio: bool) -> MediaAsset {
         MediaAsset {
+            extra: Default::default(),
             id: id.into(),
             path: "/x.mp4".into(),
             name: "Clip".into(),
@@ -348,6 +349,7 @@ mod tests {
         let vt = s.timeline.source_patch_track(TrackKind::Video).unwrap().to_string();
         let existing = {
             let mut c = TimelineClip {
+                extra: Default::default(),
                 id: crate::core::types::new_id(),
                 track_id: vt.clone(),
                 asset_id: "a".into(),
@@ -401,6 +403,7 @@ mod tests {
         s.media.add_asset(av_asset("clipA", 30.0, true));
         let vt = s.timeline.source_patch_track(TrackKind::Video).unwrap().to_string();
         s.timeline.clips.push(TimelineClip {
+            extra: Default::default(),
             id: crate::core::types::new_id(),
             track_id: vt,
             asset_id: "clipA".into(),
@@ -460,6 +463,7 @@ fn source_clip(
     markers: Vec<Marker>,
 ) -> TimelineClip {
     TimelineClip {
+        extra: Default::default(),
         id: new_id(),
         track_id,
         asset_id: asset_id.to_string(),

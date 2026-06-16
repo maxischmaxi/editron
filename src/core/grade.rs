@@ -12,12 +12,43 @@
 //! 2. Tonwerte: Schwarz/Schatten/Lichter/Weiß als luma-gewichtete Offsets
 //! 3. Kontrast: lineare Steigung um den Pivot 0,5
 //! 4. Lift/Gamma/Gain pro Kanal (Farbräder + Look-Anteile)
+//! 4.5 Tonwertkurven: Luma-Master- + R/G/B-Kurven (kombinierte 1D-LUT)
 //! 5. Sättigung/Dynamik (luma-erhaltend)
 //! 6. Vignette über die normierten Clip-Koordinaten
 
+use crate::core::lut::{LutCache, LutStack, OwnedLutStack};
 use serde::{Deserialize, Serialize};
 
 // -------------------------------------------------------------- Datenmodell
+
+/// Referenz eines Clips auf eine externe `.cube`-LUT-Datei (Input- oder
+/// Look-Slot). Im Projekt wird NUR Pfad + Stärke (+ Anzeigename) gespeichert;
+/// die LUT-Daten liegen extern und werden über den [`crate::core::lut::LutCache`]
+/// aufgelöst (fehlende Datei ⇒ Offline-Hinweis im Farbe-Panel).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LutSlot {
+    /// Pfad zur `.cube`-Datei.
+    pub path: String,
+    /// Anzeigename (Dateiname) für die UI; rein kosmetisch.
+    #[serde(default)]
+    pub name: String,
+    /// Wirkstärke 0…100 (100 = voll).
+    #[serde(default = "default_hundred")]
+    pub strength: f64,
+}
+
+impl LutSlot {
+    /// Wirkt der Slot (Pfad gesetzt UND Stärke > 0)?
+    pub fn is_active(&self) -> bool {
+        self.strength > 0.0 && !self.path.is_empty()
+    }
+
+    /// Stärke auf 0…1 normiert (Shader/CPU-Mischfaktor).
+    pub fn strength01(&self) -> f32 {
+        (self.strength / 100.0).clamp(0.0, 1.0) as f32
+    }
+}
 
 /// Farb-Offset eines Farbrads: (x, y) im Einheitskreis + Luma-Regler −1…1.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -34,6 +65,184 @@ pub struct WheelValue {
 impl WheelValue {
     pub fn is_zero(&self) -> bool {
         self.x == 0.0 && self.y == 0.0 && self.luma == 0.0
+    }
+}
+
+/// Ein Stützpunkt einer Tonwertkurve: Eingang/Ausgang je 0…1.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurvePoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Eine Tonwertkurve als aufsteigend in x sortierte Stützpunktfolge.
+/// Leer ODER alle Punkte auf der Diagonale ⇒ Identität. Die Auswertung
+/// nutzt einen monotonen kubischen Hermite-Spline (Fritsch–Carlson, kein
+/// Überschwingen), siehe [`Curve::eval`]. Serialisiert als reines Array.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Curve {
+    pub points: Vec<CurvePoint>,
+}
+
+impl Default for Curve {
+    fn default() -> Self {
+        Curve::identity()
+    }
+}
+
+impl Curve {
+    /// Identitätskurve: Eckpunkte (0,0) und (1,1).
+    pub fn identity() -> Self {
+        Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ],
+        }
+    }
+
+    /// Wirkt die Kurve wie die Identität (alle Stützpunkte auf y = x)?
+    /// Toleranter Check (für Neutral-Erkennung/Schlankhalten der Datei) —
+    /// nicht zu verwechseln mit dem strikten `PartialEq`-Default.
+    pub fn is_identity(&self) -> bool {
+        self.points.iter().all(|p| (p.y - p.x).abs() < 1e-9)
+    }
+
+    /// Auswertung an `x` ∈ 0…1. Außerhalb des Stützbereichs wird der
+    /// jeweilige Endpunktwert gehalten. Monotoner kubischer Hermite-Spline.
+    pub fn eval(&self, x: f64) -> f64 {
+        self.eval_prepared(&self.prepare_tangents(), x)
+    }
+
+    /// Tangenten einmal vorberechnen (leer bei < 2 Punkten). Der LUT-Aufbau in
+    /// [`precompute`] ruft das je Kurve EINMAL und sampelt dann mit
+    /// [`Curve::eval_prepared`] — sonst würde jeder der 256 Stützstellen-Aufrufe
+    /// die Tangenten (zwei `Vec`s) neu allozieren.
+    fn prepare_tangents(&self) -> Vec<f64> {
+        if self.points.len() >= 2 {
+            monotone_tangents(&self.points)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Auswertung mit vorberechneten Tangenten (`prepare_tangents`, Länge = Zahl
+    /// der Stützpunkte). Formelgleich zu [`Curve::eval`].
+    fn eval_prepared(&self, tangents: &[f64], x: f64) -> f64 {
+        let p = &self.points;
+        let n = p.len();
+        if n == 0 {
+            return x.clamp(0.0, 1.0);
+        }
+        if n == 1 {
+            return p[0].y.clamp(0.0, 1.0);
+        }
+        if x <= p[0].x {
+            return p[0].y.clamp(0.0, 1.0);
+        }
+        if x >= p[n - 1].x {
+            return p[n - 1].y.clamp(0.0, 1.0);
+        }
+        let m = tangents;
+        let mut k = 0;
+        while k + 1 < n - 1 && x > p[k + 1].x {
+            k += 1;
+        }
+        let h = p[k + 1].x - p[k].x;
+        if h <= 0.0 {
+            return p[k].y.clamp(0.0, 1.0);
+        }
+        let t = (x - p[k].x) / h;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        let y = h00 * p[k].y + h10 * h * m[k] + h01 * p[k + 1].y + h11 * h * m[k + 1];
+        y.clamp(0.0, 1.0)
+    }
+}
+
+/// Tangenten für den monotonen kubischen Hermite-Spline (Fritsch–Carlson):
+/// zuerst die Standard-Tangenten (Mittel der Sekanten), dann auf das
+/// Monotonie-Kreissegment beschränkt, damit zwischen den Stützpunkten kein
+/// Über-/Unterschwingen entsteht.
+fn monotone_tangents(p: &[CurvePoint]) -> Vec<f64> {
+    let n = p.len();
+    let mut d = vec![0.0f64; n - 1];
+    for k in 0..n - 1 {
+        let dx = p[k + 1].x - p[k].x;
+        d[k] = if dx > 0.0 { (p[k + 1].y - p[k].y) / dx } else { 0.0 };
+    }
+    let mut m = vec![0.0f64; n];
+    m[0] = d[0];
+    m[n - 1] = d[n - 2];
+    for k in 1..n - 1 {
+        m[k] = (d[k - 1] + d[k]) / 2.0;
+    }
+    for k in 0..n - 1 {
+        if d[k] == 0.0 {
+            m[k] = 0.0;
+            m[k + 1] = 0.0;
+        } else {
+            let alpha = m[k] / d[k];
+            let beta = m[k + 1] / d[k];
+            let s = alpha * alpha + beta * beta;
+            if s > 9.0 {
+                let tau = 3.0 / s.sqrt();
+                m[k] = tau * alpha * d[k];
+                m[k + 1] = tau * beta * d[k];
+            }
+        }
+    }
+    m
+}
+
+/// Tonwertkurven eines Clips: Luma-Master-Kurve plus separate Kurven je
+/// RGB-Kanal. Anwendung: pro Kanal `kanal(master(wert))` (Master zuerst,
+/// in [`precompute`] zu einer kombinierten 1D-LUT je Kanal gefaltet).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GradeCurves {
+    #[serde(default, skip_serializing_if = "Curve::is_identity")]
+    pub luma: Curve,
+    #[serde(default, skip_serializing_if = "Curve::is_identity")]
+    pub red: Curve,
+    #[serde(default, skip_serializing_if = "Curve::is_identity")]
+    pub green: Curve,
+    #[serde(default, skip_serializing_if = "Curve::is_identity")]
+    pub blue: Curve,
+}
+
+impl GradeCurves {
+    /// Alle vier Kurven neutral?
+    pub fn is_identity(&self) -> bool {
+        self.luma.is_identity()
+            && self.red.is_identity()
+            && self.green.is_identity()
+            && self.blue.is_identity()
+    }
+
+    /// Kurve nach Kanal-Index (0 = Luma, 1 = Rot, 2 = Grün, 3 = Blau).
+    pub fn channel(&self, ch: usize) -> &Curve {
+        match ch {
+            0 => &self.luma,
+            1 => &self.red,
+            2 => &self.green,
+            _ => &self.blue,
+        }
+    }
+
+    pub fn channel_mut(&mut self, ch: usize) -> &mut Curve {
+        match ch {
+            0 => &mut self.luma,
+            1 => &mut self.red,
+            2 => &mut self.green,
+            _ => &mut self.blue,
+        }
     }
 }
 
@@ -143,6 +352,19 @@ pub struct ColorGrade {
     /// Weiche Kante 0 … 100
     #[serde(default = "default_fifty")]
     pub vignette_feather: f64,
+    // ---- Tonwertkurven ----
+    /// Luma-Master- + R/G/B-Kanalkurven (monotone Splines, je 0…1).
+    #[serde(default, skip_serializing_if = "GradeCurves::is_identity")]
+    pub curves: GradeCurves,
+    // ---- 3D-LUTs ----
+    /// Input-LUT (`.cube`): technische Normalisierung am PIPELINE-ANFANG
+    /// (vor Weißabgleich). None = kein LUT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_lut: Option<LutSlot>,
+    /// Look-LUT (`.cube`): kreativer Schluss-Stempel am PIPELINE-ENDE
+    /// (nach Lift/Gamma/Gain, Kurven, Sättigung, Vignette). None = kein LUT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look_lut: Option<LutSlot>,
 }
 
 fn default_true() -> bool {
@@ -181,6 +403,9 @@ impl Default for ColorGrade {
             vignette_midpoint: 50.0,
             vignette_roundness: 0.0,
             vignette_feather: 50.0,
+            curves: GradeCurves::default(),
+            input_lut: None,
+            look_lut: None,
         }
     }
 }
@@ -215,6 +440,30 @@ impl ColorGrade {
             && self.gamma.is_zero()
             && self.gain.is_zero()
             && self.vignette_amount == d.vignette_amount
+            && self.curves.is_identity()
+            && !self.has_active_lut()
+    }
+
+    /// Trägt der Clip mindestens eine wirkende LUT (Input oder Look)?
+    pub fn has_active_lut(&self) -> bool {
+        self.input_lut.as_ref().is_some_and(|s| s.is_active())
+            || self.look_lut.as_ref().is_some_and(|s| s.is_active())
+    }
+}
+
+/// Die Input-/Look-LUT-Slots eines Grades über einen [`LutCache`] zu einem
+/// besitzenden [`OwnedLutStack`] auflösen (Player-Vorschau, Scopes). Fehlende
+/// Dateien fallen still weg (im Panel separat als Offline-Hinweis gemeldet).
+pub fn resolve_luts(grade: &ColorGrade, cache: &mut LutCache) -> OwnedLutStack {
+    OwnedLutStack {
+        input: grade
+            .input_lut
+            .as_ref()
+            .and_then(|s| cache.resolve(&s.path, s.strength01())),
+        look: grade
+            .look_lut
+            .as_ref()
+            .and_then(|s| cache.resolve(&s.path, s.strength01())),
     }
 }
 
@@ -232,6 +481,56 @@ pub fn parse_test_grade(spec: &str) -> ColorGrade {
                 .find(|l| l.label().eq_ignore_ascii_case(value) || format!("{l:?}").eq_ignore_ascii_case(value))
             {
                 g.look = *look;
+            }
+            continue;
+        }
+        // 3D-LUT-Slots: "inputLut=/pfad.cube" / "lookLut=/pfad.cube"
+        // (optional ":stärke" am Ende, z. B. "lookLut=/x.cube:60").
+        if key == "inputLut" || key == "lookLut" {
+            let (path, strength) = match value.rsplit_once(':') {
+                Some((p, s)) if s.parse::<f64>().is_ok() => {
+                    (p.to_string(), s.parse::<f64>().unwrap_or(100.0))
+                }
+                _ => (value.to_string(), 100.0),
+            };
+            if !path.is_empty() {
+                let name = std::path::Path::new(&path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let slot = LutSlot { path, name, strength };
+                if key == "inputLut" {
+                    g.input_lut = Some(slot);
+                } else {
+                    g.look_lut = Some(slot);
+                }
+            }
+            continue;
+        }
+        // Kurven: "lumaCurve=0/0;0.5/0.75;1/1" (Punkte x/y, mit ';' getrennt;
+        // Schlüssel luma|master|red|r|green|g|blue|b + "Curve").
+        if let Some(chan) = key.strip_suffix("Curve") {
+            let mut pts = Vec::new();
+            for seg in value.split(';') {
+                if let Some((xs, ys)) = seg.split_once('/') {
+                    if let (Ok(x), Ok(y)) = (xs.trim().parse::<f64>(), ys.trim().parse::<f64>()) {
+                        pts.push(CurvePoint {
+                            x: x.clamp(0.0, 1.0),
+                            y: y.clamp(0.0, 1.0),
+                        });
+                    }
+                }
+            }
+            if pts.len() >= 2 {
+                pts.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+                let curve = Curve { points: pts };
+                match chan {
+                    "luma" | "master" => g.curves.luma = curve,
+                    "red" | "r" => g.curves.red = curve,
+                    "green" | "g" => g.curves.green = curve,
+                    "blue" | "b" => g.curves.blue = curve,
+                    _ => {}
+                }
             }
             continue;
         }
@@ -265,6 +564,39 @@ pub fn parse_test_grade(spec: &str) -> ColorGrade {
 
 // ------------------------------------------------------------ Vorberechnung
 
+/// Auflösung der vorberechneten Kurven-LUT (ein Eintrag je 8-Bit-Code).
+/// MUSS mit dem Shader (`lutR/lutG/lutB[256]` in `ui/grade_shader.rs`)
+/// übereinstimmen — dort per `const _`-Assert abgesichert.
+pub const LUT_N: usize = 256;
+
+/// Identitäts-LUT: Eintrag i = i/(N−1). Const, damit [`IDENTITY`] eine
+/// echte Konstante bleibt und neutrale Kurven bit-genau erkannt werden.
+const fn identity_lut() -> [f32; LUT_N] {
+    let mut lut = [0.0f32; LUT_N];
+    let mut i = 0;
+    while i < LUT_N {
+        lut[i] = i as f32 / (LUT_N as f32 - 1.0);
+        i += 1;
+    }
+    lut
+}
+
+const IDENTITY_LUT: [f32; LUT_N] = identity_lut();
+
+/// LUT an `x` ∈ 0…1 abtasten — lineare Interpolation mit Klemmung an den
+/// Rändern (entspricht GL_LINEAR + CLAMP_TO_EDGE des Shader-Pendants, daher
+/// formelgleich: `a + (b − a)·frac`).
+#[inline]
+pub fn sample_lut(lut: &[f32; LUT_N], x: f32) -> f32 {
+    let f = x.clamp(0.0, 1.0) * (LUT_N as f32 - 1.0);
+    let fi = f.floor();
+    let idx = fi as usize;
+    let frac = f - fi;
+    let a = lut[idx];
+    let b = lut[(idx + 1).min(LUT_N - 1)];
+    a + (b - a) * frac
+}
+
 /// Per-Pixel-Parameter (CPU-Pfad und Shader-Uniforms): das gesamte Grading
 /// inkl. Look auf wenige branchfreie Operationen reduziert.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -287,6 +619,13 @@ pub struct GradeParams {
     pub vibrance: f32,
     /// [Stärke (signiert −1…1), Mittelpunkt 0…1, Weichkante 0…1, Rundheit −1…1]
     pub vignette: [f32; 4],
+    /// Sind Tonwertkurven aktiv? (Sonst wird die LUT-Stufe übersprungen —
+    /// exakter, billiger Durchlass wie vor dem Kurven-Feature.)
+    pub curves_on: bool,
+    /// Kombinierte Kurven-LUT je Kanal (R/G/B), Master bereits gefaltet:
+    /// `curve_lut[ch][i] = kanal_ch(master(i/(N−1)))`. Bei inaktiven Kurven
+    /// die Identitäts-LUT.
+    pub curve_lut: [[f32; LUT_N]; 3],
 }
 
 pub const IDENTITY: GradeParams = GradeParams {
@@ -302,6 +641,8 @@ pub const IDENTITY: GradeParams = GradeParams {
     saturation: 1.0,
     vibrance: 0.0,
     vignette: [0.0, 0.5, 0.5, 0.0],
+    curves_on: false,
+    curve_lut: [IDENTITY_LUT; 3],
 };
 
 impl GradeParams {
@@ -469,6 +810,32 @@ pub fn precompute(grade: &ColorGrade) -> GradeParams {
         (grade.vignette_roundness / 100.0).clamp(-1.0, 1.0) as f32,
     ];
 
+    // ---- Tonwertkurven → kombinierte 1D-LUT je Kanal (Master ∘ Kanal) ----
+    // Neutrale Kurven ⇒ bit-genaue Identitäts-LUT (kein Beinahe-Identitäts-
+    // Drift durch f64→f32, damit is_identity() greift und die Stufe entfällt).
+    let curves_on = !grade.curves.is_identity();
+    let curve_lut = if curves_on {
+        let curves = &grade.curves;
+        // Tangenten einmal je Kurve (statt je Stützstelle) vorberechnen.
+        let (lt, rt, gt, bt) = (
+            curves.luma.prepare_tangents(),
+            curves.red.prepare_tangents(),
+            curves.green.prepare_tangents(),
+            curves.blue.prepare_tangents(),
+        );
+        let mut lut = [[0f32; LUT_N]; 3];
+        for i in 0..LUT_N {
+            let x = i as f64 / (LUT_N as f64 - 1.0);
+            let m = curves.luma.eval_prepared(&lt, x); // Master zuerst
+            lut[0][i] = curves.red.eval_prepared(&rt, m) as f32;
+            lut[1][i] = curves.green.eval_prepared(&gt, m) as f32;
+            lut[2][i] = curves.blue.eval_prepared(&bt, m) as f32;
+        }
+        lut
+    } else {
+        [IDENTITY_LUT; 3]
+    };
+
     GradeParams {
         wb_gain,
         blacks,
@@ -482,6 +849,8 @@ pub fn precompute(grade: &ColorGrade) -> GradeParams {
         saturation,
         vibrance,
         vignette,
+        curves_on,
+        curve_lut,
     }
 }
 
@@ -525,6 +894,12 @@ pub fn grade_pixel(p: &GradeParams, rgb: [f32; 3], u: f32, v: f32) -> [f32; 3] {
         let g = (g * p.gain[ch] + p.lift[ch] * (1.0 - g)).clamp(0.0, 1.0);
         c[ch] = g.powf(p.inv_gamma[ch]);
     }
+    // 4.5) Tonwertkurven (Master ∘ Kanal als kombinierte LUT je Kanal).
+    if p.curves_on {
+        c[0] = sample_lut(&p.curve_lut[0], c[0]);
+        c[1] = sample_lut(&p.curve_lut[1], c[1]);
+        c[2] = sample_lut(&p.curve_lut[2], c[2]);
+    }
     // 5) Sättigung/Dynamik (luma-erhaltend).
     let l = luma(c[0], c[1], c[2]);
     let max_c = c[0].max(c[1]).max(c[2]);
@@ -563,6 +938,46 @@ pub fn grade_pixel(p: &GradeParams, rgb: [f32; 3], u: f32, v: f32) -> [f32; 3] {
     ]
 }
 
+/// Volle Per-Pixel-Pipeline INKL. 3D-LUTs (CPU-Pendant zum Shader). Die LUTs
+/// umschließen das Grading sauber und lassen [`grade_pixel`] unberührt:
+///
+/// 1. **Input-LUT** (falls aktiv) auf das Quellpixel — ganz am Anfang.
+/// 2. Vollständiges Grading [`grade_pixel`] (Weißabgleich … Vignette);
+///    bei Identitäts-Parametern übersprungen (exakter Durchlass für den
+///    „Identitäts-LUT verändert nichts“-Fall).
+/// 3. **Look-LUT** (falls aktiv) auf das gegradete Pixel — ganz am Ende.
+/// 4. Finale Klemmung auf 0…1 (LUTs dürfen zwischendurch über den Bereich
+///    hinausgehen; die GPU klemmt ebenfalls erst zum Schluss).
+///
+/// MUSS formelgleich mit dem Fragment-Shader (`ui/grade_shader.rs`, `applyLut`)
+/// bleiben.
+#[inline]
+pub fn grade_lut_pixel(
+    p: &GradeParams,
+    luts: &LutStack,
+    rgb: [f32; 3],
+    u: f32,
+    v: f32,
+) -> [f32; 3] {
+    let rgb = match luts.input {
+        Some(a) => a.lut.apply(rgb, a.strength),
+        None => rgb,
+    };
+    let mut c = if p.is_identity() {
+        rgb
+    } else {
+        grade_pixel(p, rgb, u, v)
+    };
+    if let Some(a) = luts.look {
+        c = a.lut.apply(c, a.strength);
+    }
+    [
+        c[0].clamp(0.0, 1.0),
+        c[1].clamp(0.0, 1.0),
+        c[2].clamp(0.0, 1.0),
+    ]
+}
+
 /// f32-RGBA-Puffer (0..1, display-referred) in place graden. `content` =
 /// (x, y, w, h) des sichtbaren Inhalts im Puffer (Vignetten-Bezugsrahmen —
 /// beim Export ist der Puffer das volle, transparent gepolsterte Frame, der
@@ -576,10 +991,11 @@ pub fn grade_buffer(
     h: usize,
     content: (usize, usize, usize, usize),
     p: &GradeParams,
+    luts: &LutStack,
     threads: usize,
 ) {
     debug_assert_eq!(data.len(), w * h * 4);
-    if p.is_identity() || w == 0 || h == 0 {
+    if (p.is_identity() && !luts.is_active()) || w == 0 || h == 0 {
         return;
     }
     let (cx, cy, cw, ch_) = content;
@@ -602,7 +1018,7 @@ pub fn grade_buffer(
                             continue; // transparentes Padding
                         }
                         let u = (x as f32 - cx as f32 + 0.5) * inv_cw;
-                        let out = grade_pixel(p, [px[0], px[1], px[2]], u, v);
+                        let out = grade_lut_pixel(p, luts, [px[0], px[1], px[2]], u, v);
                         px[0] = out[0];
                         px[1] = out[1];
                         px[2] = out[2];
@@ -616,9 +1032,25 @@ pub fn grade_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::lut::{parse_cube, LutApply, LutStack};
 
     fn close(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() <= eps
+    }
+
+    /// Invertierende 2³-LUT (`out = 1 − in`) zum Testen der LUT-Slots.
+    fn invert_lut() -> crate::core::lut::Lut {
+        let n = 2usize;
+        let mut s = format!("LUT_3D_SIZE {n}\n");
+        for b in 0..n {
+            for g in 0..n {
+                for r in 0..n {
+                    let f = |i: usize| i as f32 / (n as f32 - 1.0);
+                    s.push_str(&format!("{} {} {}\n", 1.0 - f(r), 1.0 - f(g), 1.0 - f(b)));
+                }
+            }
+        }
+        parse_cube(&s).expect("invert lut")
     }
 
     #[test]
@@ -753,7 +1185,7 @@ mod tests {
             px[2] = b;
             px[3] = if i == 0 { 0.0 } else { 1.0 };
         }
-        grade_buffer(&mut buf, w, h, (0, 0, w, h), &p, 2);
+        grade_buffer(&mut buf, w, h, (0, 0, w, h), &p, &LutStack::EMPTY, 2);
         // Transparenter Pixel unangetastet.
         assert_eq!(&buf[0..3], &[r, gg, b]);
         // Opaker Pixel = grade_pixel-Ergebnis (jetzt exakt — gleicher Pfad).
@@ -812,14 +1244,14 @@ mod tests {
 
         // NEUER Pfad: f32-Grade → TPDF-Dither auf 8 Bit.
         let mut hi = src.clone();
-        grade_buffer(&mut hi, w, h, (0, 0, w, h), &p, 2);
+        grade_buffer(&mut hi, w, h, (0, 0, w, h), &p, &LutStack::EMPTY, 2);
         let new_u8 = pixbuf::f32_to_rgba8_dithered(&hi, w, h);
 
         // ALTER Pfad simuliert: Quelle ZUERST auf 8 Bit quantisieren, dann
         // graden (1 Eingangscode ⇒ 1 Ausgangscode = Treppenstufen), ohne Dither.
         let src8 = pixbuf::f32_to_rgba8(&src);
         let mut old = pixbuf::rgba8_to_f32(&src8);
-        grade_buffer(&mut old, w, h, (0, 0, w, h), &p, 2);
+        grade_buffer(&mut old, w, h, (0, 0, w, h), &p, &LutStack::EMPTY, 2);
         let old_u8 = pixbuf::f32_to_rgba8(&old);
 
         let distinct = |buf: &[u8]| -> usize {
@@ -849,5 +1281,341 @@ mod tests {
         assert!(red[0] > 0.9 && red[1] < 0.0 && red[2] < 0.0, "{red:?}");
         let zero = wheel_rgb(0.0, 0.0);
         assert_eq!(zero, [0.0; 3]);
+    }
+
+    // -------------------------------------------------------- Tonwertkurven
+
+    #[test]
+    fn curve_identity_eval_is_passthrough() {
+        let c = Curve::identity();
+        for &x in &[0.0, 0.1, 0.25, 0.5, 0.751, 1.0] {
+            assert!((c.eval(x) - x).abs() < 1e-9, "id eval {x} -> {}", c.eval(x));
+        }
+        assert!(c.is_identity());
+    }
+
+    #[test]
+    fn curve_passes_through_control_points_and_is_monotone() {
+        let c = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.05 },
+                CurvePoint { x: 0.5, y: 0.8 },
+                CurvePoint { x: 1.0, y: 0.95 },
+            ],
+        };
+        // Stützpunkte werden exakt getroffen.
+        assert!((c.eval(0.0) - 0.05).abs() < 1e-9);
+        assert!((c.eval(0.5) - 0.8).abs() < 1e-9);
+        assert!((c.eval(1.0) - 0.95).abs() < 1e-9);
+        // Monoton steigend, im Einheitsintervall, kein Überschwingen.
+        let mut prev = -1.0;
+        for k in 0..=100 {
+            let x = k as f64 / 100.0;
+            let y = c.eval(x);
+            assert!(y >= prev - 1e-9, "monoton bei {x}: {y} < {prev}");
+            assert!((0.0..=1.0).contains(&y), "im Intervall bei {x}: {y}");
+            prev = y;
+        }
+        // Im steigenden Segment [0,5..1,0] bleibt alles ≤ 0,95 (kein Overshoot).
+        for k in 50..=100 {
+            let x = k as f64 / 100.0;
+            assert!(c.eval(x) <= 0.95 + 1e-9, "Overshoot bei {x}: {}", c.eval(x));
+        }
+        assert!(!c.is_identity());
+    }
+
+    #[test]
+    fn precompute_folds_master_then_channel_into_lut() {
+        let mut g = ColorGrade::default();
+        g.curves.luma = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 0.5, y: 0.6 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ],
+        };
+        g.curves.red = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.1 },
+                CurvePoint { x: 1.0, y: 0.9 },
+            ],
+        };
+        let p = precompute(&g);
+        assert!(p.curves_on);
+        for &i in &[0usize, 64, 128, 200, LUT_N - 1] {
+            let x = i as f64 / (LUT_N as f64 - 1.0);
+            let m = g.curves.luma.eval(x);
+            let expect_r = g.curves.red.eval(m) as f32;
+            assert!(
+                (p.curve_lut[0][i] - expect_r).abs() < 1e-6,
+                "R-LUT[{i}] = {} vs {expect_r}",
+                p.curve_lut[0][i]
+            );
+            // Grün ist Identität ⇒ kombinierte LUT = Master.
+            assert!((p.curve_lut[1][i] - m as f32).abs() < 1e-6, "G-LUT[{i}] = Master");
+        }
+    }
+
+    #[test]
+    fn curve_brightening_lifts_midtones_via_grade_pixel() {
+        let mut g = ColorGrade::default();
+        g.curves.luma = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 0.5, y: 0.7 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ],
+        };
+        assert!(g.is_active());
+        let p = precompute(&g);
+        let out = grade_pixel(&p, [0.5; 3], 0.5, 0.5);
+        assert!(out[0] > 0.6, "Mitte angehoben: {}", out[0]);
+        assert!(close(out[0], out[1], 1e-4) && close(out[1], out[2], 1e-4), "neutral grau");
+    }
+
+    #[test]
+    fn grade_buffer_matches_pixel_path_with_curves() {
+        let mut g = ColorGrade::default();
+        g.curves.luma = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 0.5, y: 0.65 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ],
+        };
+        g.curves.blue = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.1 },
+                CurvePoint { x: 1.0, y: 0.85 },
+            ],
+        };
+        let p = precompute(&g);
+        let (w, h) = (4usize, 2usize);
+        let (r, gg, b) = (100.0 / 255.0, 150.0 / 255.0, 200.0 / 255.0);
+        let mut buf = vec![0f32; w * h * 4];
+        for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+            px[0] = r;
+            px[1] = gg;
+            px[2] = b;
+            px[3] = if i == 0 { 0.0 } else { 1.0 };
+        }
+        grade_buffer(&mut buf, w, h, (0, 0, w, h), &p, &LutStack::EMPTY, 2);
+        assert_eq!(&buf[0..3], &[r, gg, b]); // transparenter Pixel unangetastet
+        let expected = grade_pixel(&p, [r, gg, b], (1.0 + 0.5) / w as f32, 0.5 / h as f32);
+        for ch in 0..3 {
+            assert!(close(buf[4 + ch], expected[ch], 1e-6), "ch{ch}");
+        }
+    }
+
+    #[test]
+    fn neutral_curve_stays_identity() {
+        let mut g = ColorGrade::default();
+        // Kollinearer Zusatzpunkt wirkt wie die Identität.
+        g.curves.luma = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 0.3, y: 0.3 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ],
+        };
+        assert!(g.is_neutral());
+        assert!(!g.is_active());
+        assert!(precompute(&g).is_identity());
+    }
+
+    #[test]
+    fn curves_roundtrip_through_json() {
+        let mut g = ColorGrade::default();
+        g.curves.luma = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.02 },
+                CurvePoint { x: 0.5, y: 0.55 },
+                CurvePoint { x: 1.0, y: 0.98 },
+            ],
+        };
+        g.curves.green = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 1.0, y: 0.9 },
+            ],
+        };
+        let json = serde_json::to_string(&g).unwrap();
+        let back: ColorGrade = serde_json::from_str(&json).unwrap();
+        assert_eq!(g, back);
+        // Neutrale Kurven tauchen nicht in der Datei auf (skip_serializing_if).
+        let js = serde_json::to_string(&ColorGrade::default()).unwrap();
+        assert!(!js.contains("curves"), "neutrale Kurven nicht serialisiert: {js}");
+    }
+
+    #[test]
+    fn curve_handles_degenerate_inputs_without_panic() {
+        // Leer ⇒ Identität.
+        let empty = Curve { points: vec![] };
+        assert!(empty.is_identity());
+        assert!((empty.eval(0.3) - 0.3).abs() < 1e-9);
+        // Ein Punkt ⇒ konstanter Ausgang.
+        let one = Curve { points: vec![CurvePoint { x: 0.5, y: 0.7 }] };
+        assert!((one.eval(0.0) - 0.7).abs() < 1e-9);
+        assert!((one.eval(1.0) - 0.7).abs() < 1e-9);
+        // Doppeltes x ⇒ kein Div-by-zero, Ergebnis bleibt im Intervall.
+        let dense = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 0.5, y: 0.4 },
+                CurvePoint { x: 0.5, y: 0.6 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ],
+        };
+        for k in 0..=20 {
+            let y = dense.eval(k as f64 / 20.0);
+            assert!((0.0..=1.0).contains(&y), "im Intervall: {y}");
+        }
+        // precompute mit leerer Kanalkurve neben aktiver Master ⇒ Kanal wirkt
+        // als Identität (kein Panic in prepare_tangents/eval_prepared).
+        let mut g = ColorGrade::default();
+        g.curves.luma = Curve {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.1 },
+                CurvePoint { x: 1.0, y: 0.9 },
+            ],
+        };
+        g.curves.red = Curve { points: vec![] };
+        let p = precompute(&g);
+        assert!(p.curves_on);
+        assert!((p.curve_lut[0][128] - p.curve_lut[1][128]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_test_grade_reads_curve() {
+        let g = parse_test_grade("lumaCurve=0/0;0.5/0.75;1/1,redCurve=0/0.1;1/0.9");
+        assert_eq!(g.curves.luma.points.len(), 3);
+        assert!((g.curves.luma.points[1].y - 0.75).abs() < 1e-9);
+        assert!((g.curves.red.points[0].y - 0.1).abs() < 1e-9);
+        assert!(g.curves.green.is_identity());
+        assert!(g.is_active());
+    }
+
+    // ------------------------------------------------------------- 3D-LUTs
+
+    #[test]
+    fn identity_lut_changes_nothing() {
+        // Identitäts-LUT in beiden Slots auf neutrale Parameter ⇒ exakter
+        // Durchlass (grade_pixel wird bei Identitäts-Parametern übersprungen).
+        let n = 4usize;
+        let mut s = format!("LUT_3D_SIZE {n}\n");
+        for b in 0..n {
+            for g in 0..n {
+                for r in 0..n {
+                    let f = |i: usize| i as f32 / (n as f32 - 1.0);
+                    s.push_str(&format!("{} {} {}\n", f(r), f(g), f(b)));
+                }
+            }
+        }
+        let id = parse_cube(&s).expect("id lut");
+        let luts = LutStack {
+            input: Some(LutApply { lut: &id, strength: 1.0 }),
+            look: Some(LutApply { lut: &id, strength: 1.0 }),
+        };
+        for &c in &[[0.0; 3], [0.25, 0.5, 0.75], [1.0; 3], [0.13, 0.87, 0.42]] {
+            let out = grade_lut_pixel(&IDENTITY, &luts, c, 0.5, 0.5);
+            assert!(
+                close(out[0], c[0], 2e-3) && close(out[1], c[1], 2e-3) && close(out[2], c[2], 2e-3),
+                "{c:?} -> {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn look_lut_applies_after_grade() {
+        // Invert-Look-LUT auf neutrales Grading ⇒ invertiertes Pixel.
+        let inv = invert_lut();
+        let luts = LutStack {
+            input: None,
+            look: Some(LutApply { lut: &inv, strength: 1.0 }),
+        };
+        let out = grade_lut_pixel(&IDENTITY, &luts, [0.2, 0.4, 0.6], 0.5, 0.5);
+        assert!(close(out[0], 0.8, 1e-3) && close(out[1], 0.6, 1e-3) && close(out[2], 0.4, 1e-3), "{out:?}");
+    }
+
+    #[test]
+    fn lut_strength_scales_effect() {
+        let inv = invert_lut();
+        let luts = LutStack {
+            input: None,
+            look: Some(LutApply { lut: &inv, strength: 0.5 }),
+        };
+        // 0,2 invertiert = 0,8; mit 50 % ⇒ Mittel aus 0,2 und 0,8 = 0,5.
+        let out = grade_lut_pixel(&IDENTITY, &luts, [0.2, 0.2, 0.2], 0.5, 0.5);
+        assert!(close(out[0], 0.5, 1e-3), "{out:?}");
+    }
+
+    #[test]
+    fn grade_buffer_applies_lut_matching_pixel_path() {
+        let inv = invert_lut();
+        let mut g = ColorGrade::default();
+        g.exposure = 0.5;
+        let p = precompute(&g);
+        let luts = LutStack {
+            input: Some(LutApply { lut: &inv, strength: 0.7 }),
+            look: None,
+        };
+        let (w, h) = (4usize, 2usize);
+        let (r, gg, b) = (0.4f32, 0.55f32, 0.7f32);
+        let mut buf = vec![0f32; w * h * 4];
+        for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+            px[0] = r;
+            px[1] = gg;
+            px[2] = b;
+            px[3] = if i == 0 { 0.0 } else { 1.0 };
+        }
+        grade_buffer(&mut buf, w, h, (0, 0, w, h), &p, &luts, 2);
+        assert_eq!(&buf[0..3], &[r, gg, b]); // transparent unangetastet
+        let expected = grade_lut_pixel(&p, &luts, [r, gg, b], (1.0 + 0.5) / w as f32, 0.5 / h as f32);
+        for ch in 0..3 {
+            assert!(close(buf[4 + ch], expected[ch], 1e-6), "ch{ch}: {} vs {}", buf[4 + ch], expected[ch]);
+        }
+    }
+
+    #[test]
+    fn lut_slot_makes_grade_active_and_roundtrips() {
+        let mut g = ColorGrade::default();
+        assert!(!g.is_active());
+        g.look_lut = Some(LutSlot {
+            path: "/luts/teal_orange.cube".into(),
+            name: "teal_orange".into(),
+            strength: 80.0,
+        });
+        assert!(g.has_active_lut());
+        assert!(g.is_active(), "LUT-Slot aktiviert das Grading");
+        assert!(!g.is_default());
+        let json = serde_json::to_string(&g).unwrap();
+        let back: ColorGrade = serde_json::from_str(&json).unwrap();
+        assert_eq!(g, back);
+        // Strength 0 ⇒ Slot inaktiv (aber serialisiert, da non-default).
+        g.look_lut.as_mut().unwrap().strength = 0.0;
+        assert!(!g.has_active_lut());
+        assert!(!g.is_active());
+    }
+
+    #[test]
+    fn parse_test_grade_reads_lut_slots() {
+        let g = parse_test_grade("lookLut=/tmp/teal.cube:60,inputLut=/tmp/log2rec709.cube");
+        let look = g.look_lut.as_ref().expect("look slot");
+        assert_eq!(look.path, "/tmp/teal.cube");
+        assert_eq!(look.name, "teal");
+        assert!((look.strength - 60.0).abs() < 1e-9);
+        let input = g.input_lut.as_ref().expect("input slot");
+        assert_eq!(input.path, "/tmp/log2rec709.cube");
+        assert!((input.strength - 100.0).abs() < 1e-9);
+        assert!(g.has_active_lut());
+    }
+
+    #[test]
+    fn empty_lut_path_or_zero_strength_is_inactive() {
+        let mut g = ColorGrade::default();
+        g.input_lut = Some(LutSlot { path: String::new(), name: String::new(), strength: 100.0 });
+        assert!(!g.has_active_lut(), "leerer Pfad ⇒ inaktiv");
+        g.input_lut = Some(LutSlot { path: "/x.cube".into(), name: "x".into(), strength: 0.0 });
+        assert!(!g.has_active_lut(), "Stärke 0 ⇒ inaktiv");
     }
 }

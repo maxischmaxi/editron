@@ -1091,6 +1091,36 @@ impl App {
                         self.services.resolve_relink(&asset_id, path);
                     }
                 }
+                ServiceEvent::LutPicked {
+                    clip_id,
+                    input,
+                    path,
+                } => {
+                    if let Some(path) = path {
+                        let path_str = path.to_string_lossy().to_string();
+                        let name = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path_str.clone());
+                        let slot = crate::core::grade::LutSlot {
+                            path: path_str.clone(),
+                            name,
+                            strength: 100.0,
+                        };
+                        self.state.timeline.grade_update(&clip_id, |g| {
+                            if input {
+                                g.input_lut = Some(slot.clone());
+                            } else {
+                                g.look_lut = Some(slot.clone());
+                            }
+                        });
+                        // Caches für diesen Pfad refreshen (falls zuvor offline
+                        // gemerkt): CPU sofort, GPU im nächsten Frame über die
+                        // Reload-Liste.
+                        self.state.luts.invalidate(&path_str);
+                        self.state.lut_reload.push(path_str);
+                    }
+                }
                 ServiceEvent::RelinkScanProgress { scanned_dirs } => {
                     self.relink_dialog.on_progress(scanned_dirs);
                 }
@@ -1270,6 +1300,36 @@ fn detected_dpi_scale(rl: &RaylibHandle) -> f32 {
 /// der CPU (`grade::grade_buffer`, derselbe `grade_pixel`) gerechnet; die
 /// maximale/mittlere Kanal-Differenz wird gemeldet. Quelle = horizontaler
 /// Verlauf (jede Zeile gleich ⇒ unempfindlich gegen die RT-Vertikalspiegelung).
+/// Vor dem Frame: alle von Clips der aktiven Sequenz referenzierten 3D-LUTs
+/// in den GPU-Cache hochladen (CPU-Parse via `state.luts`, GPU-Upload via
+/// `lut_gpu`). Idempotent je Pfad; fehlende Dateien werden als gescheitert
+/// markiert (Offline-Hinweis erscheint im Farbe-Panel).
+fn ensure_lut_textures(
+    rl: &mut raylib::RaylibHandle,
+    thread: &raylib::RaylibThread,
+    state: &mut AppState,
+    lut_gpu: &mut ui::lut_gpu::LutGpuCache,
+) {
+    let mut paths: Vec<String> = Vec::new();
+    for clip in state.timeline.clips.iter() {
+        for s in [&clip.grade.input_lut, &clip.grade.look_lut]
+            .into_iter()
+            .flatten()
+        {
+            if s.is_active() && !lut_gpu.contains(&s.path) && !paths.contains(&s.path) {
+                paths.push(s.path.clone());
+            }
+        }
+    }
+    for path in paths {
+        // Klonen löst den &mut-Borrow auf state.luts vor dem GPU-Upload.
+        match state.luts.get_or_load(&path).clone() {
+            Ok(lut) => lut_gpu.upload(rl, thread, &path, &lut),
+            Err(_) => lut_gpu.mark_failed(&path),
+        }
+    }
+}
+
 fn run_grade_parity(
     rl: &mut raylib::RaylibHandle,
     thread: &raylib::RaylibThread,
@@ -1298,6 +1358,10 @@ fn run_grade_parity(
     tex.update_texture(&src).expect("Upload");
 
     // Nicht-trivialer Grade (ohne Vignette — reine Geometrie, separat getestet).
+    // Inkl. Tonwertkurven (Master + R/B), damit die LUT-Stufe GPU↔CPU mitgeprüft
+    // wird: die kombinierte LUT wird als Uniform-Array hochgeladen und im Shader
+    // formelgleich zu `sample_lut` linear interpoliert.
+    use crate::core::grade::{Curve, CurvePoint};
     let mut g = crate::core::grade::ColorGrade::default();
     g.temperature = 30.0;
     g.contrast = 40.0;
@@ -1307,6 +1371,26 @@ fn run_grade_parity(
     g.highlights = -20.0;
     g.gamma.luma = 0.2;
     g.gain = crate::core::grade::WheelValue { x: 0.3, y: -0.2, luma: 0.0 };
+    g.curves.luma = Curve {
+        points: vec![
+            CurvePoint { x: 0.0, y: 0.04 },
+            CurvePoint { x: 0.5, y: 0.62 },
+            CurvePoint { x: 1.0, y: 0.97 },
+        ],
+    };
+    g.curves.red = Curve {
+        points: vec![
+            CurvePoint { x: 0.0, y: 0.0 },
+            CurvePoint { x: 0.6, y: 0.45 },
+            CurvePoint { x: 1.0, y: 1.0 },
+        ],
+    };
+    g.curves.blue = Curve {
+        points: vec![
+            CurvePoint { x: 0.0, y: 0.08 },
+            CurvePoint { x: 1.0, y: 0.9 },
+        ],
+    };
     let params = crate::core::grade::precompute(&g);
 
     // GPU-Pfad: in eine RenderTexture rendern, Dither AUS.
@@ -1339,7 +1423,15 @@ fn run_grade_parity(
 
     // CPU-Pfad: gleiche Quelle f32 → grade_buffer → u8 (kein Dither).
     let mut cpu = crate::core::pixbuf::rgba8_to_f32(&src);
-    crate::core::grade::grade_buffer(&mut cpu, n, n, (0, 0, n, n), &params, 4);
+    crate::core::grade::grade_buffer(
+        &mut cpu,
+        n,
+        n,
+        (0, 0, n, n),
+        &params,
+        &crate::core::lut::LutStack::EMPTY,
+        4,
+    );
     let cpu_u8 = crate::core::pixbuf::f32_to_rgba8(&cpu);
 
     let mut max_d = 0i32;
@@ -1401,6 +1493,9 @@ fn main() {
         return;
     }
     let mut fx_renderer = ui::fx_shader::EffectChainRenderer::load(&mut rl, &thread);
+    // Hochgeladene 3D-LUT-Texturen (pfad-indiziert), persistent über Frames —
+    // vor jedem Frame mit den von sichtbaren Clips referenzierten LUTs befüllt.
+    let mut lut_gpu = ui::lut_gpu::LutGpuCache::default();
     // Effekt-Jobs des letzten Frames — werden vor dem nächsten verarbeitet.
     let mut pending_fx_jobs: Vec<ui::fx_shader::EffectJob> = Vec::new();
     let mut window_title = String::new();
@@ -1484,6 +1579,16 @@ fn main() {
             let (x, y) = s.split_once(',')?;
             Some(ui::geom::v2(x.trim().parse().ok()?, y.trim().parse().ok()?))
         });
+    // Testmodus: synthetisches Mausrad (EDITRON_TEST_WHEEL=dy oder dx,dy) jeden
+    // Frame einspeisen — um scrollbare Panels/Dialoge für Screenshots an die
+    // gewünschte Stelle zu fahren (zusammen mit EDITRON_TEST_MOUSE über dem
+    // Scroll-Bereich). Negatives dy scrollt nach unten.
+    let test_wheel: Option<Vector2> = std::env::var("EDITRON_TEST_WHEEL").ok().and_then(|s| {
+        match s.split_once(',') {
+            Some((x, y)) => Some(ui::geom::v2(x.trim().parse().ok()?, y.trim().parse().ok()?)),
+            None => Some(ui::geom::v2(0.0, s.trim().parse().ok()?)),
+        }
+    });
 
     // Absturz-Wiederherstellung: ist eine Autosave-Version neuer als die
     // Projektdatei (CLI-geöffnet oder zuletzt verwendet), wurde Editron
@@ -1573,6 +1678,9 @@ fn main() {
         if let Some(pos) = test_mouse {
             input.mouse = pos;
         }
+        if let Some(w) = test_wheel {
+            input.wheel = w;
+        }
         // Maus/Delta kommen in Framebuffer-Pixeln aus raylib — in den logischen
         // UI-Raum übersetzen, in dem das Layout rechnet.
         input.mouse.x /= ui_scale;
@@ -1653,6 +1761,11 @@ fn main() {
         app.handle_keyboard(&input, now);
         playback::tick(&mut app.state, dt);
         app.maybe_revalidate_proxies(now);
+        // Best-Effort-Hinweis nach dem Laden eines neueren Projekts einmalig
+        // in die Statusleiste übernehmen (von `project::apply` gesetzt).
+        if let Some(warning) = app.state.app.load_warning.take() {
+            app.state.app.set_status_message(Some(warning), now);
+        }
         app.state.app.tick_status(now);
         // Zeitgesteuertes Autosave mit Versionen (nicht im Screenshot-/
         // Testmodus — sonst würden Testläufe echte Projektordner zumüllen).
@@ -1695,6 +1808,15 @@ fn main() {
         // setzen es im folgenden UI-Frame neu, solange aktiv gezogen wird.
         app.state.playback.scrub_active = false;
 
+        // Zu-neuladende LUT-Pfade (Relink/Datei-Wechsel) im GPU-Cache verwerfen.
+        for path in std::mem::take(&mut app.state.lut_reload) {
+            lut_gpu.invalidate(&path);
+        }
+        // 3D-LUT-Texturen vor dem Frame befüllen: alle von Clips der aktiven
+        // Sequenz referenzierten `.cube`-Pfade einmalig hochladen (CPU-Parse
+        // via state.luts, GPU-Upload via lut_gpu). Idempotent je Pfad.
+        ensure_lut_textures(&mut rl, &thread, &mut app.state, &mut lut_gpu);
+
         // ---- UI-Frame ----
         let overlay_open = app.state.context_menu.open
             || app.state.app.command_palette_open
@@ -1716,6 +1838,7 @@ fn main() {
             ui_scale,
         );
         ui.grade_shader = grade_shader.as_mut();
+        ui.lut_textures = Some(&lut_gpu);
         ui.fx_outputs = Some(&fx_renderer);
 
         ui.begin_main_layer(overlay_open);
@@ -1863,7 +1986,6 @@ fn apply_custom_action(state: &mut AppState, action: overlays::context_menu::Cus
     match action {
         TimelineSplitAt { t, clip_id } => state.timeline.split_at(t, Some(&[clip_id])),
         TimelinePasteAt { t } => state.timeline.paste(Some(t.max(0.0))),
-        TimelineRemoveTrack { track_id } => state.timeline.remove_track(&track_id),
         TimelineToggleTrackFlag { track_id, flag } => {
             state.timeline.toggle_track_flag(&track_id, flag)
         }

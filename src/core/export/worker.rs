@@ -4,6 +4,7 @@ use crate::core::audio_fx::AudioFxChain;
 use crate::core::compose;
 use crate::core::effects::{self, EffectInstance};
 use crate::core::grade::{self};
+use crate::core::lut::{self, OwnedLutStack};
 use crate::core::timeline::{
     TimelineClip, TimelineStore,
 };
@@ -23,6 +24,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExportPhase {
     MixAudio,
+    NormalizeLoudness,
     RenderVideo,
     EncodeAudio,
     Finalize,
@@ -32,6 +34,7 @@ impl ExportPhase {
     pub fn label(&self) -> &'static str {
         match self {
             ExportPhase::MixAudio => "Audio wird gemischt",
+            ExportPhase::NormalizeLoudness => "Lautheit wird normalisiert",
             ExportPhase::RenderVideo => "Video wird gerendert",
             ExportPhase::EncodeAudio => "Audio wird kodiert",
             ExportPhase::Finalize => "Datei wird abgeschlossen",
@@ -42,6 +45,14 @@ impl ExportPhase {
 enum ExportError {
     Cancelled,
     Failed(String),
+}
+
+/// Ein Audio-Eingang für den Mux-Schritt: fertig gemischte WAV-Datei plus
+/// optionaler Stream-Titel. Ohne Stems gibt es genau einen Eingang (der
+/// Master-Mix, ohne Titel); mit Stems je Audiospur einen (Titel = Spurname).
+struct AudioMux {
+    path: PathBuf,
+    title: Option<String>,
 }
 
 type ChildList = Arc<Mutex<Vec<(u64, Child)>>>;
@@ -261,6 +272,14 @@ pub fn run_export_worker(
     let registry = ChildRegistry::new(Arc::clone(&children));
     let part = part_path(&settings.output);
     let wav = std::env::temp_dir().join(format!("editron-mix-{job_id}.wav"));
+    // Stems-Export: je Audiospur eine eigene Mix-WAV (statt der Master-WAV).
+    let stem_wavs: Vec<PathBuf> = if stems_enabled(&settings) {
+        (0..plan.audio_tracks.len())
+            .map(|i| std::env::temp_dir().join(format!("editron-stem-{job_id}-{i}.wav")))
+            .collect()
+    } else {
+        Vec::new()
+    };
     // Temp-SRTs fürs Einbetten (eine je Spur; .srt-Endung für den Demuxer).
     let subs: Vec<PathBuf> = if settings.subtitles == SubtitleMode::Embed {
         plan.subtitle_tracks
@@ -273,7 +292,9 @@ pub fn run_export_worker(
     };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        export_inner(&job_id, &plan, &settings, &tx, &cancel, registry, &part, &wav, &subs)
+        export_inner(
+            &job_id, &plan, &settings, &tx, &cancel, registry, &part, &wav, &stem_wavs, &subs,
+        )
     }));
     let outcome = match result {
         Ok(r) => r,
@@ -290,6 +311,9 @@ pub fn run_export_worker(
     // Aufräumen: Kinder sind tot, tmp-Dateien weg; .part nur bei Erfolg renamed.
     ChildRegistry::new(children).kill_all();
     let _ = std::fs::remove_file(&wav);
+    for stem in &stem_wavs {
+        let _ = std::fs::remove_file(stem);
+    }
     for sub in &subs {
         let _ = std::fs::remove_file(sub);
     }
@@ -338,6 +362,7 @@ fn export_inner(
     mut children: ChildRegistry,
     part: &Path,
     wav: &Path,
+    stem_wavs: &[PathBuf],
     subs: &[PathBuf],
 ) -> Result<(), ExportError> {
     let mut progress = Progress::new(tx, job_id);
@@ -359,6 +384,14 @@ fn export_inner(
 
     let with_audio = settings.audio.is_some();
     let with_video = settings.video.is_some();
+    // Stems-Export: je Audiospur ein eigener Stream (kein summierter Master).
+    let stems = stems_enabled(settings);
+    // Lautheits-Normalisierung läuft als 2-Pass über die fertig gemischte WAV
+    // (greift nur, wenn es überhaupt eine Tonspur gibt). Bei Stems ist sie
+    // ausgeschaltet: loudnorm ist eine Master-Bus-Operation, sie würde die
+    // relativen Pegel der einzelnen Stems verfälschen (der Dialog schließt die
+    // Kombination ohnehin aus).
+    let normalize = with_audio && settings.loudness.is_some() && !stems;
 
     // Einzubettende Untertitel als Temp-SRTs schreiben (Encoder-Inputs).
     for (sub, track) in subs.iter().zip(&plan.subtitle_tracks) {
@@ -368,23 +401,64 @@ fn export_inner(
     }
 
     // ---- Phase A: Audio-Mixdown in eine temporäre f32-WAV ----
+    // Lautheits-Normalisierung bekommt einen eigenen, kleinen Fortschritts-
+    // Abschnitt direkt hinter dem Mischen (mit Video schmal, sonst breiter).
+    let mix_span = if with_video {
+        6.0
+    } else if normalize {
+        70.0
+    } else {
+        85.0
+    };
+    let norm_span = if with_video { 4.0 } else { 15.0 };
     if with_audio {
         let audio = settings.audio.as_ref().expect("audio settings");
-        let span = if with_video { 6.0 } else { 85.0 };
         let total_units = plan.audio_total_units(audio.sample_rate);
-        progress.begin_phase(ExportPhase::MixAudio, 0.0, span, total_units.max(1), false);
-        mix_audio_to_wav(plan, audio, wav, cancel, &mut children, &mut progress)
-            .map_err(fail_or_cancel(cancel))?;
+        progress.begin_phase(ExportPhase::MixAudio, 0.0, mix_span, total_units.max(1), false);
+        if stems {
+            // Je Audiospur eine eigene Mix-WAV (Stem); keine Master-Summe,
+            // keine Lautheits-Normalisierung.
+            mix_audio_stems(plan, audio, stem_wavs, cancel, &mut children, &mut progress)
+                .map_err(fail_or_cancel(cancel))?;
+        } else {
+            mix_audio_to_wav(plan, audio, wav, cancel, &mut children, &mut progress)
+                .map_err(fail_or_cancel(cancel))?;
+
+            // ---- Phase A2: Lautheit auf das Ziel normalisieren (2-Pass) ----
+            if let Some(norm) = settings.loudness {
+                progress.begin_phase(ExportPhase::NormalizeLoudness, mix_span, norm_span, 2, false);
+                normalize_loudness(wav, norm, audio, cancel, &mut children, &mut progress)
+                    .map_err(fail_or_cancel(cancel))?;
+            }
+        }
     }
+
+    // Audio-Eingänge fürs Muxen: ohne Stems der Master-Mix (ein Stream, ohne
+    // Titel), mit Stems je Audiospur einer (Titel = Spurname). Leer = ohne Ton.
+    let audio_inputs: Vec<AudioMux> = if !with_audio {
+        Vec::new()
+    } else if stems {
+        stem_wavs
+            .iter()
+            .zip(&plan.audio_tracks)
+            .map(|(p, t)| AudioMux { path: p.clone(), title: Some(t.name.clone()) })
+            .collect()
+    } else {
+        vec![AudioMux { path: wav.to_path_buf(), title: None }]
+    };
 
     // ---- Phase B: Video rendern bzw. Audio-only kodieren ----
     if with_video {
-        let base = if with_audio { 6.0 } else { 0.0 };
+        let base = if with_audio {
+            mix_span + if normalize { norm_span } else { 0.0 }
+        } else {
+            0.0
+        };
         progress.begin_phase(ExportPhase::RenderVideo, base, 93.0 - base, plan.total_frames, true);
         render_video(
             plan,
             settings,
-            with_audio.then_some(wav),
+            &audio_inputs,
             subs,
             part,
             cancel,
@@ -394,7 +468,7 @@ fn export_inner(
         .map_err(fail_or_cancel(cancel))?;
     } else {
         progress.begin_phase(ExportPhase::EncodeAudio, 85.0, 14.0, 1, false);
-        encode_audio_only(settings, wav, part, cancel, &mut children)
+        encode_audio_only(settings, &audio_inputs, part, cancel, &mut children)
             .map_err(fail_or_cancel(cancel))?;
     }
 
@@ -514,6 +588,40 @@ pub(crate) fn mix_audio_to_wav(
     }
 
     file.sync_all().ok();
+    Ok(())
+}
+
+/// Stems mischen: je Audiospur eine eigene WAV (Stem) statt einer summierten
+/// Master-WAV. Jede Spur wird in eine frisch stille WAV mit voller Bus-
+/// Verarbeitung (Bus-FX + Spur-Gain/Pan + Master) geschrieben — identische
+/// DSP-Kette wie `mix_audio_to_wav`, nur ohne Summieren. `stems[i]` gehört zu
+/// `plan.audio_tracks[i]`. Die Summe aller Stems ergibt exakt den Master-Mix.
+pub(crate) fn mix_audio_stems(
+    plan: &RenderPlan,
+    audio: &AudioSettings,
+    stems: &[PathBuf],
+    cancel: &AtomicBool,
+    children: &mut ChildRegistry,
+    progress: &mut Progress,
+) -> Result<(), String> {
+    let rate = audio.sample_rate;
+    let ch = audio.channels.clamp(1, 2) as usize;
+    let total_frames = (plan.duration * rate as f64).round().max(1.0) as u64;
+    let data_bytes = total_frames * ch as u64 * 4;
+    if data_bytes >= u32::MAX as u64 - 1024 {
+        return Err("Audio-Mix überschreitet die 4-GB-Grenze des WAV-Zwischenformats.".into());
+    }
+    for (idx, track) in plan.audio_tracks.iter().enumerate() {
+        let stem = &stems[idx];
+        // Stille-WAV als Ziel; `process_audio_track` summiert die (frisch
+        // stille) Spur hinein ⇒ exakt das Spur-Signal im Stem.
+        let (mut file, data_off) = create_silent_wav(stem, rate, ch, data_bytes)?;
+        process_audio_track(
+            &mut file, data_off, total_frames, rate, ch, stem, idx, track, cancel, children,
+            progress,
+        )?;
+        file.sync_all().ok();
+    }
     Ok(())
 }
 
@@ -800,6 +908,158 @@ fn process_audio_track(
     let result = run();
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+// ------------------------------------------------------ Lautheits-Normalisierung
+
+/// Gemessene Lautheitswerte aus dem `loudnorm`-JSON (Pass 1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LoudnessMeasured {
+    pub input_i: f64,
+    pub input_tp: f64,
+    pub input_lra: f64,
+    pub input_thresh: f64,
+    pub target_offset: f64,
+}
+
+impl LoudnessMeasured {
+    /// Stilles/leeres Material liefert `-inf`-Messwerte — dann ist eine
+    /// Normalisierung weder sinnvoll noch in Pass 2 abbildbar.
+    pub(crate) fn all_finite(&self) -> bool {
+        self.input_i.is_finite()
+            && self.input_tp.is_finite()
+            && self.input_lra.is_finite()
+            && self.input_thresh.is_finite()
+            && self.target_offset.is_finite()
+    }
+}
+
+/// `loudnorm`-Mess-JSON aus dem ffmpeg-stderr extrahieren. Der JSON-Block ist
+/// dem Log-Text nachgestellt; wir schneiden ihn zwischen erster `{` und
+/// letzter `}` heraus und parsen die als Strings notierten Zahlen.
+pub(crate) fn parse_loudnorm_json(stderr: &str) -> Option<LoudnessMeasured> {
+    let start = stderr.find('{')?;
+    let end = stderr.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&stderr[start..=end]).ok()?;
+    let get = |k: &str| -> Option<f64> { v.get(k)?.as_str()?.trim().parse::<f64>().ok() };
+    Some(LoudnessMeasured {
+        input_i: get("input_i")?,
+        input_tp: get("input_tp")?,
+        input_lra: get("input_lra")?,
+        input_thresh: get("input_thresh")?,
+        target_offset: get("target_offset")?,
+    })
+}
+
+/// Einen ffmpeg-Lauf ausführen, der nur stderr liefert (loudnorm-Messung bzw.
+/// -Anwendung). Gibt das gesammelte stderr zurück (für JSON/Fehlertail).
+fn run_ffmpeg_collect_stderr(
+    cmd: &mut Command,
+    cancel: &AtomicBool,
+    children: &mut ChildRegistry,
+) -> Result<Vec<u8>, String> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    let (id, _, _, stderr) = children.spawn(cmd)?;
+    let mut stderr = stderr.ok_or("ffmpeg-stderr nicht verfügbar")?;
+    let task = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let status = children.wait(id);
+    let buf = task.join().unwrap_or_default();
+    if cancel.load(Ordering::Relaxed) {
+        return Err("abgebrochen".into());
+    }
+    if !status.map(|s| s.success()).unwrap_or(false) {
+        let tail = stderr_tail(&buf);
+        return Err(if tail.is_empty() {
+            "ohne Fehlermeldung".into()
+        } else {
+            tail
+        });
+    }
+    Ok(buf)
+}
+
+/// Lautheits-Normalisierung der gemischten WAV per ffmpeg `loudnorm`
+/// (2-Pass: erst integrierte Lautheit/True-Peak messen, dann mit den
+/// Messwerten linear auf das Ziel bringen). Das Ergebnis ersetzt die Mix-WAV
+/// (Temp + Rename) — der nachgelagerte Encode-Pfad nutzt unverändert dieselbe
+/// Datei. Format der Zwischendatei (f32-PCM, gleiche Rate/Kanäle) bleibt
+/// erhalten, damit das Compositing/Muxing nichts davon merkt.
+fn normalize_loudness(
+    wav: &Path,
+    norm: LoudnessNorm,
+    audio: &AudioSettings,
+    cancel: &AtomicBool,
+    children: &mut ChildRegistry,
+    progress: &mut Progress,
+) -> Result<(), String> {
+    let norm = norm.clamped();
+
+    // ---- Pass 1: messen (loudnorm im JSON-Modus, kein Datei-Output) ----
+    let measure = format!(
+        "loudnorm=I={:.2}:TP={:.2}:LRA={:.2}:print_format=json",
+        norm.target_i, norm.true_peak, norm.lra
+    );
+    let mut cmd = Command::new(crate::services::ffmpeg_bin());
+    cmd.args(["-hide_banner", "-nostats", "-v", "info", "-y"])
+        .args(["-i", &wav.to_string_lossy()])
+        .args(["-af", &measure])
+        .args(["-f", "null", "-"]);
+    let stderr = run_ffmpeg_collect_stderr(&mut cmd, cancel, children)
+        .map_err(|e| format!("Lautheitsmessung fehlgeschlagen: {e}"))?;
+    let measured = parse_loudnorm_json(&String::from_utf8_lossy(&stderr))
+        .ok_or("Lautheitsmessung lieferte keine Messwerte (loudnorm-JSON fehlt)")?;
+    progress.advance(1);
+
+    // Stilles Material: nichts zu normalisieren — Mix-WAV unverändert lassen.
+    if !measured.all_finite() {
+        progress.advance(1);
+        return Ok(());
+    }
+
+    // ---- Pass 2: anwenden (Messwerte → lineare Normalisierung) ----
+    let ch = audio.channels.clamp(1, 2);
+    let apply = format!(
+        "loudnorm=I={:.2}:TP={:.2}:LRA={:.2}:measured_I={:.2}:measured_TP={:.2}:\
+         measured_LRA={:.2}:measured_thresh={:.2}:offset={:.2}:linear=true:print_format=summary",
+        norm.target_i,
+        norm.true_peak,
+        norm.lra,
+        measured.input_i,
+        measured.input_tp,
+        measured.input_lra,
+        measured.input_thresh,
+        measured.target_offset,
+    );
+    let out = wav.with_extension("norm.wav");
+    let mut cmd = Command::new(crate::services::ffmpeg_bin());
+    cmd.args(["-hide_banner", "-v", "error", "-y"])
+        .args(["-i", &wav.to_string_lossy()])
+        .args(["-af", &apply])
+        // loudnorm rechnet intern bei 192 kHz — wieder auf die Mix-Parameter
+        // zurückbringen (gleiche Rate/Kanäle/f32-PCM wie die Eingangs-WAV).
+        .args(["-ar", &audio.sample_rate.to_string()])
+        .args(["-ac", &ch.to_string()])
+        .args(["-c:a", "pcm_f32le"])
+        .args(["-f", "wav"])
+        .arg(&out);
+    let result = run_ffmpeg_collect_stderr(&mut cmd, cancel, children);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&out);
+        return Err(format!("Lautheitsnormalisierung fehlgeschlagen: {e}"));
+    }
+    std::fs::rename(&out, wav).map_err(|e| {
+        let _ = std::fs::remove_file(&out);
+        format!("Normalisierte Audiodatei konnte nicht ersetzt werden: {e}")
+    })?;
+    progress.advance(1);
+    Ok(())
 }
 
 // ----------------------------------------------------------- Video-Render
@@ -1159,7 +1419,7 @@ fn render_image_sequence(
 fn render_video(
     plan: &RenderPlan,
     settings: &ExportSettings,
-    wav: Option<&Path>,
+    audio: &[AudioMux],
     subs: &[PathBuf],
     part: &Path,
     cancel: &AtomicBool,
@@ -1176,24 +1436,36 @@ fn render_video(
         .args(["-video_size", &format!("{}x{}", video.width, video.height)])
         .args(["-framerate", &fps])
         .args(["-i", "pipe:0"]);
-    if let Some(wav) = wav {
-        cmd.args(["-i", &wav.to_string_lossy()]);
+    // Audio-Eingänge (ein Master-Mix bzw. je ein Stem pro Audiospur).
+    for a in audio {
+        cmd.args(["-i", &a.path.to_string_lossy()]);
     }
     for sub in subs {
         cmd.args(["-i", &sub.to_string_lossy()]);
     }
     cmd.args(["-map", "0:v:0"]);
-    if wav.is_some() {
-        cmd.args(["-map", "1:a:0"]);
+    // Jeden Audio-Eingang als eigenen Stream mappen (Input 1..=audio.len()).
+    for i in 0..audio.len() {
+        cmd.args(["-map", &format!("{}:a:0", 1 + i)]);
     }
     // Untertitel-Streams hinter Video/Audio mappen (Input-Reihenfolge).
-    let sub_base = 1 + usize::from(wav.is_some());
+    let sub_base = 1 + audio.len();
     for i in 0..subs.len() {
         cmd.args(["-map", &format!("{}:s:0", sub_base + i)]);
     }
     cmd.args(video_codec_args(video, settings.container, plan.color));
-    if let (Some(_), Some(a)) = (wav, settings.audio.as_ref()) {
-        cmd.args(audio_codec_args(a));
+    if !audio.is_empty() {
+        if let Some(a) = settings.audio.as_ref() {
+            // `-c:a`/`-b:a` gelten für ALLE Audio-Ausgabe-Streams.
+            cmd.args(audio_codec_args(a));
+        }
+        // Stream-Titel je Stem (Spurname), damit Player/NLE die Stems benennen.
+        for (i, m) in audio.iter().enumerate() {
+            if let Some(title) = &m.title {
+                cmd.arg(format!("-metadata:s:a:{i}"))
+                    .arg(format!("title={title}"));
+            }
+        }
     }
     if !subs.is_empty() {
         if let Some(codec) = settings.container.subtitle_codec {
@@ -1640,6 +1912,29 @@ impl ReverseDecode {
 
 /// Ein Layer-Decoder im Compositing-Pfad: liefert transparent gepolsterte
 /// RGBA-Frames in Decode-Auflösung (das volle Zielframe repräsentierend).
+/// Input-/Look-LUTs eines Export-Layers direkt aus den `.cube`-Dateien laden
+/// (Worker-Pfad, kein geteilter Cache — pro Segment einmalig, vernachlässigbar).
+/// Fehlende/ungültige Dateien fallen still weg (Export nutzt, was verfügbar ist).
+fn resolve_export_luts(grade: &grade::ColorGrade) -> OwnedLutStack {
+    let load = |slot: &Option<grade::LutSlot>| -> Option<(Arc<lut::Lut>, f32)> {
+        let s = slot.as_ref()?;
+        if !s.is_active() {
+            return None;
+        }
+        match lut::load_cube_file(&s.path) {
+            Ok(l) => Some((Arc::new(l), s.strength01())),
+            Err(e) => {
+                eprintln!("[export] LUT „{}“ nicht ladbar: {e}", s.path);
+                None
+            }
+        }
+    };
+    OwnedLutStack {
+        input: load(&grade.input_lut),
+        look: load(&grade.look_lut),
+    }
+}
+
 struct LayerStream {
     src: LayerSource,
     /// Letzter vollständiger Frame, f32-RGBA 0..1 (initial transparent).
@@ -1659,6 +1954,8 @@ struct LayerStream {
     effects: Vec<EffectInstance>,
     /// Vorberechnete Farbkorrektur (Identität ⇒ kein Grading-Pass).
     grade: grade::GradeParams,
+    /// Aufgelöste Input-/Look-3D-LUTs des Clips.
+    luts: OwnedLutStack,
     /// Sichtbarer Inhalt im gepolsterten Puffer (Vignetten-Bezugsrahmen).
     content: (usize, usize, usize, usize),
     /// Übergangs-Fenster dieses Layers (Exportzeit).
@@ -1697,6 +1994,7 @@ struct TitleLayer {
     fx: ClipFx,
     effects: Vec<EffectInstance>,
     grade: grade::GradeParams,
+    luts: OwnedLutStack,
     transitions: Vec<PlanTransition>,
 }
 
@@ -1723,13 +2021,14 @@ impl TitleLayer {
                 threads,
             );
         }
-        if !self.grade.is_identity() {
+        if !self.grade.is_identity() || self.luts.is_active() {
             grade::grade_buffer(
                 &mut self.scratch,
                 self.w,
                 self.h,
                 (0, 0, self.w, self.h),
                 &self.grade,
+                &self.luts.borrow(),
                 threads,
             );
         }
@@ -1804,13 +2103,14 @@ impl LayerStream {
                     );
                 }
             }
-            if !self.grade.is_identity() {
+            if !self.grade.is_identity() || self.luts.is_active() {
                 grade::grade_buffer(
                     &mut self.frame,
                     self.w,
                     self.h,
                     self.content,
                     &self.grade,
+                    &self.luts.borrow(),
                     threads,
                 );
             }
@@ -1922,6 +2222,7 @@ struct NestLayer {
     media_step: f64,
     fx: ClipFx,
     grade: grade::GradeParams,
+    luts: OwnedLutStack,
     effects: Vec<EffectInstance>,
     transitions: Vec<PlanTransition>,
     frame: Vec<f32>,
@@ -1954,8 +2255,8 @@ impl NestLayer {
                 effects::apply_effects_buffer(&mut self.frame, w, h, (0, 0, w, h), &resolved, threads);
             }
         }
-        if !self.grade.is_identity() {
-            grade::grade_buffer(&mut self.frame, w, h, (0, 0, w, h), &self.grade, threads);
+        if !self.grade.is_identity() || self.luts.is_active() {
+            grade::grade_buffer(&mut self.frame, w, h, (0, 0, w, h), &self.grade, &self.luts.borrow(), threads);
         }
     }
 }
@@ -2011,10 +2312,11 @@ fn render_segment_composited(
             let (rw, rh, extend_k) = (raster.w, raster.h, raster.extend_k);
             let mut base = crate::core::pixbuf::rgba8_to_f32(&raster.data);
             let grade_params = grade::precompute(&plan_layer.grade);
+            let title_luts = resolve_export_luts(&plan_layer.grade);
             let dynamic = effects::has_active_video_effects(&plan_layer.effects);
-            if !dynamic && !grade_params.is_identity() {
-                // Ohne Effekte ist das Grading statisch — einmal einbrennen.
-                grade::grade_buffer(&mut base, rw, rh, (0, 0, rw, rh), &grade_params, threads);
+            if !dynamic && (!grade_params.is_identity() || title_luts.is_active()) {
+                // Ohne Effekte ist das Grading (inkl. LUTs) statisch — einbrennen.
+                grade::grade_buffer(&mut base, rw, rh, (0, 0, rw, rh), &grade_params, &title_luts.borrow(), threads);
             }
             layers.push(SegLayer::Title(TitleLayer {
                 scratch: if dynamic { base.clone() } else { Vec::new() },
@@ -2028,6 +2330,7 @@ fn render_segment_composited(
                 fx: plan_layer.fx.clone(),
                 effects: if dynamic { plan_layer.effects.clone() } else { Vec::new() },
                 grade: grade_params,
+                luts: title_luts,
                 transitions: plan_layer.transitions.clone(),
             }));
             continue;
@@ -2080,6 +2383,7 @@ fn render_segment_composited(
                 media_step: plan_layer.media_step,
                 fx: plan_layer.fx.clone(),
                 grade: grade::precompute(&plan_layer.grade),
+                luts: resolve_export_luts(&plan_layer.grade),
                 effects: plan_layer.effects.clone(),
                 transitions: plan_layer.transitions.clone(),
                 // Initial opak schwarz, bis advance das erste Frame liefert.
@@ -2198,6 +2502,7 @@ fn render_segment_composited(
             fx: plan_layer.fx.clone(),
             effects: plan_layer.effects.clone(),
             grade: grade::precompute(&plan_layer.grade),
+            luts: resolve_export_luts(&plan_layer.grade),
             content,
             transitions: plan_layer.transitions.clone(),
         }));
@@ -2338,17 +2643,30 @@ fn render_segment_composited(
 
 fn encode_audio_only(
     settings: &ExportSettings,
-    wav: &Path,
+    audio: &[AudioMux],
     part: &Path,
     cancel: &AtomicBool,
     children: &mut ChildRegistry,
 ) -> Result<(), String> {
-    let audio = settings.audio.as_ref().expect("audio settings");
+    let audio_settings = settings.audio.as_ref().expect("audio settings");
     let mut cmd = Command::new(crate::services::ffmpeg_bin());
-    cmd.args(["-y", "-v", "error"])
-        .args(["-i", &wav.to_string_lossy()])
-        .args(["-map", "0:a:0"])
-        .args(audio_codec_args(audio));
+    cmd.args(["-y", "-v", "error"]);
+    // Audio-Eingänge (ein Master-Mix bzw. je ein Stem pro Audiospur).
+    for a in audio {
+        cmd.args(["-i", &a.path.to_string_lossy()]);
+    }
+    for i in 0..audio.len() {
+        cmd.args(["-map", &format!("{i}:a:0")]);
+    }
+    // `-c:a`/`-b:a` gelten für ALLE Audio-Streams.
+    cmd.args(audio_codec_args(audio_settings));
+    // Stream-Titel je Stem (Spurname).
+    for (i, m) in audio.iter().enumerate() {
+        if let Some(title) = &m.title {
+            cmd.arg(format!("-metadata:s:a:{i}"))
+                .arg(format!("title={title}"));
+        }
+    }
     if settings.container.faststart {
         cmd.args(["-movflags", "+faststart"]);
     }

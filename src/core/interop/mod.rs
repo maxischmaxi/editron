@@ -709,6 +709,7 @@ fn emit_track_clips(
             InteropItem::Clip(c) => {
                 let asset_id = media_asset_id.get(c.media).cloned().unwrap_or_default();
                 let clip = TimelineClip {
+                    extra: Default::default(),
                     id: new_id(),
                     track_id: track.id.clone(),
                     asset_id,
@@ -845,6 +846,7 @@ fn make_import_asset(m: &InteropMedia, seq_rate: FrameRate, exists: bool, now: f
         Vec::new()
     };
     MediaAsset {
+        extra: Default::default(),
         id: new_id(),
         path: m.path.clone(),
         name: if m.name.trim().is_empty() {

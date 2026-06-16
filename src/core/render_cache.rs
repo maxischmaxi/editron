@@ -338,6 +338,7 @@ mod tests {
 
     fn clip(id: &str, start: f64, duration: f64) -> TimelineClip {
         TimelineClip {
+            extra: Default::default(),
             id: id.into(),
             track_id: "v1".into(),
             asset_id: "asset".into(),
@@ -367,6 +368,7 @@ mod tests {
     fn media_with_asset() -> MediaStore {
         let mut m = MediaStore::default();
         m.add_asset(MediaAsset {
+            extra: Default::default(),
             id: "asset".into(),
             path: "/tmp/asset.mp4".into(),
             name: "asset".into(),

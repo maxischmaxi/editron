@@ -9,7 +9,7 @@ use crate::core::timecode::{format_duration, format_sequence_timecode};
 use crate::core::timeline::{
     apply_trim, expand_links, plan_asset_placements, sequence_end, track_name, trim_range,
     PlannedPlacement, TimelineClip, TimelineTrack, TrackAutoParam, TrackFlag, TrackKind, TrimEdge,
-    MIN_CLIP_DURATION, SelectMode,
+    MAX_TRACK_HEIGHT, MIN_CLIP_DURATION, MIN_TRACK_HEIGHT, SelectMode,
 };
 use std::collections::HashSet;
 use crate::core::transitions::{
@@ -40,6 +40,8 @@ const RULER_H: f32 = 28.0; // h-7
 const VIDEO_H: f32 = 48.0; // h-12
 const AUDIO_H: f32 = 40.0; // h-10
 const SUBTITLE_H: f32 = 28.0; // h-7 — kompakte Untertitel-Spuren
+/// Greifzone (Höhe) des Sash am Spurkopf-Unterrand zum Verstellen der Spurhöhe.
+const TRACK_SASH_H: f32 = 5.0;
 /// Höhe des Marker-Bandes am unteren Linealrand.
 const MARKER_BAND_H: f32 = 11.0;
 /// Einrast-Radius in Pixeln (zoomunabhängig).
@@ -156,6 +158,8 @@ pub struct TimelinePanel {
     tab_rename: Option<TextInputState>,
     /// Laufendes Verschieben eines Sequenz-Tabs (Reihenfolge per Drag).
     tab_drag: Option<TabDrag>,
+    /// Laufendes Verstellen einer Spurhöhe (Sash-Drag am Spurkopf-Unterrand).
+    track_resize: Option<TrackResizeDrag>,
 }
 
 /// Laufendes Ziehen eines Sequenz-Tabs (Reihenfolge umsortieren).
@@ -164,6 +168,15 @@ struct TabDrag {
     origin_x: f32,
     /// Erst nach kleiner Bewegung „echter“ Drag (sonst bleibt es ein Klick).
     moved: bool,
+}
+
+/// Laufendes Verstellen einer Spurhöhe per Sash-Drag am unteren Spurkopf-Rand.
+struct TrackResizeDrag {
+    track_id: String,
+    /// Mausposition (y) und Spurhöhe bei Gestenbeginn — die Höhe folgt dann
+    /// `start_h + (maus_y − start_mouse_y)`.
+    start_mouse_y: f32,
+    start_h: f32,
 }
 
 /// Laufendes Ziehen eines Automations-Punkts auf einer Audiospur.
@@ -196,6 +209,7 @@ impl Default for TimelinePanel {
             auto_pan: HashSet::new(),
             tab_rename: None,
             tab_drag: None,
+            track_resize: None,
         }
     }
 }
@@ -209,12 +223,21 @@ fn auto_range(param: TrackAutoParam) -> f64 {
     }
 }
 
-fn track_height(track: &TimelineTrack) -> f32 {
-    match track.kind {
+/// Kompakte Standardhöhe einer Spurart (gilt, solange keine manuelle Höhe
+/// per Sash-Drag gesetzt ist).
+fn default_track_height(kind: TrackKind) -> f32 {
+    match kind {
         TrackKind::Video => VIDEO_H,
         TrackKind::Audio => AUDIO_H,
         TrackKind::Subtitle => SUBTITLE_H,
     }
+}
+
+fn track_height(track: &TimelineTrack) -> f32 {
+    track
+        .height
+        .map(|h| h.clamp(MIN_TRACK_HEIGHT, MAX_TRACK_HEIGHT))
+        .unwrap_or_else(|| default_track_height(track.kind))
 }
 
 /// Tooltip-Text mit Shortcut der aktiven Keymap, z. B. "Rasierklinge (C)".
@@ -256,6 +279,17 @@ impl TimelinePanel {
             }
             targets.push(c.start);
             targets.push(c.end());
+        }
+        // Sequenz-Marker als Snap-Ziele (Beat-genaues Schneiden zu Musik);
+        // Bereichsmarker liefern zusätzlich ihre Endkante. Aufs Frame-Raster
+        // gerastert, weil der frame-genaue Edit-Pfad die Frame-Rundung bei
+        // aktivem Snap überspringt (er vertraut darauf, dass Snap-Ziele selbst
+        // frame-aligned sind) — Marker können aber sub-frame gesetzt sein.
+        for m in &app.timeline.markers {
+            targets.push(app.timeline.snap_to_frame(m.time));
+            if m.duration > 0.0 {
+                targets.push(app.timeline.snap_to_frame(m.end()));
+            }
         }
         self.snap_targets = targets;
     }
@@ -801,6 +835,7 @@ impl Panel for TimelinePanel {
             && !auto_input
             && self.ruler_drag.is_none()
             && self.trans_editor.is_none()
+            && self.track_resize.is_none()
             && ui.mouse_in(viewport)
             && mouse.y >= viewport.y + RULER_H - scroll_y
         {
@@ -827,7 +862,18 @@ impl Panel for TimelinePanel {
             let h = track_height(track);
             let head = Rect::new(viewport.x, head_y, TRACK_HEADER_W, h);
             self.draw_track_header(ui, app, track, head);
+            // Sash am Unterrand: Spurhöhe per Drag verstellen (nach dem Header,
+            // damit der Griff über dem Trennstrich liegt).
+            self.handle_track_resize(ui, app, track, head);
             head_y += h;
+        }
+        // Sicherheitsnetz: Wurde die gezogene Spur während der Geste entfernt
+        // (z. B. removeTrack-Shortcut bei gehaltenem Sash), besucht die Schleife
+        // sie nicht mehr und der Release-Zweig läuft nie — `track_resize` bliebe
+        // stale und das Lane-Input-Gate würde Klicks dauerhaft blockieren. Beim
+        // Loslassen daher hart aufräumen (der normale Commit lief oben bereits).
+        if self.track_resize.is_some() && !ui.input.left_down {
+            self.track_resize = None;
         }
 
         // ---------------- Snap-Hilfslinie, Marquee, Playhead ------------------
@@ -1447,6 +1493,63 @@ impl TimelinePanel {
             let items = track_header_menu(track, &name);
             app.context_menu
                 .show(ui.input.mouse.x, ui.input.mouse.y, items);
+        }
+    }
+
+    /// Sash am Spurkopf-Unterrand: Spurhöhe per Drag verstellen (für Waveforms/
+    /// Keyframes). Setzt den Resize-Cursor beim Überfahren, startet die Geste
+    /// beim Drücken und schreibt die geklemmte Höhe live nach `app.timeline`
+    /// (persistiert in der Sequenz). Liegt in der Header-Spalte, die der Lane-
+    /// Input ohnehin ausnimmt — daher kein Konflikt mit Clip-/Marquee-Klicks.
+    fn handle_track_resize(&mut self, ui: &mut Ui, app: &mut AppState, track: &TimelineTrack, head: Rect) {
+        let sash = Rect::new(head.x, head.bottom() - TRACK_SASH_H, head.w, TRACK_SASH_H);
+        let active = self
+            .track_resize
+            .as_ref()
+            .is_some_and(|d| d.track_id == track.id);
+        let hover = ui.mouse_in(sash);
+        if active || hover {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_NS);
+            // Akzent-Griff am Unterrand als visuelle Rückmeldung.
+            ui.fill(Rect::new(sash.x, head.bottom() - 2.0, sash.w, 2.0), theme::ACCENT);
+        }
+
+        if active {
+            if ui.input.left_down {
+                if let Some(d) = self.track_resize.as_ref() {
+                    let new_h = (d.start_h + (ui.input.mouse.y - d.start_mouse_y))
+                        .clamp(MIN_TRACK_HEIGHT, MAX_TRACK_HEIGHT);
+                    // Erst ab spürbarem Versatz schreiben — ein reines Klicken
+                    // (ohne Ziehen) lässt die Höhe unangetastet (kein None→Some).
+                    if (new_h - d.start_h).abs() > 0.5 {
+                        app.timeline.set_track_height_live(&track.id, new_h);
+                    }
+                }
+            } else {
+                // Geste beendet: einmalig als geändert verbuchen (Dirty/Autosave),
+                // wenn sich die Höhe gegenüber dem Gestenbeginn verändert hat. So
+                // bleibt die Revision während des Ziehens stabil (kein Per-Frame-
+                // Dirty / keine Render-Cache-Revalidierung pro Frame).
+                if let Some(d) = self.track_resize.take() {
+                    if (track_height(track) - d.start_h).abs() > 0.5 {
+                        app.timeline.mark_track_resized();
+                    }
+                }
+            }
+            return;
+        }
+
+        // Neue Geste: Druck auf die Greifzone (nur wenn nichts anderes zieht).
+        if hover
+            && ui.input.left_pressed
+            && self.drag.is_none()
+            && self.ruler_drag.is_none()
+        {
+            self.track_resize = Some(TrackResizeDrag {
+                track_id: track.id.clone(),
+                start_mouse_y: ui.input.mouse.y,
+                start_h: track_height(track),
+            });
         }
     }
 
@@ -3166,6 +3269,12 @@ fn clip_context_menu(app: &AppState, clip: &TimelineClip, t: f64) -> Vec<MenuEnt
         MenuEntry::Separator,
         MenuEntry::Item(MenuItem::command("clip.copyAttributes").with_icon("copy")),
         MenuEntry::Item(MenuItem::command("clip.pasteAttributes").with_icon("clipboard-paste")),
+        MenuEntry::Item(MenuItem::command("color.copyGrade").with_icon("palette")),
+        MenuEntry::Item(
+            MenuItem::command("color.pasteGrade")
+                .with_icon("clipboard-paste")
+                .with_disabled(app.grade_clipboard.is_none()),
+        ),
         MenuEntry::Item(MenuItem::command("clip.toggleEffects").with_icon("zap")),
         MenuEntry::Item(
             MenuItem::command("clip.removeAllEffects")
@@ -3253,14 +3362,14 @@ fn lane_context_menu(app: &AppState, track: Option<&TimelineTrack>, t: f64) -> V
     ];
     if let Some(track) = track {
         items.push(MenuEntry::Item(
-            MenuItem::custom(
-                &format!("Spur {} entfernen", track_name(track, &app.timeline.tracks)),
-                CustomAction::TimelineRemoveTrack {
-                    track_id: track.id.clone(),
-                },
-            )
-            .with_icon("trash-2")
-            .with_danger(),
+            MenuItem::command("timeline.removeTrack")
+                .with_label(&format!(
+                    "Spur {} entfernen",
+                    track_name(track, &app.timeline.tracks)
+                ))
+                .with_args(serde_json::json!({ "trackId": track.id }))
+                .with_icon("trash-2")
+                .with_danger(),
         ));
     }
     items
@@ -3370,14 +3479,11 @@ fn track_header_menu(track: &TimelineTrack, name: &str) -> Vec<MenuEntry> {
         MenuItem::command("subtitle.addTrack").with_icon("plus"),
     ));
     items.push(MenuEntry::Item(
-        MenuItem::custom(
-            &format!("Spur {name} entfernen"),
-            CustomAction::TimelineRemoveTrack {
-                track_id: track.id.clone(),
-            },
-        )
-        .with_icon("trash-2")
-        .with_danger(),
+        MenuItem::command("timeline.removeTrack")
+            .with_label(&format!("Spur {name} entfernen"))
+            .with_args(serde_json::json!({ "trackId": track.id }))
+            .with_icon("trash-2")
+            .with_danger(),
     ));
     items
 }
@@ -3445,4 +3551,76 @@ fn open_marker_dialog(app: &mut AppState, marker_id: String) {
         marker_id,
     });
     app.app.open_dialog = Some(DialogId::Marker);
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::*;
+    use crate::core::marker::Marker;
+
+    #[test]
+    fn snap_targets_include_sequence_markers_and_range_edges() {
+        let mut app = AppState::default();
+        // Punktmarker bei 5 s und Bereichsmarker 10–14 s.
+        app.timeline.markers.push(Marker::new(5.0));
+        let mut range = Marker::new(10.0);
+        range.duration = 4.0;
+        app.timeline.markers.push(range);
+
+        let mut panel = TimelinePanel::default();
+        panel.collect_snap_targets(&app, &[]);
+
+        let has = |t: f64| panel.snap_targets.iter().any(|&s| (s - t).abs() < 1e-9);
+        assert!(has(5.0), "Punktmarkerzeit fehlt");
+        assert!(has(10.0), "Bereichsmarker-Start fehlt");
+        assert!(has(14.0), "Bereichsmarker-Ende fehlt");
+    }
+
+    #[test]
+    fn sub_frame_marker_target_is_frame_aligned() {
+        // Default = 25 fps ⇒ 0,04 s/Frame. Ein sub-frame gesetzter Marker
+        // (z. B. via roher EDITRON_TEST_MARKER-Dauer) darf kein Snap-Ziel
+        // zwischen zwei Frames erzeugen, sonst landet die Clip-Kante off-grid.
+        let mut app = AppState::default();
+        let mut m = Marker::new(5.03); // → Frame 126 = 5,04 s
+        m.duration = 2.01; // end 7,04 → Frame 176 = 7,04 s
+        app.timeline.markers.push(m);
+
+        let mut panel = TimelinePanel::default();
+        panel.collect_snap_targets(&app, &[]);
+
+        // Jedes Marker-Ziel sitzt exakt auf einem Frame (idempotent).
+        for &s in &panel.snap_targets {
+            assert!(
+                (s - app.timeline.snap_to_frame(s)).abs() < 1e-9,
+                "Snap-Ziel {s} liegt nicht auf dem Frame-Raster",
+            );
+        }
+        let has = |t: f64| panel.snap_targets.iter().any(|&s| (s - t).abs() < 1e-9);
+        assert!(has(5.04), "Markerzeit nicht frame-gerastet");
+        assert!(!has(5.03), "rohe Sub-Frame-Markerzeit darf kein Ziel sein");
+    }
+
+    #[test]
+    fn marker_snap_respects_snapping_toggle() {
+        let mut app = AppState::default();
+        app.timeline.markers.push(Marker::new(5.0));
+        let mut panel = TimelinePanel::default();
+        panel.collect_snap_targets(&app, &[]);
+
+        // Kante knapp neben dem Marker (innerhalb der Schwelle bei 40 px/s).
+        let edge = 5.05;
+
+        // Snapping an: Kante rastet exakt auf den Marker.
+        app.timeline.snapping = true;
+        let (delta, target) = panel.snap_adjust(&app, &[edge], 0.0);
+        assert_eq!(target, Some(5.0));
+        assert!((edge + delta - 5.0).abs() < 1e-9);
+
+        // Snapping aus (Taste S): keine Anpassung.
+        app.timeline.snapping = false;
+        let (delta_off, target_off) = panel.snap_adjust(&app, &[edge], 0.0);
+        assert_eq!(target_off, None);
+        assert_eq!(delta_off, 0.0);
+    }
 }

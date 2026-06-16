@@ -27,6 +27,9 @@ pub struct ScopesPanel {
     mode: usize,
     /// Thumbnail-Fallback-Cache: Pfad → RGBA in natürlicher Thumb-Größe.
     thumb_cache: Option<(String, ThumbSample)>,
+    /// Panel-eigener `.cube`-LUT-Cache (Scopes laufen jeden Frame, daher nicht
+    /// pro Frame neu parsen). Spiegelt den Export-/Programm-LUT-Pfad.
+    lut_cache: crate::core::lut::LutCache,
 }
 
 struct ThumbSample {
@@ -122,8 +125,9 @@ impl ScopesPanel {
                 effects::apply_effects_buffer(&mut data, w, h, (0, 0, w, h), &resolved, 1);
             }
             let params = grade::precompute(&clip.grade);
-            if !params.is_identity() {
-                grade::grade_buffer(&mut data, w, h, (0, 0, w, h), &params, 1);
+            let luts = grade::resolve_luts(&clip.grade, &mut self.lut_cache);
+            if !params.is_identity() || luts.is_active() {
+                grade::grade_buffer(&mut data, w, h, (0, 0, w, h), &params, &luts.borrow(), 1);
             }
             let quad = if clip.is_generator() {
                 // Titel-Raster repräsentiert das volle Frame (ggf. erweitert).

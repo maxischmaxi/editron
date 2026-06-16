@@ -24,6 +24,7 @@ const NTSC_24: FrameRate = FrameRate::new(24000, 1001);
 
 fn asset(id: &str, name: &str, path: &str, video: bool, audio: bool, fps: f64) -> MediaAsset {
     MediaAsset {
+        extra: Default::default(),
         id: id.into(),
         path: path.into(),
         name: name.into(),

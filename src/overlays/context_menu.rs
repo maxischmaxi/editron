@@ -14,7 +14,6 @@ use raylib::consts::{KeyboardKey, MouseCursor};
 pub enum CustomAction {
     TimelineSplitAt { t: f64, clip_id: String },
     TimelinePasteAt { t: f64 },
-    TimelineRemoveTrack { track_id: String },
     TimelineToggleTrackFlag { track_id: String, flag: crate::core::timeline::TrackFlag },
     /// Source-Patch-Ziel der Spurart umschalten (Radio).
     TimelineToggleSourcePatch { track_id: String },

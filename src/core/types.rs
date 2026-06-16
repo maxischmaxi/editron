@@ -117,6 +117,11 @@ pub struct MediaAsset {
     /// Laden + bei Proxy-Aktionen geprüft). Nicht persistiert.
     #[serde(skip)]
     pub proxy_offline: bool,
+    /// Felder einer NEUEREN Editron-Version, die dieser Build noch nicht kennt.
+    /// Werden beim Speichern unverändert wieder herausgeschrieben (Vorwärts-
+    /// kompatibilität, siehe `core::project::ProjectFile::extra`).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl MediaAsset {

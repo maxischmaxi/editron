@@ -114,7 +114,7 @@ pub fn validate(
     }
 
     let plan = build_render_plan(timeline, media, settings, nests);
-    if !plan.has_video_media() && plan.audio.is_empty() {
+    if !plan.has_video_media() && !plan.has_audio_media() {
         issues.push(error(
             "Im Exportbereich liegen keine abspielbaren Clips (alles leer, offline oder stumm).",
         ));
@@ -125,7 +125,7 @@ pub fn validate(
             "Im Exportbereich liegt kein Video — es wird nur Schwarzbild exportiert.",
         ));
     }
-    if settings.audio.is_some() && plan.audio.is_empty() && settings.video.is_some() {
+    if settings.audio.is_some() && !plan.has_audio_media() && settings.video.is_some() {
         issues.push(warning("Im Exportbereich liegt kein Audio — die Tonspur bleibt stumm."));
     }
     if settings.audio.is_none() && settings.video.is_some() {

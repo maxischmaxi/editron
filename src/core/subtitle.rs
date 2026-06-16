@@ -10,6 +10,34 @@ use serde::{Deserialize, Serialize};
 /// Standarddauer eines neu angelegten Untertitel-Segments (Premiere: 3 s).
 pub const DEFAULT_CUE_DURATION: f64 = 3.0;
 
+/// Profi-Lesbarkeitsschwellen (Netflix/ARD-Untertitelungsnorm): bis 17
+/// Zeichen pro Sekunde und höchstens 42 Zeichen je Zeile gelten als gut
+/// lesbar — darüber warnt das Untertitel-Panel rot.
+pub const MAX_CPS: f64 = 17.0;
+pub const MAX_CHARS_PER_LINE: usize = 42;
+
+/// Zeichen pro Sekunde (CPS) bei gegebener Anzeigedauer; 0 bei nicht-
+/// positiver Dauer.
+pub fn chars_per_second(char_count: usize, duration: f64) -> f64 {
+    if duration > 0.0 {
+        char_count as f64 / duration
+    } else {
+        0.0
+    }
+}
+
+/// Lesbarkeit eines Segmenttexts bei gegebener Anzeigedauer:
+/// `(cps, längste Zeile in Zeichen, Schwelle gerissen)`. „Gerissen" heißt
+/// CPS > [`MAX_CPS`] **oder** Zeile > [`MAX_CHARS_PER_LINE`]. Zeichen ohne
+/// Zeilenumbrüche, Leerzeichen zählen mit (Untertitelungsnorm). Eine Quelle
+/// für die Panel-Warnung (und künftige Export-Hinweise).
+pub fn readability(text: &str, duration: f64) -> (f64, usize, bool) {
+    let chars = text.chars().filter(|c| *c != '\n').count();
+    let max_line = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    let cps = chars_per_second(chars, duration);
+    (cps, max_line, cps > MAX_CPS || max_line > MAX_CHARS_PER_LINE)
+}
+
 // ------------------------------------------------------------------ Segment
 
 /// Inhalt eines Untertitel-Segments (Clip ohne Mediendatei auf einer
@@ -57,6 +85,9 @@ pub struct SubtitleStyle {
     /// Schriftfamilie (fontconfig); leer = Standard-Sans.
     #[serde(default)]
     pub font_family: String,
+    /// Schriftschnitt (Gewicht); Profi-Untertitel sind meist halbfett.
+    #[serde(default = "default_weight")]
+    pub weight: TitleWeight,
     /// Schriftgröße in px @1080p.
     #[serde(default = "default_size")]
     pub size: f64,
@@ -75,6 +106,10 @@ pub struct SubtitleStyle {
     /// (+38 = unteres Drittel, Title-Safe respektiert).
     #[serde(default = "default_pos_y")]
     pub pos_y: f64,
+}
+
+fn default_weight() -> TitleWeight {
+    TitleWeight::SemiBold
 }
 
 fn default_size() -> f64 {
@@ -101,6 +136,7 @@ impl Default for SubtitleStyle {
     fn default() -> Self {
         SubtitleStyle {
             font_family: String::new(),
+            weight: default_weight(),
             size: default_size(),
             color: default_color(),
             bg_enabled: true,
@@ -118,7 +154,7 @@ impl SubtitleStyle {
         TitleSpec {
             text: text.to_string(),
             font_family: self.font_family.clone(),
-            weight: TitleWeight::SemiBold,
+            weight: self.weight,
             italic: false,
             size: self.size,
             line_spacing: 1.2,
@@ -359,6 +395,7 @@ mod tests {
         style.pos_y = -38.0;
         style.bg_enabled = false;
         style.stroke_width = 3.0;
+        style.weight = TitleWeight::Bold;
         let spec = style.title_spec("Hallo\nWelt");
         assert_eq!(spec.text, "Hallo\nWelt");
         assert_eq!(spec.size, 56.0);
@@ -366,9 +403,32 @@ mod tests {
         assert_eq!(spec.pos_y, -38.0);
         assert!(!spec.bg.enabled);
         assert_eq!(spec.stroke_width, 3.0);
+        assert_eq!(spec.weight, TitleWeight::Bold);
         // Stil-/Textänderungen müssen den Raster-Cache invalidieren.
         let other = style.title_spec("Hallo\nWelt!");
         assert_ne!(spec.content_hash(), other.content_hash());
+    }
+
+    #[test]
+    fn readability_counts_chars_lines_and_flags_thresholds() {
+        // "Hallo Welt" (10) + "zweite Zeile" (12) = 22 Zeichen ohne Umbruch,
+        // längste Zeile 12; bei 2 s ⇒ 11 CPS, beides unter der Schwelle.
+        let (cps, max_line, over) = readability("Hallo Welt\nzweite Zeile", 2.0);
+        assert!((cps - 11.0).abs() < 1e-9);
+        assert_eq!(max_line, 12);
+        assert!(!over);
+        // Lange Einzelzeile (>42 Zeichen) reißt die Zeilenschwelle.
+        let long = "a".repeat(50);
+        let (_, ml, over_line) = readability(&long, 10.0);
+        assert_eq!(ml, 50);
+        assert!(over_line);
+        // Zu schnell (>17 CPS) reißt die CPS-Schwelle trotz kurzer Zeile.
+        let (cps_fast, _, over_cps) = readability("kurz aber hektisch", 0.5);
+        assert!(cps_fast > MAX_CPS);
+        assert!(over_cps);
+        // Nicht-positive Dauer ⇒ CPS 0, keine CPS-Warnung.
+        let (cps_zero, _, _) = readability("Text", 0.0);
+        assert_eq!(cps_zero, 0.0);
     }
 
     #[test]
@@ -460,6 +520,7 @@ mod tests {
     fn style_serde_roundtrip_and_defaults() {
         let style = SubtitleStyle {
             font_family: "Inter".into(),
+            weight: TitleWeight::Bold,
             size: 52.0,
             color: RgbaColor::rgb(255, 255, 0),
             bg_enabled: false,

@@ -160,6 +160,16 @@ pub const CONTAINERS: &[ContainerDef] = &[
     },
 ];
 
+impl ContainerDef {
+    /// Kann der Container mehrere Audio-Streams tragen? Voraussetzung für den
+    /// Stems-Export (je Audiospur ein eigener Stream). MP4/MOV/MKV/WebM/M4A
+    /// können es; die Ein-Stream-Audioformate (WAV/MP3/FLAC) und
+    /// Bild-Sequenzen nicht.
+    pub fn multi_audio(&self) -> bool {
+        matches!(self.id, "mp4" | "mov" | "mkv" | "webm" | "m4a")
+    }
+}
+
 pub fn container(id: &str) -> &'static ContainerDef {
     CONTAINERS
         .iter()

@@ -2,6 +2,7 @@
 
     fn test_clip(track_id: &str, kind: TrackKind, start: f64, duration: f64) -> TimelineClip {
         TimelineClip {
+            extra: Default::default(),
             id: new_id(),
             track_id: track_id.into(),
             asset_id: "asset".into(),
@@ -323,6 +324,86 @@
         store.paste(None);
         assert_eq!(store.clips.len(), 2);
         assert_eq!(store.clips.last().unwrap().track_id, audios[1]);
+    }
+
+    #[test]
+    fn paste_grade_copies_value_across_selected_clips_in_one_undo() {
+        let mut store = TimelineStore::default();
+        let videos = track_ids(&store, TrackKind::Video);
+        let audios = track_ids(&store, TrackKind::Audio);
+
+        // Quelle mit einem nicht-neutralen Grade.
+        let mut g = ColorGrade::default();
+        g.saturation = 42.0;
+        g.exposure = 1.5;
+        g.contrast = 20.0;
+        assert_ne!(g, ColorGrade::default(), "Test-Grade muss vom Default abweichen");
+
+        // Zwei Video-Ziele + ein Audio-Ziel (Audio wird übersprungen).
+        let target_a = test_clip(&videos[1], TrackKind::Video, 0.0, 4.0);
+        let target_b = test_clip(&videos[1], TrackKind::Video, 4.0, 4.0);
+        let audio = test_clip(&audios[0], TrackKind::Audio, 0.0, 4.0);
+        let a_id = target_a.id.clone();
+        let b_id = target_b.id.clone();
+        let audio_id = audio.id.clone();
+        store.clips.push(target_a);
+        store.clips.push(target_b);
+        store.clips.push(audio);
+
+        let ids = vec![a_id.clone(), b_id.clone(), audio_id.clone()];
+        let n = store.paste_grade(&g, &ids);
+
+        assert_eq!(n, 2, "nur die beiden Video-Clips erhalten den Grade");
+        assert_eq!(store.clip(&a_id).unwrap().grade, g, "Grade bleibt wertgleich");
+        assert_eq!(store.clip(&b_id).unwrap().grade, g);
+        assert_eq!(
+            store.clip(&audio_id).unwrap().grade,
+            ColorGrade::default(),
+            "Audio-Clip bleibt unangetastet"
+        );
+
+        // Genau ein Undo-Schritt stellt den Ausgangszustand wieder her.
+        assert!(store.can_undo());
+        store.undo();
+        assert_eq!(store.clip(&a_id).unwrap().grade, ColorGrade::default());
+        assert_eq!(store.clip(&b_id).unwrap().grade, ColorGrade::default());
+    }
+
+    #[test]
+    fn paste_grade_is_idempotent_without_empty_undo() {
+        let mut store = TimelineStore::default();
+        let videos = track_ids(&store, TrackKind::Video);
+        let mut g = ColorGrade::default();
+        g.saturation = 10.0;
+        let mut clip = test_clip(&videos[0], TrackKind::Video, 0.0, 4.0);
+        clip.grade = g.clone();
+        let id = clip.id.clone();
+        store.clips.push(clip);
+
+        // Ziel trägt den Grade bereits → keine Änderung, kein Verlaufseintrag.
+        let n = store.paste_grade(&g, std::slice::from_ref(&id));
+        assert_eq!(n, 0, "unveränderter Clip zählt nicht als angewendet");
+        assert!(!store.can_undo(), "kein leerer Undo-Schritt bei No-op");
+        assert_eq!(store.clip(&id).unwrap().grade, g);
+    }
+
+    #[test]
+    fn paste_grade_skips_locked_tracks() {
+        let mut store = TimelineStore::default();
+        let videos = track_ids(&store, TrackKind::Video);
+        let target = test_clip(&videos[0], TrackKind::Video, 0.0, 4.0);
+        let id = target.id.clone();
+        store.clips.push(target);
+        // Zielspur sperren — Paste darf den Clip nicht anfassen.
+        if let Some(track) = store.tracks.iter_mut().find(|t| t.id == videos[0]) {
+            track.locked = true;
+        }
+        let mut g = ColorGrade::default();
+        g.saturation = 10.0;
+        let n = store.paste_grade(&g, std::slice::from_ref(&id));
+        assert_eq!(n, 0, "gesperrte Spur bleibt unangetastet");
+        assert!(!store.can_undo());
+        assert_eq!(store.clip(&id).unwrap().grade, ColorGrade::default());
     }
 
     #[test]
@@ -1139,6 +1220,194 @@
     }
 
     #[test]
+    fn subtitle_split_at_playhead_distributes_text_and_preserves_total_time() {
+        let mut store = TimelineStore::default();
+        let id = store
+            .add_subtitle_clip("Hallo schöne weite Welt", 0.0)
+            .expect("anlegen");
+        let track_id = store.clip(&id).unwrap().track_id.clone();
+        let (start, total) = {
+            let c = store.clip(&id).unwrap();
+            (c.start, c.duration)
+        };
+        // Playhead in die Mitte des Segments und teilen.
+        store.set_playhead(start + total / 2.0);
+        let right_id = store.subtitle_split_at_playhead().expect("teilen");
+
+        let mut parts: Vec<&TimelineClip> = store
+            .clips
+            .iter()
+            .filter(|c| c.track_id == track_id)
+            .collect();
+        parts.sort_by(|a, b| a.start.total_cmp(&b.start));
+        assert_eq!(parts.len(), 2);
+        // Gesamtzeit bleibt erhalten: Summe der Hälften == Original, lückenlos.
+        let sum: f64 = parts.iter().map(|c| c.duration).sum();
+        assert!((sum - total).abs() < 1e-9);
+        assert!((parts[0].end() - parts[1].start).abs() < 1e-9);
+        // Rechte Hälfte ist selektiert.
+        assert_eq!(store.selected_clip_ids, vec![right_id]);
+        // Kein Wort geht verloren: die Wörter beider Hälften ergeben das Original.
+        let left_words: Vec<&str> = parts[0]
+            .subtitle
+            .as_ref()
+            .unwrap()
+            .text
+            .split_whitespace()
+            .collect();
+        let right_words: Vec<&str> = parts[1]
+            .subtitle
+            .as_ref()
+            .unwrap()
+            .text
+            .split_whitespace()
+            .collect();
+        let combined: Vec<&str> = left_words.iter().chain(right_words.iter()).copied().collect();
+        assert_eq!(combined, vec!["Hallo", "schöne", "weite", "Welt"]);
+        // Beide Hälften tragen Text.
+        assert!(!parts[0].subtitle.as_ref().unwrap().text.is_empty());
+        assert!(!parts[1].subtitle.as_ref().unwrap().text.is_empty());
+
+        // EIN Undo stellt das ungeteilte Segment wieder her.
+        store.undo();
+        let after: Vec<&TimelineClip> = store
+            .clips
+            .iter()
+            .filter(|c| c.track_id == track_id)
+            .collect();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].subtitle.as_ref().unwrap().text,
+            "Hallo schöne weite Welt"
+        );
+    }
+
+    #[test]
+    fn subtitle_merge_combines_neighbor_and_preserves_span_and_text() {
+        let mut store = TimelineStore::default();
+        let id = store.add_subtitle_clip("Erster Satz", 0.0).expect("anlegen");
+        let track_id = store.clip(&id).unwrap().track_id.clone();
+        let (start, total) = {
+            let c = store.clip(&id).unwrap();
+            (c.start, c.duration)
+        };
+        // Teilen, dann das erste Segment als Anker wieder mit dem Nachbarn mergen.
+        store.set_playhead(start + total / 2.0);
+        store.subtitle_split_at_playhead().expect("teilen");
+        let first_id = {
+            let mut parts: Vec<&TimelineClip> = store
+                .clips
+                .iter()
+                .filter(|c| c.track_id == track_id)
+                .collect();
+            parts.sort_by(|a, b| a.start.total_cmp(&b.start));
+            parts[0].id.clone()
+        };
+        store.select_clips(&[first_id], SelectMode::Replace, false);
+        let merged_id = store.subtitle_merge().expect("zusammenführen");
+
+        let parts: Vec<&TimelineClip> = store
+            .clips
+            .iter()
+            .filter(|c| c.track_id == track_id)
+            .collect();
+        assert_eq!(parts.len(), 1);
+        let merged = parts[0];
+        assert_eq!(merged.id, merged_id);
+        // Gesamtzeit bleibt erhalten (Start- und Endkante wie vor dem Teilen).
+        assert!((merged.start - start).abs() < 1e-9);
+        assert!((merged.duration - total).abs() < 1e-9);
+        // Kein Text geht verloren.
+        let words: Vec<&str> = merged
+            .subtitle
+            .as_ref()
+            .unwrap()
+            .text
+            .split_whitespace()
+            .collect();
+        assert_eq!(words, vec!["Erster", "Satz"]);
+
+        // EIN Undo trennt wieder in zwei Segmente.
+        store.undo();
+        assert_eq!(
+            store
+                .clips
+                .iter()
+                .filter(|c| c.track_id == track_id)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn subtitle_split_is_frame_accurate_and_rejects_edges() {
+        let mut store = TimelineStore::default();
+        // NTSC 29,97 — die kritische Rate für Frame-Genauigkeit beim Snapping.
+        store.settings = SequenceSettings {
+            rate: sequence::FrameRate::new(30000, 1001),
+            ..SequenceSettings::default()
+        };
+        let rate = store.settings.rate;
+        let id = store.add_subtitle_clip("Eins zwei drei", 0.0).expect("anlegen");
+        let track_id = store.clip(&id).unwrap().track_id.clone();
+        let (start, total) = {
+            let c = store.clip(&id).unwrap();
+            (c.start, c.duration)
+        };
+
+        // Am exakten Anfang ist nichts teilbar (keine Hälfte hätte Platz).
+        store.set_playhead(start);
+        assert!(store.subtitle_split_at_playhead().is_err());
+
+        // Playhead auf eine krumme NTSC-Zeit, dann teilen.
+        store.set_playhead(start + total / 2.0 + 0.0007);
+        store.subtitle_split_at_playhead().expect("teilen");
+        let mut parts: Vec<&TimelineClip> = store
+            .clips
+            .iter()
+            .filter(|c| c.track_id == track_id)
+            .collect();
+        parts.sort_by(|a, b| a.start.total_cmp(&b.start));
+        assert_eq!(parts.len(), 2);
+        // Die NEUE Schnittkante rastet exakt aufs NTSC-Frame-Raster ein
+        // (die Außenkanten erben unverändert vom Original).
+        let cut = parts[0].end();
+        let frame = rate.frame_round(cut);
+        assert!((cut - rate.time_of_frame(frame as f64)).abs() < 1e-9);
+        // Lückenlos und Gesamtzeit erhalten.
+        assert!((parts[1].start - cut).abs() < 1e-9);
+        assert!(((parts[0].duration + parts[1].duration) - total).abs() < 1e-9);
+    }
+
+    #[test]
+    fn subtitle_split_without_track_errs() {
+        let mut store = TimelineStore::default();
+        assert!(store.subtitle_split_at_playhead().is_err());
+        assert!(store.subtitle_merge().is_err());
+    }
+
+    #[test]
+    fn subtitle_merge_falls_back_to_previous_for_last_segment() {
+        let mut store = TimelineStore::default();
+        let a = store.add_subtitle_clip("Eins", 0.0).expect("a");
+        let track_id = store.clip(&a).unwrap().track_id.clone();
+        let b = store.add_subtitle_clip("Zwei", 4.0).expect("b");
+        // Letztes Segment ausgewählt → Merge greift den Vorgänger.
+        store.select_clips(&[b], SelectMode::Replace, false);
+        let merged_id = store.subtitle_merge().expect("zusammenführen");
+        let parts: Vec<&TimelineClip> = store
+            .clips
+            .iter()
+            .filter(|c| c.track_id == track_id)
+            .collect();
+        assert_eq!(parts.len(), 1);
+        // Ergebnis ist das frühere (erste) Segment, gespannt bis zum Ende des zweiten.
+        assert_eq!(merged_id, a);
+        assert!(parts[0].subtitle.as_ref().unwrap().text.contains("Eins"));
+        assert!(parts[0].subtitle.as_ref().unwrap().text.contains("Zwei"));
+    }
+
+    #[test]
     fn import_subtitle_cues_is_frame_accurate_and_resolves_overlaps() {
         use crate::core::subtitle::SrtCue;
         let mut store = TimelineStore::default();
@@ -1615,6 +1884,7 @@
     fn insert_copies_asset_markers_into_clip() {
         let mut store = TimelineStore::default();
         let mut asset = MediaAsset {
+            extra: Default::default(),
             id: "a1".into(),
             path: "/tmp/x.mp4".into(),
             name: "x.mp4".into(),
@@ -1743,4 +2013,247 @@
                 assert_eq!(a, 0, "linke Hälfte = alter Winkel");
             }
         }
+    }
+
+    /// Extend Edit: die dem Playhead nächste Schnittkante (hier der Through-
+    /// Edit zweier Clips) rollt exakt auf den frame-gerasteten Playhead — ein
+    /// Clip wird länger, der andere kürzer, die Sequenzdauer bleibt, ein Undo.
+    #[test]
+    fn extend_edit_rolls_through_edit_to_playhead_frame() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 10.0, 10.0, 100.0));
+        // Playhead bewusst nicht frame-gerastert → prüft die Frame-Genauigkeit.
+        store.set_playhead(7.33);
+        let target = store.snap_to_frame(7.33);
+        assert!(store.extend_edit());
+        let on = clips_on(&store, &v1);
+        assert_eq!(on.len(), 2);
+        assert!((on[0].end() - target).abs() < 1e-6, "linke Kante landet am Playhead-Frame");
+        assert!((on[1].start - target).abs() < 1e-6, "rechte Kante landet am Playhead-Frame");
+        // Roll: Sequenzdauer unverändert, nur die Kante wandert.
+        assert!((on[1].end() - 20.0).abs() < 1e-6, "Sequenzende bleibt");
+        assert_eq!(store.past.len(), 1, "genau ein Undo-Schritt");
+    }
+
+    /// Extend Edit ohne Gegenstück an der Kante: die offene Clip-Kante wird bis
+    /// zum (frame-gerasteten) Playhead in die Lücke verlängert.
+    #[test]
+    fn extend_edit_extends_open_end_to_playhead_frame() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.set_playhead(13.33);
+        let target = store.snap_to_frame(13.33);
+        assert!(store.extend_edit());
+        let on = clips_on(&store, &v1);
+        assert_eq!(on.len(), 1);
+        assert!((on[0].end() - target).abs() < 1e-6, "Clip-Ende bis zum Playhead verlängert");
+        assert_eq!(store.past.len(), 1, "genau ein Undo-Schritt");
+    }
+
+    /// Extend Edit rollt einen Through-Edit, der auf mehreren Ziel-Spuren an
+    /// derselben Stelle sitzt (z. B. verknüpftes A/V), GEMEINSAM und synchron
+    /// in genau einem Undo-Schritt — sonst liefen Bild und Ton auseinander.
+    #[test]
+    fn extend_edit_rolls_all_targeted_tracks_in_sync() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let a1 = track_ids(&store, TrackKind::Audio)[0].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 10.0, 10.0, 100.0));
+        store.clips.push(placed_clip(&a1, TrackKind::Audio, 0.0, 10.0, 0.0));
+        store.clips.push(placed_clip(&a1, TrackKind::Audio, 10.0, 10.0, 100.0));
+        store.set_playhead(7.33);
+        let target = store.snap_to_frame(7.33);
+        assert!(store.extend_edit());
+        for tid in [&v1, &a1] {
+            let on = clips_on(&store, tid);
+            assert_eq!(on.len(), 2);
+            assert!((on[0].end() - target).abs() < 1e-6, "Bild/Ton-Kante synchron am Frame");
+            assert!((on[1].start - target).abs() < 1e-6);
+            assert!((on[1].end() - 20.0).abs() < 1e-6, "Sequenzende bleibt");
+        }
+        assert_eq!(store.past.len(), 1, "ein gemeinsamer Undo-Schritt");
+    }
+
+    /// Extend Edit fasst nur anvisierte Spuren an: liegt das einzige Material
+    /// auf einer nicht anvisierten Spur, passiert nichts.
+    #[test]
+    fn extend_edit_ignores_untargeted_track() {
+        let mut store = TimelineStore::default();
+        // track_ids(Video)[0] ist die obere, nicht anvisierte Spur (V2).
+        let v2 = track_ids(&store, TrackKind::Video)[0].clone();
+        store.clips.push(placed_clip(&v2, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.set_playhead(7.0);
+        assert!(!store.extend_edit(), "nicht anvisierte Spur ist kein Ziel");
+        let on = clips_on(&store, &v2);
+        assert!((on[0].end() - 10.0).abs() < 1e-6, "untargetierte Spur unberührt");
+        assert!(store.past.is_empty());
+    }
+
+    /// Extend Edit respektiert gesperrte Spuren: ist die einzige Spur mit
+    /// Material gesperrt (und damit kein Ziel mehr), bleibt alles unberührt.
+    #[test]
+    fn extend_edit_skips_locked_target_track() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, 10.0, 0.0));
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 10.0, 10.0, 100.0));
+        store.toggle_track_flag(&v1, TrackFlag::Locked);
+        store.set_playhead(7.0);
+        assert!(!store.extend_edit(), "gesperrte Spur ist kein Ziel");
+        let on = clips_on(&store, &v1);
+        assert!((on[0].end() - 10.0).abs() < 1e-6 && (on[1].start - 10.0).abs() < 1e-6);
+        assert!(store.past.is_empty(), "kein Undo-Schritt");
+    }
+
+    /// Nudge verschiebt die Auswahl an NTSC-Raten um EXAKT einen Frame (hin
+    /// und zurück landet wieder auf dem Ausgangsframe) — ein Undo je Aufruf.
+    #[test]
+    fn nudge_moves_selection_exactly_one_frame() {
+        for rate in [
+            sequence::FrameRate::new(24000, 1001), // 23,976
+            sequence::FrameRate::new(30000, 1001), // 29,97
+        ] {
+            let mut store = TimelineStore::default();
+            store.settings = SequenceSettings { rate, ..SequenceSettings::default() };
+            let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+            // Start auf einem ganzen Frame, damit der Versatz prüfbar ist.
+            let start = rate.time_of_frame(100.0);
+            store.clips.push(placed_clip(&v1, TrackKind::Video, start, 10.0, 0.0));
+            let id = clips_on(&store, &v1)[0].id.clone();
+            store.selected_clip_ids = vec![id];
+            let frame = rate.time_of_frame(1.0);
+
+            store.nudge_selected_clips(1.0);
+            let moved = clips_on(&store, &v1)[0].clone();
+            assert!(
+                (moved.start - (start + frame)).abs() < 1e-9,
+                "Versatz exakt 1 Frame an {} fps",
+                rate.label()
+            );
+            assert_eq!(rate.frame_round(moved.start), 101);
+            assert_eq!(store.past.len(), 1, "ein Undo-Schritt pro Nudge");
+
+            store.nudge_selected_clips(-1.0);
+            let back = clips_on(&store, &v1)[0].clone();
+            assert!((back.start - start).abs() < 1e-9, "zurück auf den Ausgangsframe");
+            assert_eq!(rate.frame_round(back.start), 100);
+            assert_eq!(store.past.len(), 2);
+        }
+    }
+
+    /// Im Ripple-Kontext trimmt der Nudge die dem Playhead nächste Kante um
+    /// exakt einen Frame (gesperrte Spuren/leere Auswahl bleiben no-op).
+    #[test]
+    fn nudge_active_edge_ripple_trims_one_frame() {
+        let rate = sequence::FrameRate::new(30000, 1001);
+        let mut store = TimelineStore::default();
+        store.settings = SequenceSettings { rate, ..SequenceSettings::default() };
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let dur = rate.time_of_frame(50.0);
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, dur, 0.0));
+        let id = clips_on(&store, &v1)[0].id.clone();
+        store.selected_clip_ids = vec![id];
+        // Playhead ans Ende ⇒ End-Kante ist aktiv; -1 Frame kürzt sie.
+        store.set_playhead(dur);
+        let frame = rate.time_of_frame(1.0);
+        store.nudge_active_edge(-1.0, false);
+        let trimmed = clips_on(&store, &v1)[0].clone();
+        assert!(
+            (trimmed.duration - (dur - frame)).abs() < 1e-9,
+            "Kante exakt 1 Frame getrimmt"
+        );
+        assert_eq!(store.past.len(), 1);
+    }
+
+    /// Im Rolling-Kontext rollt der Nudge die gemeinsame Schnittkante: beide
+    /// Clips bleiben, die Sequenzdauer ändert sich nicht.
+    #[test]
+    fn nudge_active_edge_rolling_moves_shared_cut() {
+        let rate = sequence::FrameRate::new(24000, 1001);
+        let mut store = TimelineStore::default();
+        store.settings = SequenceSettings { rate, ..SequenceSettings::default() };
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let half = rate.time_of_frame(50.0);
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, half, 0.0));
+        store.clips.push(placed_clip(&v1, TrackKind::Video, half, half, 200.0));
+        let left_id = clips_on(&store, &v1)[0].id.clone();
+        store.selected_clip_ids = vec![left_id];
+        // Playhead an die Schnittkante ⇒ End-Kante des linken Clips aktiv.
+        store.set_playhead(half);
+        let frame = rate.time_of_frame(1.0);
+        store.nudge_active_edge(1.0, true);
+        let on = clips_on(&store, &v1);
+        assert_eq!(on.len(), 2, "Roll erhält beide Clips");
+        assert!((on[0].end() - (half + frame)).abs() < 1e-9, "Schnitt 1 Frame nach rechts");
+        assert!((on[1].start - (half + frame)).abs() < 1e-9, "Nachbar zieht mit");
+        assert!((on[1].end() - 2.0 * half).abs() < 1e-9, "Sequenzdauer bleibt (Roll)");
+        assert_eq!(store.past.len(), 1);
+    }
+
+    /// Rolling ohne bündigen Nachbarn (offene Kante an einer Lücke): die Kante
+    /// wird nur getrimmt, nachgelagerte Clips bleiben stehen (kein Ripple).
+    #[test]
+    fn nudge_active_edge_rolling_without_neighbor_trims_without_ripple() {
+        let rate = sequence::FrameRate::new(30000, 1001);
+        let mut store = TimelineStore::default();
+        store.settings = SequenceSettings { rate, ..SequenceSettings::default() };
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let dur = rate.time_of_frame(50.0);
+        // Clip A, dann eine Lücke, dann Clip B (kein bündiger Nachbar an A.end).
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 0.0, dur, 0.0));
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 2.0 * dur, dur, 100.0));
+        let a_id = clips_on(&store, &v1)[0].id.clone();
+        let b_start = clips_on(&store, &v1)[1].start;
+        store.selected_clip_ids = vec![a_id];
+        store.set_playhead(dur); // End-Kante von A aktiv, Nachbar nur mit Lücke
+        let frame = rate.time_of_frame(1.0);
+        store.nudge_active_edge(-1.0, true);
+        let on = clips_on(&store, &v1);
+        assert!((on[0].duration - (dur - frame)).abs() < 1e-9, "A-Endkante 1 Frame getrimmt");
+        assert!((on[1].start - b_start).abs() < 1e-9, "B bleibt stehen (kein Ripple)");
+        assert_eq!(store.past.len(), 1);
+    }
+
+    /// Nudge respektiert gesperrte Spuren: kein Versatz, kein Undo-Schritt.
+    #[test]
+    fn nudge_skips_locked_track() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        store.clips.push(placed_clip(&v1, TrackKind::Video, 5.0, 10.0, 0.0));
+        let id = clips_on(&store, &v1)[0].id.clone();
+        store.selected_clip_ids = vec![id];
+        store.toggle_track_flag(&v1, TrackFlag::Locked);
+        store.nudge_selected_clips(1.0);
+        assert!((clips_on(&store, &v1)[0].start - 5.0).abs() < 1e-9, "gesperrt: kein Versatz");
+        assert!(store.past.is_empty(), "kein Undo-Schritt");
+    }
+
+    /// Nudge verschiebt den verknüpften Partner mit (Link-Expansion), auch wenn
+    /// nur ein Teil des A/V-Paares selektiert ist — Sync bleibt gewahrt.
+    #[test]
+    fn nudge_moves_linked_audio_partner() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let a1 = track_ids(&store, TrackKind::Audio)[0].clone();
+        let link = new_id();
+        let mut vclip = placed_clip(&v1, TrackKind::Video, 5.0, 10.0, 0.0);
+        let mut aclip = placed_clip(&a1, TrackKind::Audio, 5.0, 10.0, 0.0);
+        vclip.link_id = Some(link.clone());
+        aclip.link_id = Some(link);
+        let v_id = vclip.id.clone();
+        let a_id = aclip.id.clone();
+        store.clips.push(vclip);
+        store.clips.push(aclip);
+        // Nur den Video-Clip selektieren — der Audio-Partner muss mitwandern.
+        store.selected_clip_ids = vec![v_id.clone()];
+        let frame = store.settings.rate.time_of_frame(1.0);
+        store.nudge_selected_clips(1.0);
+        let v = store.clips.iter().find(|c| c.id == v_id).unwrap();
+        let a = store.clips.iter().find(|c| c.id == a_id).unwrap();
+        assert!((v.start - (5.0 + frame)).abs() < 1e-9);
+        assert!((a.start - (5.0 + frame)).abs() < 1e-9, "verknüpfter Audio-Clip wandert mit");
     }

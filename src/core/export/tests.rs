@@ -15,6 +15,7 @@
 
     fn track(id: &str, kind: TrackKind) -> TimelineTrack {
         TimelineTrack {
+            extra: Default::default(),
             id: id.into(),
             kind,
             muted: false,
@@ -29,11 +30,13 @@
             effects: Vec::new(),
             volume_auto: crate::core::animation::AnimatedParam::fixed(0.0),
             pan_auto: crate::core::animation::AnimatedParam::fixed(0.0),
+            height: None,
         }
     }
 
     fn clip(id: &str, track_id: &str, kind: TrackKind, asset: &str, start: f64, dur: f64) -> TimelineClip {
         TimelineClip {
+            extra: Default::default(),
             id: id.into(),
             track_id: track_id.into(),
             asset_id: asset.into(),
@@ -62,6 +65,7 @@
 
     fn video_asset(id: &str, path: &str) -> MediaAsset {
         MediaAsset {
+            extra: Default::default(),
             id: id.into(),
             path: path.into(),
             name: path.into(),
@@ -112,7 +116,9 @@
             container: container("mp4"),
             video: Some(default_video("h264", 1280, 720, 25.0)),
             audio: Some(default_audio("aac", None)),
+            loudness: None,
             use_in_out: false,
+            audio_stems: false,
             subtitles: SubtitleMode::None,
             image_start: 1,
             output: "/tmp/out.mp4".into(),
@@ -485,6 +491,7 @@
         t.pan_auto.upsert_key(0.0, 0.0);
         t.pan_auto.upsert_key(4.0, 0.5);
         let plan = AudioTrackPlan {
+            name: "A1".into(),
             clips: vec![],
             effects: vec![],
             volume_auto: t.volume_auto.clone(),
@@ -1231,6 +1238,412 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Integrierte Lautheit eines Mediums per ffmpeg `loudnorm` (JSON-Messung)
+    /// auslesen — `input_i` aus dem an den Log angehängten JSON-Block.
+    fn measure_integrated_lufs(path: &std::path::Path) -> f64 {
+        let out = Command::new(crate::services::ffmpeg_bin())
+            .args(["-hide_banner", "-nostats", "-v", "info"])
+            .args(["-i", &path.to_string_lossy()])
+            .args(["-af", "loudnorm=I=-23:print_format=json"])
+            .args(["-f", "null", "-"])
+            .output()
+            .expect("ffmpeg-Messung startbar");
+        let log = String::from_utf8_lossy(&out.stderr);
+        let start = log.find('{').expect("loudnorm-JSON fehlt");
+        let end = log.rfind('}').expect("loudnorm-JSON fehlt");
+        let v: serde_json::Value =
+            serde_json::from_str(&log[start..=end]).expect("loudnorm-JSON parsebar");
+        v.get("input_i")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .expect("input_i")
+    }
+
+    /// Mittlerer Pegel (mean_volume, dBFS) eines einzelnen Audio-Streams einer
+    /// Datei — via ffmpeg `volumedetect`. Für die Stem-Verifikation.
+    fn stream_mean_db(path: &std::path::Path, stream: usize) -> f64 {
+        let out = Command::new(crate::services::ffmpeg_bin())
+            .args(["-hide_banner", "-nostats", "-v", "info"])
+            .args(["-i", &path.to_string_lossy()])
+            .args(["-map", &format!("0:a:{stream}")])
+            .args(["-af", "volumedetect"])
+            .args(["-f", "null", "-"])
+            .output()
+            .expect("ffmpeg-Messung startbar");
+        let log = String::from_utf8_lossy(&out.stderr);
+        for line in log.lines() {
+            if let Some(i) = line.find("mean_volume:") {
+                let rest = line[i + "mean_volume:".len()..].trim();
+                if let Some(num) = rest.split_whitespace().next() {
+                    if let Ok(v) = num.parse::<f64>() {
+                        return v;
+                    }
+                }
+            }
+        }
+        panic!("mean_volume nicht gefunden für Stream {stream}: {log}");
+    }
+
+    #[test]
+    fn stems_route_every_audio_track_separately() {
+        // Zwei Audiospuren: im Stems-Modus wird KEINE Master-Summe gebaut,
+        // sondern jede Spur als eigener Stem-Track mit Spurname.
+        let (tl, media) = state_with(
+            vec![track("a1", TrackKind::Audio), track("a2", TrackKind::Audio)],
+            vec![
+                clip("c1", "a1", TrackKind::Audio, "A", 0.0, 4.0),
+                clip("c2", "a2", TrackKind::Audio, "A", 0.0, 4.0),
+            ],
+            vec![video_asset("A", "/a.mp4")],
+        );
+        let mut settings = test_settings(); // mp4 trägt mehrere Audio-Streams
+        settings.audio_stems = true;
+        assert!(stems_enabled(&settings));
+        let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+        assert!(plan.audio.is_empty(), "Stems: kein Schnellpfad-Master");
+        assert_eq!(plan.audio_tracks.len(), 2, "je Spur ein Stem");
+        assert_eq!(plan.audio_tracks[0].name, "A1");
+        assert_eq!(plan.audio_tracks[1].name, "A2");
+
+        // WAV trägt nur EINEN Audio-Stream ⇒ kein Stems-Modus, Schnellpfad bleibt.
+        settings.container = container("wav");
+        settings.video = None;
+        settings.audio = Some(default_audio("pcm24", None));
+        assert!(!stems_enabled(&settings), "WAV kann keine Stems tragen");
+        let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+        assert_eq!(plan.audio.len(), 2, "ohne Stems: summierter Schnellpfad");
+        assert!(plan.audio_tracks.is_empty());
+    }
+
+    #[test]
+    fn validate_accepts_audio_only_when_all_tracks_are_processed() {
+        // Regression: Audio-only-Export, dessen Spuren ALLE getrennt verarbeitet
+        // werden (Bus-FX bzw. Stems), landet vollständig in `plan.audio_tracks`
+        // und `plan.audio` bleibt leer — die Validierung darf das NICHT als
+        // „keine abspielbaren Clips" blockieren (has_audio_media zählt beide).
+        use crate::core::effects::{EffectInstance, EffectKind};
+        let audio_asset = |id: &str, path: &str| {
+            let mut a = video_asset(id, path);
+            a.kind = MediaKind::Audio;
+            a.info.video.clear();
+            a
+        };
+
+        // (a) Einzelspur mit Bus-EQ → Audio-only WAV (kein Stems-Container).
+        let mut t = track("a1", TrackKind::Audio);
+        t.effects.push(EffectInstance::new(EffectKind::Equalizer));
+        let (tl, media) = state_with(
+            vec![t],
+            vec![clip("c", "a1", TrackKind::Audio, "A", 0.0, 4.0)],
+            vec![audio_asset("A", "/a.mov")],
+        );
+        let mut settings = test_settings();
+        settings.container = container("wav");
+        settings.video = None;
+        settings.audio = Some(default_audio("pcm24", None));
+        settings.output = "/tmp/out.wav".into();
+        let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+        assert!(plan.audio.is_empty() && plan.audio_tracks.len() == 1, "Bus-Spur ⇒ audio_tracks");
+        assert!(plan.has_audio_media(), "Bus-Spur zählt als Audio");
+        let issues = validate(&tl, &media, Some(true), None, &settings, &NoNests);
+        assert!(
+            !issues.iter().any(|i| i.severity == Severity::Error),
+            "Bus-FX-Audiospur darf nicht blockiert werden: {issues:?}"
+        );
+
+        // (b) Zwei Spuren, Audio-only Stems nach M4A (multi_audio).
+        let (tl, media) = state_with(
+            vec![track("a1", TrackKind::Audio), track("a2", TrackKind::Audio)],
+            vec![
+                clip("c1", "a1", TrackKind::Audio, "A", 0.0, 4.0),
+                clip("c2", "a2", TrackKind::Audio, "A", 0.0, 4.0),
+            ],
+            vec![audio_asset("A", "/a.mov")],
+        );
+        let mut settings = test_settings();
+        settings.container = container("m4a");
+        settings.video = None;
+        settings.audio = Some(default_audio("aac", Some(256)));
+        settings.audio_stems = true;
+        settings.output = "/tmp/out.m4a".into();
+        assert!(stems_enabled(&settings));
+        let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+        assert_eq!(plan.audio_tracks.len(), 2, "zwei Stems");
+        assert!(plan.audio.is_empty());
+        let issues = validate(&tl, &media, Some(true), None, &settings, &NoNests);
+        assert!(
+            !issues.iter().any(|i| i.severity == Severity::Error),
+            "Audio-only-Stems-Export darf nicht blockiert werden: {issues:?}"
+        );
+    }
+
+    /// End-to-End: Ein Export mit zwei Audiospuren erzeugt im Stems-Modus zwei
+    /// getrennte Audio-Streams im Container, deren Inhalt den Einzelspuren
+    /// entspricht (lauter A1-Stem vs. um 18 dB leiserer A2-Stem). Bestätigt:
+    /// keine Master-Summe, Spur-Gain pro Stem angewandt, Streams nicht vertauscht.
+    #[test]
+    fn end_to_end_export_writes_separate_stems() {
+        let dir = std::env::temp_dir().join(format!("editron-export-stems-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_a = dir.join("a.wav");
+        let src_b = dir.join("b.wav");
+        let out = dir.join("stems.mov");
+
+        // Beide Quellen Vollpegel-Sinus (A 440 Hz, B 2 kHz) — gleicher Pegel.
+        for (path, freq) in [(&src_a, 440), (&src_b, 2000)] {
+            let gen = Command::new(crate::services::ffmpeg_bin())
+                .args(["-y", "-v", "error"])
+                .args(["-f", "lavfi", "-i", &format!("sine=frequency={freq}:duration=3:sample_rate=48000")])
+                .args(["-c:a", "pcm_s16le"])
+                .arg(path)
+                .status()
+                .expect("ffmpeg nicht startbar — Tests brauchen ffmpeg im PATH");
+            assert!(gen.success(), "Testton nicht erzeugt");
+        }
+
+        let audio_asset = |id: &str, path: &std::path::Path| {
+            let mut a = video_asset(id, &path.to_string_lossy());
+            a.kind = MediaKind::Audio;
+            a.info.video.clear();
+            a
+        };
+        // Spur A2 hängt 18 dB am SPUR-Fader herunter — beweist, dass Spur-Gain
+        // pro Stem angewandt bleibt (nicht erst in einer Master-Summe).
+        let mut t2 = track("a2", TrackKind::Audio);
+        t2.gain_db = -18.0;
+        let (tl, media) = state_with(
+            vec![track("a1", TrackKind::Audio), t2],
+            vec![
+                clip("c1", "a1", TrackKind::Audio, "A", 0.0, 3.0),
+                clip("c2", "a2", TrackKind::Audio, "B", 0.0, 3.0),
+            ],
+            vec![audio_asset("A", &src_a), audio_asset("B", &src_b)],
+        );
+
+        let mut settings = test_settings();
+        settings.container = container("mov");
+        settings.video = None;
+        settings.audio = Some(default_audio("pcm24", None));
+        settings.audio_stems = true;
+        settings.output = out.to_string_lossy().into_owned();
+
+        let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+        assert_eq!(plan.audio_tracks.len(), 2, "zwei Stem-Tracks im Plan");
+        assert!(plan.audio.is_empty(), "kein Schnellpfad-Master");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let children = Arc::new(Mutex::new(Vec::new()));
+        run_export_worker("stems-job".into(), plan, settings, tx, cancel, children);
+
+        let mut done: Option<(bool, Option<String>)> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServiceEvent::SequenceExportDone { ok, error, .. } = ev {
+                done = Some((ok, error));
+            }
+        }
+        let (ok, error) = done.expect("Done-Event fehlt");
+        assert!(ok, "Stems-Export fehlgeschlagen: {error:?}");
+        assert!(out.exists(), "Zieldatei fehlt");
+
+        // Genau zwei Audio-Streams (Stems) — nicht ein summierter Master.
+        let info = crate::services::probe_media(&out.to_string_lossy()).expect("probe");
+        assert_eq!(info.audio.len(), 2, "zwei Stems erwartet, kein Master-Mix");
+
+        // Inhalt = die Einzelspuren: Stem 0 (A1, Spur-Gain 0 dB) trägt den
+        // Vollpegel-Ton, Stem 1 (A2, Spur-Gain −18 dB) liegt 18 dB darunter.
+        // Wären die Spuren zu einem Master summiert, hätten beide Streams den
+        // gleichen Pegel — die Differenz beweist die getrennten Stems samt
+        // angewandtem Spur-Gain.
+        let mean_a = stream_mean_db(&out, 0);
+        let mean_b = stream_mean_db(&out, 1);
+        assert!(mean_a > -40.0, "Stem A1 muss hörbar sein, war {mean_a}");
+        assert!(mean_b > -60.0, "Stem A2 muss hörbar sein, war {mean_b}");
+        let diff = mean_a - mean_b;
+        assert!(
+            (diff - 18.0).abs() <= 4.0,
+            "Stem A2 muss ~18 dB (Spur-Gain) unter A1 liegen: A1={mean_a}, A2={mean_b}, diff={diff}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loudnorm_json_parses_measured_values() {
+        // Realistischer loudnorm-Log: Text-Präfix + angehängter JSON-Block.
+        let log = "[Parsed_loudnorm_0 @ 0x55] \n\
+            {\n\
+            \t\"input_i\" : \"-3.01\",\n\
+            \t\"input_tp\" : \"-0.00\",\n\
+            \t\"input_lra\" : \"0.00\",\n\
+            \t\"input_thresh\" : \"-13.20\",\n\
+            \t\"output_i\" : \"-23.00\",\n\
+            \t\"target_offset\" : \"0.05\"\n\
+            }\n";
+        let m = parse_loudnorm_json(log).expect("Messwerte");
+        assert!((m.input_i - (-3.01)).abs() < 1e-9);
+        assert!((m.input_thresh - (-13.20)).abs() < 1e-9);
+        assert!((m.target_offset - 0.05).abs() < 1e-9);
+        assert!(m.all_finite());
+    }
+
+    #[test]
+    fn loudnorm_json_handles_silence_as_non_finite() {
+        // Stille liefert -inf-Messwerte → all_finite() = false (Pass 2 entfällt).
+        let log = "{ \"input_i\" : \"-inf\", \"input_tp\" : \"-inf\", \
+            \"input_lra\" : \"0.00\", \"input_thresh\" : \"-inf\", \
+            \"target_offset\" : \"0.00\" }";
+        let m = parse_loudnorm_json(log).expect("Messwerte");
+        assert!(!m.all_finite(), "stille Messung darf nicht normalisiert werden");
+    }
+
+    /// End-to-End: Lautheits-Normalisierung bringt einen lauten Testton (1 kHz
+    /// Vollpegel, ≈ −3 LUFS) beim Export auf das EBU-R128-Ziel von −23 LUFS.
+    /// Verifikation der 2-Pass-loudnorm-Kette im Audio-Export-Pfad (±1 LU).
+    #[test]
+    fn end_to_end_loudness_normalization_hits_target() {
+        let dir =
+            std::env::temp_dir().join(format!("editron-export-loud-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("ton.wav");
+        let out = dir.join("norm.wav");
+
+        // Lauter 1-kHz-Sinus (+15 dB über dem leisen lavfi-Default ≈ −6 LUFS)
+        // als Quelle — deutlich über dem −23-LUFS-Ziel, damit die
+        // Normalisierung echte Arbeit leistet.
+        let gen = Command::new(crate::services::ffmpeg_bin())
+            .args(["-y", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=1000:duration=5:sample_rate=48000"])
+            .args(["-af", "volume=15dB"])
+            .args(["-c:a", "pcm_s16le"])
+            .arg(&src)
+            .status()
+            .expect("ffmpeg nicht startbar — Tests brauchen ffmpeg im PATH");
+        assert!(gen.success(), "Testton konnte nicht erzeugt werden");
+
+        // Sanity: die unnormalisierte Quelle ist deutlich lauter als −23 LUFS.
+        let src_lufs = measure_integrated_lufs(&src);
+        assert!(src_lufs > -12.0, "Quelle unerwartet leise: {src_lufs}");
+
+        let (tl, media) = state_with(
+            vec![track("a1", TrackKind::Audio)],
+            vec![clip("a", "a1", TrackKind::Audio, "TON", 0.0, 5.0)],
+            vec![{
+                let mut a = video_asset("TON", &src.to_string_lossy());
+                a.kind = MediaKind::Audio;
+                a.info.video.clear();
+                a
+            }],
+        );
+
+        let mut settings = test_settings();
+        settings.container = container("wav");
+        settings.video = None;
+        settings.audio = Some(default_audio("pcm24", None));
+        settings.loudness = Some(LoudnessNorm::EBU_R128);
+        settings.output = out.to_string_lossy().into_owned();
+
+        let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let children = Arc::new(Mutex::new(Vec::new()));
+        run_export_worker("loud-job".into(), plan, settings, tx, cancel, children);
+
+        let mut done: Option<(bool, Option<String>)> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServiceEvent::SequenceExportDone { ok, error, .. } = ev {
+                done = Some((ok, error));
+            }
+        }
+        let (ok, error) = done.expect("Done-Event fehlt");
+        assert!(ok, "Export fehlgeschlagen: {error:?}");
+        assert!(out.exists(), "Zieldatei fehlt");
+
+        // Gemessene integrierte Lautheit der Ausgabe muss am Ziel liegen (±1 LU).
+        let measured = measure_integrated_lufs(&out);
+        assert!(
+            (measured - (-23.0)).abs() <= 1.0,
+            "Integrated LUFS {measured} weicht > 1 LU von −23 ab"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-End: Lautheits-Normalisierung im VIDEO-Export-Pfad. Sichert ab,
+    /// dass die normalisierte WAV nach dem Rename auch vom Encoder gemuxt wird
+    /// (anderer Pfad als Audio-only: render_video statt encode_audio_only, plus
+    /// die Phasen-Basis-Arithmetik bei Video+Normalisierung). Ziel −16 LUFS.
+    #[test]
+    fn end_to_end_loudness_normalization_in_video_export() {
+        let dir =
+            std::env::temp_dir().join(format!("editron-export-loudvid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clip.mp4");
+        let out = dir.join("norm.mp4");
+
+        // Kleines Testvideo mit lautem Ton (+15 dB) als Quelle.
+        let gen = Command::new(crate::services::ffmpeg_bin())
+            .args(["-y", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "testsrc=duration=4:size=160x120:rate=25"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=1000:duration=4"])
+            .args(["-af", "volume=15dB"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest"])
+            .arg(&src)
+            .status()
+            .expect("ffmpeg nicht startbar — Tests brauchen ffmpeg im PATH");
+        assert!(gen.success(), "Testvideo konnte nicht erzeugt werden");
+
+        let (tl, media) = state_with(
+            vec![track("v1", TrackKind::Video), track("a1", TrackKind::Audio)],
+            vec![
+                clip("v", "v1", TrackKind::Video, "VID", 0.0, 4.0),
+                clip("a", "a1", TrackKind::Audio, "VID", 0.0, 4.0),
+            ],
+            vec![video_asset("VID", &src.to_string_lossy())],
+        );
+
+        let mut settings = test_settings();
+        settings.audio = Some(default_audio("aac", Some(192)));
+        settings.loudness = Some(LOUDNESS_PRESETS[1].norm); // −16 LUFS
+        settings.output = out.to_string_lossy().into_owned();
+        if let Some(v) = settings.video.as_mut() {
+            v.width = 160;
+            v.height = 120;
+            v.speed = 0; // ultrafast
+        }
+
+        let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let children = Arc::new(Mutex::new(Vec::new()));
+        run_export_worker("loudvid-job".into(), plan, settings, tx, cancel, children);
+
+        let mut done: Option<(bool, Option<String>)> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServiceEvent::SequenceExportDone { ok, error, .. } = ev {
+                done = Some((ok, error));
+            }
+        }
+        let (ok, error) = done.expect("Done-Event fehlt");
+        assert!(ok, "Video-Export mit Normalisierung fehlgeschlagen: {error:?}");
+        assert!(out.exists(), "Zieldatei fehlt");
+
+        // Datei trägt Video + Audio, und die Tonspur liegt am −16-LUFS-Ziel.
+        let info = crate::services::probe_media(&out.to_string_lossy()).expect("probe");
+        assert_eq!(info.video.len(), 1, "Videospur fehlt");
+        assert_eq!(info.audio.len(), 1, "Tonspur fehlt");
+        let measured = measure_integrated_lufs(&out);
+        assert!(
+            (measured - (-16.0)).abs() <= 1.5, // AAC-Verlust ⇒ etwas weiter
+            "Integrated LUFS {measured} weicht > 1,5 LU von −16 ab"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// End-to-End: eine verschachtelte Sequenz (Nest-Clip) wird rekursiv
     /// komponiert. Das innere Material ist grün → der Ausgabe-Mittelpixel muss
     /// grün sein (nicht schwarz), und die Datei abspielbar mit Zielraster.
@@ -1356,7 +1769,9 @@
             container: container("png_seq"),
             video: Some(default_video("png", 320, 180, 25.0)),
             audio: None,
+            loudness: None,
             use_in_out: false,
+            audio_stems: false,
             subtitles: SubtitleMode::None,
             image_start: 1,
             output: out.to_string_lossy().into_owned(),
@@ -1505,7 +1920,9 @@
                     container: container("mov"),
                     video: Some(prores),
                     audio: Some(default_audio("pcm24", None)),
+                    loudness: None,
                     use_in_out: false,
+                    audio_stems: false,
                     subtitles: SubtitleMode::None,
                     image_start: 1,
                     output: String::new(),
@@ -1517,7 +1934,9 @@
                     container: container("webm"),
                     video: Some(vp9),
                     audio: Some(default_audio("opus", Some(96))),
+                    loudness: None,
                     use_in_out: false,
+                    audio_stems: false,
                     subtitles: SubtitleMode::None,
                     image_start: 1,
                     output: String::new(),
@@ -1529,7 +1948,9 @@
                     container: container("m4a"),
                     video: None,
                     audio: Some(default_audio("aac", Some(128))),
+                    loudness: None,
                     use_in_out: false,
+                    audio_stems: false,
                     subtitles: SubtitleMode::None,
                     image_start: 1,
                     output: String::new(),
@@ -2790,7 +3211,9 @@
             container: container("mkv"),
             video: Some(default_video("h264", 640, 360, 25.0)),
             audio: None,
+            loudness: None,
             use_in_out: false,
+            audio_stems: false,
             subtitles: SubtitleMode::Embed,
             image_start: 1,
             output: out.to_string_lossy().into_owned(),

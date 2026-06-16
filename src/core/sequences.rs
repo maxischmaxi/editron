@@ -25,6 +25,13 @@ pub struct Sequence {
     /// Bin (Ordner) im Medien-Browser, in dem die Sequenz liegt.
     pub bin_id: String,
     pub timeline: TimelineStore,
+    /// Unbekannte Felder einer neueren Version auf Sequenz-Ebene (siehe
+    /// [`crate::core::project::ProjectFile::extra`]). Verlustfrei beim Speichern
+    /// zurückgeschrieben.
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Unbekannte Felder einer neueren Version innerhalb des Timeline-Objekts
+    /// dieser Sequenz.
+    pub timeline_extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Sequence {
@@ -34,6 +41,8 @@ impl Sequence {
             name: name.into(),
             bin_id: bin_id.into(),
             timeline,
+            extra: serde_json::Map::new(),
+            timeline_extra: serde_json::Map::new(),
         }
     }
 

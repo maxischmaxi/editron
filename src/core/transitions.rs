@@ -561,6 +561,7 @@ mod tests {
 
     fn clip(start: f64, duration: f64, src_in: f64, src_duration: f64) -> TimelineClip {
         TimelineClip {
+            extra: Default::default(),
             id: new_id(),
             track_id: "t".into(),
             asset_id: "a".into(),

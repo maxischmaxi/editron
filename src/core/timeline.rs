@@ -42,6 +42,12 @@ const EPS: f64 = 1e-6;
 pub const MIN_CLIP_SPEED: f64 = 0.1;
 pub const MAX_CLIP_SPEED: f64 = 10.0;
 
+/// Grenzen der manuell verstellten Spurhöhe (logische Pixel, Sash-Drag am
+/// Spurkopf). Die Untergrenze lässt Label + Toggles der kompaktesten Spurart
+/// (Untertitel) noch zu; die Obergrenze gibt Platz für Waveforms/Keyframes.
+pub const MIN_TRACK_HEIGHT: f32 = 28.0;
+pub const MAX_TRACK_HEIGHT: f32 = 320.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrackKind {
@@ -113,6 +119,16 @@ pub struct TimelineTrack {
     /// Statische Null = keine Automation. Formatversion 7.
     #[serde(default = "zero_auto", skip_serializing_if = "AnimatedParam::is_static_zero")]
     pub pan_auto: AnimatedParam,
+    /// Manuell verstellte Spurhöhe in logischen Pixeln (Sash-Drag am Spurkopf,
+    /// auf [`MIN_TRACK_HEIGHT`]..[`MAX_TRACK_HEIGHT`] geklemmt). `None` ⇒ die
+    /// kompakte Standardhöhe der Spurart (Formatversion 13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f32>,
+    /// Felder einer NEUEREN Editron-Version, die dieser Build noch nicht kennt.
+    /// Werden beim Speichern unverändert zurückgeschrieben (Vorwärtskompatibilität,
+    /// siehe `core::project::ProjectFile::extra`).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn zero_auto() -> AnimatedParam {
@@ -183,6 +199,8 @@ fn make_track(kind: TrackKind) -> TimelineTrack {
         effects: Vec::new(),
         volume_auto: zero_auto(),
         pan_auto: zero_auto(),
+        height: None,
+        extra: Default::default(),
     }
 }
 
@@ -262,6 +280,12 @@ pub struct TimelineClip {
     /// aufgelöst (Formatversion 12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multicam: Option<crate::core::multicam::MulticamClip>,
+    /// Felder einer NEUEREN Editron-Version, die dieser Build noch nicht kennt.
+    /// Werden beim Speichern unverändert zurückgeschrieben (Vorwärtskompatibilität,
+    /// siehe `core::project::ProjectFile::extra`). `Clone` erhält sie, sodass
+    /// Schnitt-Operationen (Teilen/Duplizieren/Ripple) sie automatisch mittragen.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_enabled() -> bool {
@@ -478,6 +502,7 @@ pub fn new_media_clip(
     src_duration: f64,
 ) -> TimelineClip {
     TimelineClip {
+        extra: Default::default(),
         id: new_id(),
         track_id: track_id.to_string(),
         asset_id: asset_id.to_string(),
@@ -554,6 +579,7 @@ pub fn test_clip(track_id: &str) -> TimelineClip {
         markers: Vec::new(),
         nest_seq: None,
         multicam: None,
+        extra: Default::default(),
     }
 }
 

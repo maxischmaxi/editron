@@ -1,7 +1,9 @@
 //! Gesamtzustand der App (alle Stores) + Workspace-Wechsel-Logik.
 
 use crate::core::dock::DockManager;
+use crate::core::grade::ColorGrade;
 use crate::core::keyboard::KeymapStore;
+use crate::core::lut::LutCache;
 use crate::core::project::ProjectStore;
 use crate::core::render_cache::RenderCacheStore;
 use crate::core::render_queue::RenderQueue;
@@ -32,6 +34,19 @@ pub struct AppState {
     /// Render-Warteschlange: Export-Jobs, die im Hintergrund sequentiell
     /// abgearbeitet werden (Laufzeit; nicht persistiert).
     pub render_queue: RenderQueue,
+    /// Internes Farbkorrektur-Klemmbrett für „Grade kopieren/einfügen“
+    /// (`color.copyGrade`/`color.pasteGrade`). Liegt bewusst im AppState und
+    /// nicht in der Sequenz, damit der Workflow über Sequenzgrenzen hinweg
+    /// funktioniert (Laufzeit; nicht persistiert).
+    pub grade_clipboard: Option<ColorGrade>,
+    /// Pfad-indizierter Cache geparster `.cube`-3D-LUTs (Player-Vorschau +
+    /// Scopes). Fehlende Dateien werden als Offline-Fehler gemerkt (Laufzeit;
+    /// die GPU-Texturen liegen separat im Mainloop). Beim Projektladen geleert.
+    pub luts: LutCache,
+    /// LUT-Pfade, deren GPU-Textur der Mainloop neu hochladen soll (nach
+    /// Relink/Datei-Wechsel; der Loop entleert die Liste und invalidiert den
+    /// GPU-Cache). Laufzeit; nicht persistiert.
+    pub lut_reload: Vec<String>,
 }
 
 impl Default for AppState {
@@ -50,6 +65,9 @@ impl Default for AppState {
             settings: AppSettings::load(),
             render_cache: RenderCacheStore::default(),
             render_queue: RenderQueue::default(),
+            grade_clipboard: None,
+            luts: LutCache::default(),
+            lut_reload: Vec::new(),
         };
         let ws = state.app.active_workspace.clone();
         state.dock.load_workspace_layout(&ws);

@@ -7,7 +7,7 @@
 //! dem Projekt gespeichert.
 
 use crate::core::compose;
-use crate::core::grade::{ColorGrade, GradeLook, WheelValue};
+use crate::core::grade::{ColorGrade, Curve, CurvePoint, GradeCurves, GradeLook, LutSlot, WheelValue};
 use crate::core::timeline::{TimelineClip, TrackKind};
 use crate::panels::Panel;
 use crate::services::Services;
@@ -23,6 +23,18 @@ use raylib::consts::MouseCursor;
 
 const ROW_H: f32 = 26.0;
 const SECTION_H: f32 = 32.0;
+/// Höhe (= Breite, quadratisch) der Kurven-Editor-Fläche.
+const CURVE_EDITOR_H: f32 = 150.0;
+
+/// Kanalfarbe für die Kurven-UI (0 = Luma/neutral, 1 = R, 2 = G, 3 = B).
+fn channel_color(ch: usize) -> raylib::color::Color {
+    match ch {
+        1 => raylib::color::Color::new(232, 96, 96, 255),
+        2 => raylib::color::Color::new(96, 210, 120, 255),
+        3 => raylib::color::Color::new(110, 150, 255, 255),
+        _ => theme::TEXT_1,
+    }
+}
 
 // --------------------------------------------------------- Generische Helfer
 // (werden auch von anderen Panels genutzt — Signaturen stabil halten)
@@ -158,6 +170,18 @@ enum Act {
     /// Wie WheelLive, aber Einzelaktion mit eigenem Snapshot (Luma-Reset).
     WheelSet(usize, WheelValue),
     WheelReset(usize),
+    /// Laufende Kurven-Geste (Punkt ziehen): Kanal-Index + neue Kurve.
+    CurveLive(usize, Curve),
+    /// Einzelaktion (Punkt hinzufügen/löschen): Kanal-Index + neue Kurve.
+    CurveSet(usize, Curve),
+    /// Kanal-Kurve zurücksetzen (Identität).
+    CurveReset(usize),
+    /// LUT-Datei für einen Slot wählen (true = Input, false = Look).
+    PickLut(bool),
+    /// LUT-Slot leeren.
+    RemoveLut(bool),
+    /// LUT-Stärke ziehen (laufende Geste).
+    LutStrengthLive(bool, f64),
     ResetSection(u8),
     ResetAll,
     ToggleBypass,
@@ -172,8 +196,12 @@ pub struct ColorPanel {
     clip_id: Option<String>,
     open_basic: bool,
     open_creative: bool,
+    open_curves: bool,
+    open_luts: bool,
     open_wheels: bool,
     open_vignette: bool,
+    /// Aktiver Kurven-Kanal (0 = Luma, 1 = Rot, 2 = Grün, 3 = Blau).
+    curve_channel: usize,
     scroll: ScrollState,
     /// Undo-Snapshot der laufenden Drag-Geste bereits angelegt.
     gesture_pushed: bool,
@@ -187,8 +215,11 @@ impl Default for ColorPanel {
             clip_id: None,
             open_basic: true,
             open_creative: true,
+            open_curves: true,
+            open_luts: true,
             open_wheels: true,
             open_vignette: false,
+            curve_channel: 0,
             scroll: ScrollState::default(),
             gesture_pushed: false,
             edit: None,
@@ -408,10 +439,260 @@ impl ColorPanel {
             FontKind::Sans12,
         );
     }
+
+    /// Segmentierte Kanal-Auswahl (Luma/R/G/B). Nicht-neutrale Kanäle werden
+    /// in ihrer Kanalfarbe hervorgehoben.
+    fn curve_channel_selector(&mut self, ui: &mut Ui, row: Rect, curves: &GradeCurves) {
+        const LABELS: [&str; 4] = ["Luma", "Rot", "Grün", "Blau"];
+        let cw = row.w / 4.0;
+        for i in 0..4 {
+            let cell = Rect::new(row.x + cw * i as f32, row.y, cw - 3.0, row.h);
+            let id = ui.id(("color.curve.chan", i));
+            let it = ui.interact(id, cell);
+            let selected = self.curve_channel == i;
+            let edited = !curves.channel(i).is_identity();
+            let bg = if selected {
+                theme::SURFACE_3
+            } else if it.hovered {
+                theme::SURFACE_2
+            } else {
+                theme::SURFACE_0
+            };
+            ui.fill_rounded(cell, 3.0, bg);
+            let col = if selected || edited {
+                channel_color(i)
+            } else {
+                theme::TEXT_2
+            };
+            ui.text_centered(LABELS[i], cell, col, FontKind::Sans12);
+            if it.hovered {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+            }
+            if it.clicked {
+                self.curve_channel = i;
+            }
+        }
+    }
+
+    /// Kurven-Editor des aktiven Kanals: Raster + Diagonale, Spline-Vorschau,
+    /// ziehbare Stützpunkte. Klick auf freie Fläche fügt einen Punkt hinzu,
+    /// Doppelklick auf einen inneren Punkt löscht ihn; Endpunkte bleiben in x
+    /// verankert (nur y verstellbar).
+    fn curve_editor(&mut self, ui: &mut Ui, ed: Rect, grade: &ColorGrade, acts: &mut Vec<Act>) {
+        let ch = self.curve_channel;
+        let curve = grade.curves.channel(ch).clone();
+        let line_col = channel_color(ch);
+
+        ui.fill_rounded(ed, 4.0, theme::SURFACE_0);
+        // Viertel-Raster.
+        for i in 1..4 {
+            let gx = (ed.x + ed.w * i as f32 / 4.0).round();
+            ui.vline(gx, ed.y, ed.h, theme::with_alpha(theme::LINE, 50));
+            let gy = (ed.y + ed.h * i as f32 / 4.0).round();
+            ui.hline(ed.x, gy, ed.w, theme::with_alpha(theme::LINE, 50));
+        }
+        ui.fill(Rect::new(ed.x, ed.y, ed.w, 1.0), theme::with_alpha(theme::LINE, 90));
+        // Rahmen + Identitäts-Diagonale.
+        ui.line_thin(
+            v2(ed.x, ed.bottom()),
+            v2(ed.right(), ed.y),
+            theme::with_alpha(theme::LINE_STRONG, 70),
+        );
+
+        let to_screen = |x: f64, y: f64| {
+            v2(
+                ed.x + (x as f32) * ed.w,
+                ed.bottom() - (y as f32) * ed.h,
+            )
+        };
+
+        // Spline-Linienzug (pixelweise abtasten).
+        let steps = (ed.w as usize).max(2);
+        let mut prev = to_screen(0.0, curve.eval(0.0));
+        for s in 1..=steps {
+            let x = s as f64 / steps as f64;
+            let p = to_screen(x, curve.eval(x));
+            ui.line(prev, p, 1.5, line_col);
+            prev = p;
+        }
+
+        // ---- Stützpunkte: ziehen / löschen ----
+        let n = curve.points.len();
+        let hit_r = 8.0;
+        let mut hovered_any = false;
+        for i in 0..n {
+            let pt = curve.points[i];
+            let is_endpoint = i == 0 || i + 1 == n;
+            let sp = to_screen(pt.x, pt.y);
+            let hit = Rect::new(sp.x - hit_r, sp.y - hit_r, hit_r * 2.0, hit_r * 2.0);
+            let id = ui.id(("color.curve.pt", ch, i));
+            let it = ui.interact(id, hit);
+            if it.hovered {
+                hovered_any = true;
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_CROSSHAIR);
+            }
+            if it.double_clicked && !is_endpoint {
+                let mut pts = curve.points.clone();
+                pts.remove(i);
+                acts.push(Act::CurveSet(ch, Curve { points: pts }));
+            } else if it.held {
+                let mut nx = ((ui.input.mouse.x - ed.x) / ed.w).clamp(0.0, 1.0) as f64;
+                let ny = ((ed.bottom() - ui.input.mouse.y) / ed.h).clamp(0.0, 1.0) as f64;
+                if is_endpoint {
+                    nx = pt.x; // Endpunkte in x verankert
+                } else {
+                    // Zwischen die Nachbarn klemmen. Liegen diese enger als der
+                    // doppelte Mindestabstand (z. B. dicht gepackte Punkte aus
+                    // einer Datei), wäre lo > hi — `f64::clamp` würde paniken,
+                    // daher in dem Fall mittig zwischen die Nachbarn setzen.
+                    let lo = curve.points[i - 1].x + 1e-3;
+                    let hi = curve.points[i + 1].x - 1e-3;
+                    nx = if lo <= hi {
+                        nx.clamp(lo, hi)
+                    } else {
+                        (curve.points[i - 1].x + curve.points[i + 1].x) * 0.5
+                    };
+                }
+                let mut pts = curve.points.clone();
+                pts[i] = CurvePoint { x: nx, y: ny };
+                let cand = Curve { points: pts };
+                if cand != curve {
+                    acts.push(Act::CurveLive(ch, cand));
+                }
+            }
+            // Marker.
+            let big = it.hovered || it.held;
+            ui.circle(sp, if big { 5.0 } else { 3.5 }, if big { theme::WHITE } else { line_col });
+            ui.circle_outline(sp, if big { 6.0 } else { 4.5 }, theme::SURFACE_0);
+        }
+
+        // ---- Freie Fläche: Klick fügt einen Punkt hinzu ----
+        let bg_id = ui.id(("color.curve.bg", ch));
+        let bg = ui.interact(bg_id, ed);
+        if bg.hovered && !hovered_any {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_CROSSHAIR);
+        }
+        if bg.clicked && !hovered_any {
+            let nx = ((ui.input.mouse.x - ed.x) / ed.w).clamp(0.0, 1.0) as f64;
+            let ny = ((ed.bottom() - ui.input.mouse.y) / ed.h).clamp(0.0, 1.0) as f64;
+            let mut pts = curve.points.clone();
+            let idx = pts.iter().position(|p| p.x > nx).unwrap_or(pts.len());
+            // Nicht zu nah an einem Nachbarn einfügen (strikt steigendes x).
+            let too_close = (idx > 0 && (nx - pts[idx - 1].x).abs() < 5e-3)
+                || (idx < pts.len() && (pts[idx].x - nx).abs() < 5e-3);
+            if !too_close {
+                pts.insert(idx, CurvePoint { x: nx, y: ny });
+                acts.push(Act::CurveSet(ch, Curve { points: pts }));
+            }
+        }
+    }
+
+    /// Ein LUT-Slot (Input oder Look): Statuszeile (Dateiname / „Keine" /
+    /// Offline-Warnung) + Wählen/Entfernen, darunter ein Stärke-Regler (nur
+    /// bei gesetzter LUT). `offline` = referenzierte Datei fehlt/ungültig.
+    #[allow(clippy::too_many_arguments)]
+    fn lut_slot_ui(
+        &mut self,
+        ui: &mut Ui,
+        input: bool,
+        label: &str,
+        slot: &Option<LutSlot>,
+        offline: bool,
+        rect: Rect,
+        acts: &mut Vec<Act>,
+    ) {
+        let mut r = rect;
+        let mut row = r.cut_top(ROW_H - 2.0);
+        let label_cell = row.cut_left(60.0);
+        ui.text_left(label, label_cell, theme::TEXT_2, FontKind::Sans12);
+        row.cut_left(6.0);
+        // Rechts: Wählen-Button, davor (falls gesetzt) Entfernen.
+        let choose = Rect::new(row.right() - 24.0, row.y, 24.0, 22.0);
+        row.cut_right(28.0);
+        let remove = if slot.is_some() {
+            let rr = Rect::new(row.right() - 24.0, row.y, 24.0, 22.0);
+            row.cut_right(28.0);
+            Some(rr)
+        } else {
+            None
+        };
+        // Statuszeile.
+        let (text, col): (String, _) = match slot {
+            Some(s) if offline => (
+                format!("fehlt: {}", slot_display(s)),
+                theme::WARNING,
+            ),
+            Some(s) => (slot_display(s), theme::TEXT_1),
+            None => ("Keine".to_string(), theme::TEXT_3),
+        };
+        if matches!(slot, Some(_) if offline) {
+            let ic = row.cut_left(16.0);
+            ui.icon("triangle-alert", ic.inset_xy(0.0, 4.0), 13.0, theme::WARNING);
+            row.cut_left(2.0);
+        }
+        let disp = ui.font(FontKind::Sans12).ellipsize(&text, row.w);
+        ui.text_left(&disp, row, col, FontKind::Sans12);
+
+        if IconButton::new("folder-open")
+            .size(14.0)
+            .tooltip(if offline {
+                "Andere LUT-Datei suchen (.cube)"
+            } else {
+                "LUT-Datei wählen (.cube)"
+            })
+            .show(ui, ("color.lut.pick", input), choose)
+            .clicked
+        {
+            acts.push(Act::PickLut(input));
+        }
+        if let Some(rr) = remove {
+            if IconButton::new("trash-2")
+                .size(14.0)
+                .tooltip("LUT entfernen")
+                .show(ui, ("color.lut.remove", input), rr)
+                .clicked
+            {
+                acts.push(Act::RemoveLut(input));
+            }
+        }
+        // Stärke-Regler (nur bei gesetzter LUT).
+        if let Some(s) = slot {
+            let mut sr = r.cut_top(ROW_H - 4.0);
+            let lc = sr.cut_left(60.0);
+            ui.text_left("Stärke", lc, theme::TEXT_3, FontKind::Sans12);
+            sr.cut_left(6.0);
+            let vc = sr.cut_right(40.0);
+            sr.cut_right(8.0);
+            let mut v = s.strength;
+            let it = slider(ui, ("color.lut.str", input), sr, &mut v, 0.0, 100.0, theme::ACCENT);
+            v = v.round();
+            if it.held && v != s.strength {
+                acts.push(Act::LutStrengthLive(input, v));
+            }
+            ui.text_right(
+                &format!("{}", v as i64),
+                vc,
+                theme::TEXT_1,
+                FontKind::Mono12,
+            );
+        }
+    }
+}
+
+/// Anzeigename eines LUT-Slots (Name, sonst Datei-Endknoten des Pfads).
+fn slot_display(s: &LutSlot) -> String {
+    if !s.name.is_empty() {
+        s.name.clone()
+    } else {
+        std::path::Path::new(&s.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| s.path.clone())
+    }
 }
 
 impl Panel for ColorPanel {
-    fn update(&mut self, ui: &mut Ui, app: &mut AppState, _services: &Services, rect: Rect) {
+    fn update(&mut self, ui: &mut Ui, app: &mut AppState, services: &Services, rect: Rect) {
         ui.fill(rect, theme::SURFACE_1);
         if ui.mouse_in(rect) && (ui.input.left_pressed || ui.input.right_pressed) {
             app.app.focused_panel = "color".into();
@@ -454,7 +735,9 @@ impl Panel for ColorPanel {
         let mut head_inner = head.inset_xy(12.0, 0.0);
         let reset_rect = Rect::new(head_inner.right() - 26.0, head.y + 5.0, 26.0, 26.0);
         let bypass_rect = Rect::new(head_inner.right() - 56.0, head.y + 5.0, 26.0, 26.0);
-        head_inner.cut_right(64.0);
+        let paste_rect = Rect::new(head_inner.right() - 86.0, head.y + 5.0, 26.0, 26.0);
+        let copy_rect = Rect::new(head_inner.right() - 116.0, head.y + 5.0, 26.0, 26.0);
+        head_inner.cut_right(124.0);
         let name = ui
             .font(FontKind::Sans12Medium)
             .ellipsize(&clip.name, head_inner.w);
@@ -483,6 +766,39 @@ impl Panel for ColorPanel {
         {
             acts.push(Act::ResetAll);
         }
+        // Grade kopieren/einfügen (sequenzübergreifend via AppState-Klemmbrett).
+        // Beide wirken über die registrierten Commands auf die Auswahl; nur
+        // sinnvoll, wenn der gezeigte Clip wirklich ausgewählt ist (nicht bloß
+        // unter dem Playhead).
+        if IconButton::new("copy")
+            .size(15.0)
+            .disabled(!from_selection)
+            .tooltip(if from_selection {
+                "Farbkorrektur kopieren"
+            } else {
+                "Zum Kopieren einen Clip auswählen"
+            })
+            .show(ui, "color.copyGrade", copy_rect)
+            .clicked
+        {
+            ui.run_command("color.copyGrade");
+        }
+        let can_paste = from_selection && app.grade_clipboard.is_some();
+        if IconButton::new("clipboard-paste")
+            .size(15.0)
+            .disabled(!can_paste)
+            .tooltip(if app.grade_clipboard.is_none() {
+                "Kein kopierter Grade im Klemmbrett"
+            } else if from_selection {
+                "Farbkorrektur einfügen"
+            } else {
+                "Zum Einfügen einen Clip auswählen"
+            })
+            .show(ui, "color.pasteGrade", paste_rect)
+            .clicked
+        {
+            ui.run_command("color.pasteGrade");
+        }
 
         // ---- Fußzeile: Ziel-Hinweis ----
         let footer = area.cut_bottom(25.0);
@@ -494,13 +810,38 @@ impl Panel for ColorPanel {
         );
         ui.text_left(&note, footer.inset_xy(12.0, 0.0), theme::TEXT_3, FontKind::Sans12);
 
+        // Offline-Status der LUT-Slots (referenzierte Datei fehlt/ungültig) —
+        // einmal auflösen (lädt bei Bedarf in den Cache).
+        let input_offline = grade
+            .input_lut
+            .as_ref()
+            .is_some_and(|s| !s.path.is_empty() && app.luts.get_or_load(&s.path).is_err());
+        let look_offline = grade
+            .look_lut
+            .as_ref()
+            .is_some_and(|s| !s.path.is_empty() && app.luts.get_or_load(&s.path).is_err());
+
         // ---- Inhalt (Scroll) ----
         let wheel_h = 110.0;
         let basic_h = if self.open_basic { BASIC_SLIDERS.len() as f32 * ROW_H + 8.0 } else { 0.0 };
         let creative_h = if self.open_creative { ROW_H * 3.0 + 8.0 } else { 0.0 };
+        let curves_h = if self.open_curves { ROW_H * 2.0 + CURVE_EDITOR_H + 14.0 } else { 0.0 };
+        let lut_rows = |slot: &Option<LutSlot>| if slot.is_some() { 2.0 } else { 1.0 };
+        let luts_h = if self.open_luts {
+            (lut_rows(&grade.input_lut) + lut_rows(&grade.look_lut)) * ROW_H + 14.0
+        } else {
+            0.0
+        };
         let wheels_h = if self.open_wheels { wheel_h + 8.0 } else { 0.0 };
         let vignette_h = if self.open_vignette { VIGNETTE_SLIDERS.len() as f32 * ROW_H + 8.0 } else { 0.0 };
-        let content_h = SECTION_H * 4.0 + basic_h + creative_h + wheels_h + vignette_h + 8.0;
+        let content_h = SECTION_H * 6.0
+            + basic_h
+            + creative_h
+            + curves_h
+            + luts_h
+            + wheels_h
+            + vignette_h
+            + 8.0;
 
         let view = self.scroll.begin(ui, area, 0.0, content_h);
         let w = view.viewport.w;
@@ -563,6 +904,71 @@ impl Panel for ColorPanel {
                 y += ROW_H;
             }
             y += 8.0;
+        }
+        ui.hline(x, y - 1.0, w, theme::LINE);
+
+        // ================= Kurven =================
+        section_header(ui, "color.sec.curves", Rect::new(x, y, w, SECTION_H), "Kurven", &mut self.open_curves);
+        let curves_dirty = !grade.curves.is_identity();
+        if section_reset(ui, "color.sec.curves", y, curves_dirty) {
+            acts.push(Act::ResetSection(4));
+        }
+        y += SECTION_H;
+        if self.open_curves {
+            let inner_x = x + 8.0;
+            let inner_w = w - 16.0;
+            // Kanal-Auswahl.
+            let chan_row = Rect::new(inner_x, y, inner_w, ROW_H - 4.0);
+            self.curve_channel_selector(ui, chan_row, &grade.curves);
+            y += ROW_H;
+            // Editor (quadratisch zentriert).
+            let sq = CURVE_EDITOR_H.min(inner_w);
+            let ed = Rect::new(inner_x + (inner_w - sq) / 2.0, y, sq, sq);
+            self.curve_editor(ui, ed, &grade, &mut acts);
+            y += sq + 6.0;
+            // Hinweis + Kanal-Reset.
+            let hint_row = Rect::new(inner_x, y, inner_w, ROW_H - 4.0);
+            let ch = self.curve_channel;
+            let reset_r = Rect::new(hint_row.right() - 22.0, hint_row.y, 22.0, 22.0);
+            if IconButton::new("rotate-ccw")
+                .size(13.0)
+                .disabled(grade.curves.channel(ch).is_identity())
+                .tooltip("Kanal-Kurve zurücksetzen")
+                .show(ui, ("color.curve.reset", ch), reset_r)
+                .clicked
+            {
+                acts.push(Act::CurveReset(ch));
+            }
+            let mut hint = hint_row;
+            hint.cut_right(26.0);
+            let label = ui
+                .font(FontKind::Sans12)
+                .ellipsize("Klick fügt Punkt · ziehen · Doppelklick löscht", hint.w);
+            ui.text_left(&label, hint, theme::TEXT_3, FontKind::Sans12);
+            y += ROW_H + 8.0;
+        }
+        ui.hline(x, y - 1.0, w, theme::LINE);
+
+        // ================= 3D-LUTs =================
+        section_header(ui, "color.sec.luts", Rect::new(x, y, w, SECTION_H), "3D-LUTs (.cube)", &mut self.open_luts);
+        let luts_dirty = grade.input_lut.is_some() || grade.look_lut.is_some();
+        if section_reset(ui, "color.sec.luts", y, luts_dirty) {
+            acts.push(Act::ResetSection(5));
+        }
+        y += SECTION_H;
+        if self.open_luts {
+            let inner_x = x + 8.0;
+            let inner_w = w - 16.0;
+            // Input-LUT (Pipeline-Anfang) — eigene Kopie, da self.lut_slot_ui
+            // self mutabel braucht und `grade` darüber hinaus gelesen wird.
+            let input_slot = grade.input_lut.clone();
+            let input_h = if input_slot.is_some() { ROW_H * 2.0 } else { ROW_H };
+            self.lut_slot_ui(ui, true, "Input", &input_slot, input_offline, Rect::new(inner_x, y, inner_w, input_h), &mut acts);
+            y += input_h + 2.0;
+            let look_slot = grade.look_lut.clone();
+            let look_h = if look_slot.is_some() { ROW_H * 2.0 } else { ROW_H };
+            self.lut_slot_ui(ui, false, "Look", &look_slot, look_offline, Rect::new(inner_x, y, inner_w, look_h), &mut acts);
+            y += look_h + 10.0;
         }
         ui.hline(x, y - 1.0, w, theme::LINE);
 
@@ -677,6 +1083,51 @@ impl Panel for ColorPanel {
                         });
                     }
                 }
+                Act::CurveLive(ch, curve) => {
+                    if !self.gesture_pushed {
+                        app.timeline.begin_fx_edit();
+                        self.gesture_pushed = true;
+                    }
+                    app.timeline
+                        .grade_update_live(&id, |g| *g.curves.channel_mut(ch) = curve);
+                }
+                Act::CurveSet(ch, curve) => {
+                    app.timeline
+                        .grade_update(&id, |g| *g.curves.channel_mut(ch) = curve);
+                }
+                Act::CurveReset(ch) => {
+                    if !grade.curves.channel(ch).is_identity() {
+                        app.timeline
+                            .grade_update(&id, |g| *g.curves.channel_mut(ch) = Curve::identity());
+                    }
+                }
+                Act::PickLut(input) => {
+                    // Datei-Dialog im Worker; das Ergebnis (LutPicked) setzt den
+                    // Slot in main.rs (undo-fähig) für genau diesen Clip.
+                    services.pick_lut_file(&id, input);
+                }
+                Act::RemoveLut(input) => {
+                    app.timeline.grade_update(&id, |g| {
+                        if input {
+                            g.input_lut = None;
+                        } else {
+                            g.look_lut = None;
+                        }
+                    });
+                }
+                Act::LutStrengthLive(input, v) => {
+                    if !self.gesture_pushed {
+                        app.timeline.begin_fx_edit();
+                        self.gesture_pushed = true;
+                    }
+                    let v = v.clamp(0.0, 100.0);
+                    app.timeline.grade_update_live(&id, |g| {
+                        let slot = if input { &mut g.input_lut } else { &mut g.look_lut };
+                        if let Some(s) = slot {
+                            s.strength = v;
+                        }
+                    });
+                }
                 Act::ResetSection(section) => {
                     app.timeline.grade_update(&id, |g| match section {
                         0 => {
@@ -701,12 +1152,18 @@ impl Panel for ColorPanel {
                             g.gamma = WheelValue::default();
                             g.gain = WheelValue::default();
                         }
-                        _ => {
+                        3 => {
                             g.vignette_amount = 0.0;
                             g.vignette_midpoint = 50.0;
                             g.vignette_roundness = 0.0;
                             g.vignette_feather = 50.0;
                         }
+                        4 => g.curves = GradeCurves::default(),
+                        5 => {
+                            g.input_lut = None;
+                            g.look_lut = None;
+                        }
+                        _ => {}
                     });
                 }
                 Act::ResetAll => {

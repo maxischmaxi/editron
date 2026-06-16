@@ -86,6 +86,13 @@ pub enum ServiceEvent {
         ok: bool,
         error: Option<String>,
     },
+    /// `.cube`-3D-LUT für einen Clip-Farbslot gewählt (Farbe-Panel).
+    /// `input` = true ⇒ Input-Slot, false ⇒ Look-Slot.
+    LutPicked {
+        clip_id: String,
+        input: bool,
+        path: Option<PathBuf>,
+    },
     /// Projektdatei im Öffnen-Dialog gewählt.
     ProjectOpenPicked(Option<PathBuf>),
     /// Ziel im Projekt-speichern-Dialog gewählt.
@@ -263,6 +270,23 @@ impl Services {
             match picked {
                 Some(paths) if !paths.is_empty() => import_files(&tx, paths),
                 _ => {
+                    let _ = tx.send(ServiceEvent::ImportCancelled);
+                }
+            }
+        });
+    }
+
+    /// Ordner-Import-Dialog in eigenem Thread: der gewählte Ordner wird rekursiv
+    /// nach unterstützten Mediendateien durchsucht (siehe [`import_files`]).
+    pub fn open_import_folder_dialog(&self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            match rfd::FileDialog::new()
+                .set_title("Ordner importieren")
+                .pick_folder()
+            {
+                Some(dir) => import_files(&tx, vec![dir]),
+                None => {
                     let _ = tx.send(ServiceEvent::ImportCancelled);
                 }
             }
@@ -710,6 +734,28 @@ impl Services {
                 .add_filter("Alle Dateien", &["*"])
                 .pick_file();
             let _ = tx.send(ServiceEvent::RelinkManualPicked { asset_id, path: picked });
+        });
+    }
+
+    /// Datei-Dialog für eine `.cube`-3D-LUT eines Clip-Farbslots.
+    pub fn pick_lut_file(&self, clip_id: &str, input: bool) {
+        let tx = self.tx.clone();
+        let clip_id = clip_id.to_string();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title(if input {
+                    "Input-LUT wählen (.cube)"
+                } else {
+                    "Look-LUT wählen (.cube)"
+                })
+                .add_filter("3D-LUT (.cube)", &["cube", "CUBE"])
+                .add_filter("Alle Dateien", &["*"])
+                .pick_file();
+            let _ = tx.send(ServiceEvent::LutPicked {
+                clip_id,
+                input,
+                path: picked,
+            });
         });
     }
 
@@ -1225,8 +1271,76 @@ fn detect_kind(path: &str, info: &MediaInfo) -> MediaKind {
     MediaKind::Video
 }
 
+/// True, wenn die Dateiendung ein unterstütztes Medienformat ist
+/// (Video/Audio/Bild). Für das rekursive Ordner-Scannen.
+pub fn is_supported_media(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let ext = ext.as_str();
+    VIDEO_EXT.contains(&ext) || AUDIO_EXT.contains(&ext) || IMAGE_EXT.contains(&ext)
+}
+
+/// Ordner rekursiv nach unterstützten Mediendateien durchsuchen (Tiefensuche,
+/// Symlinks werden übersprungen). Ergebnis nach Pfad sortiert für eine stabile,
+/// vorhersehbare Import-Reihenfolge.
+fn collect_media_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            // macOS-AppleDouble-Metadateien („._clip.mov") tragen zwar eine
+            // Medien-Endung, sind aber keine Medien und würden nur Probe-Fehler
+            // erzeugen — beim rekursiven Scan überspringen.
+            if entry.file_name().to_string_lossy().starts_with("._") {
+                continue;
+            }
+            if is_supported_media(&entry.path()) {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Import-Pfade auflösen: Ordner werden rekursiv in unterstützte Mediendateien
+/// expandiert; einzelne (explizit gewählte/gezogene) Dateien bleiben unverändert
+/// — auch wenn ihre Endung untypisch ist, denn der Nutzer hat sie direkt gewählt.
+fn expand_import_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            out.extend(collect_media_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
 fn import_files(tx: &Sender<ServiceEvent>, paths: Vec<PathBuf>) {
+    // Ordner rekursiv auflösen (Drag&Drop oder „Ordner importieren").
+    let had_dirs = paths.iter().any(|p| p.is_dir());
+    let paths = expand_import_paths(paths);
     let mut errors: Vec<String> = Vec::new();
+    if paths.is_empty() && had_dirs {
+        errors.push("Keine unterstützten Medien im Ordner gefunden".to_string());
+    }
     for path_buf in paths {
         let path = path_buf.to_string_lossy().into_owned();
         match import_one(&path) {
@@ -1261,6 +1375,7 @@ fn import_one(path: &str) -> Result<MediaAsset, String> {
         None
     };
     Ok(MediaAsset {
+        extra: Default::default(),
         id: new_id(),
         path: path.to_string(),
         name: info.file_name.clone(),
@@ -1835,6 +1950,37 @@ mod tests {
         assert!(by_id["wav-other"].ends_with("a/musik.wav"));
         assert!(by_id["video"].ends_with("CLIP.MP4"));
         assert!(!by_id.contains_key("fehlt"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn folder_import_collects_supported_media_recursively() {
+        let root = std::env::temp_dir().join(format!("editron-import-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_file(&root.join("clip.mp4"), 1);
+        write_file(&root.join("audio/take.WAV"), 1); // Endung case-insensitiv
+        write_file(&root.join("audio/tief/bild.png"), 1);
+        write_file(&root.join("notiz.txt"), 1); // nicht unterstützt → ignoriert
+        write_file(&root.join("projekt.etron"), 1); // nicht unterstützt → ignoriert
+        write_file(&root.join("._clip.mp4"), 1); // macOS-AppleDouble → übersprungen
+
+        let files = collect_media_files(&root);
+        assert_eq!(files.len(), 3, "nur Medien, keine .txt/.etron/AppleDouble");
+        assert!(
+            !files.iter().any(|p| p.file_name().unwrap() == "._clip.mp4"),
+            "AppleDouble-Datei darf nicht importiert werden"
+        );
+        assert!(files.iter().all(|p| is_supported_media(p)));
+        assert!(files.iter().any(|p| p.ends_with("clip.mp4")));
+        assert!(files.iter().any(|p| p.ends_with("take.WAV")));
+        assert!(files.iter().any(|p| p.ends_with("bild.png")));
+
+        // expand: Ordner → Mediendateien, Einzeldatei bleibt unverändert.
+        let single = root.join("notiz.txt");
+        let expanded = expand_import_paths(vec![root.clone(), single.clone()]);
+        assert!(expanded.contains(&single), "explizit gewählte Datei bleibt");
+        assert_eq!(expanded.len(), 4); // 3 Medien + die explizite .txt
 
         let _ = std::fs::remove_dir_all(&root);
     }

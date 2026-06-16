@@ -22,6 +22,7 @@ impl MediaDialogs {
             Some(DialogId::ProxySettings) => render_proxy_settings(ui, state),
             Some(DialogId::ConfirmQuitRender) => render_confirm_quit(ui, state),
             Some(DialogId::ConfirmDeleteSequence) => render_confirm_delete_sequence(ui, state),
+            Some(DialogId::ConfirmRemoveTrack) => render_confirm_remove_track(ui, state),
             _ => {}
         }
     }
@@ -374,6 +375,64 @@ fn render_confirm_delete_sequence(ui: &mut Ui, state: &mut AppState) {
         .clicked
     {
         state.app.sequence_delete_target = None;
+        state.app.open_dialog = None;
+    }
+}
+
+// --------------------------------------------------------- Belegte Spur entfernen
+
+fn render_confirm_remove_track(ui: &mut Ui, state: &mut AppState) {
+    let Some(target) = state.app.remove_track_target.clone() else {
+        state.app.open_dialog = None;
+        return;
+    };
+    let Some(track) = state.timeline.tracks.iter().find(|t| t.id == target).cloned() else {
+        state.app.remove_track_target = None;
+        state.app.open_dialog = None;
+        return;
+    };
+    if esc_pressed(ui) {
+        state.app.remove_track_target = None;
+        state.app.open_dialog = None;
+        return;
+    }
+
+    let name = crate::core::timeline::track_name(&track, &state.timeline.tracks);
+    let clips = state.timeline.track_clip_count(&target);
+
+    let (mut body, footer) = modal_frame(ui, "triangle-alert", "Spur entfernen?", 540.0, 212.0);
+    let intro = body.cut_top(18.0);
+    ui.text_left(
+        &format!("Die Spur „{name}“ enthält {clips} Clip(s)."),
+        intro,
+        theme::TEXT_1,
+        FontKind::Sans12,
+    );
+    body.cut_top(10.0);
+    let note = body.cut_top(36.0);
+    ui.text_left(
+        "Beim Entfernen der Spur werden diese Clips mit gelöscht.",
+        note,
+        theme::TEXT_3,
+        FontKind::Sans12,
+    );
+
+    ui.hline(footer.x, footer.y, footer.w, theme::LINE);
+    let f = footer.inset_xy(16.0, 0.0);
+    let del_rect = Rect::new(f.right() - 200.0, f.y + 12.0, 200.0, 28.0);
+    if danger_button(ui, "track.del.confirm", del_rect, "Spur + Clips entfernen").clicked {
+        state.timeline.remove_track(&target);
+        state.app.remove_track_target = None;
+        state.app.open_dialog = None;
+        return;
+    }
+    let keep = TextButton::new("Abbrechen").style(TextButtonStyle::Outline);
+    let kw = keep.measure(ui).max(96.0);
+    if keep
+        .show(ui, "track.del.cancel", Rect::new(del_rect.x - 8.0 - kw, f.y + 12.0, kw, 28.0))
+        .clicked
+    {
+        state.app.remove_track_target = None;
         state.app.open_dialog = None;
     }
 }

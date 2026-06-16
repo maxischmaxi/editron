@@ -93,6 +93,7 @@ pub fn context_value(state: &AppState, key: &str) -> Value {
             .any(|t| t.kind == TrackKind::Subtitle)
             .into(),
         "timelineAttrClipboard" => state.timeline.has_attr_clipboard().into(),
+        "colorGradeClipboard" => state.grade_clipboard.is_some().into(),
         "timelineCanUndo" => state.timeline.can_undo().into(),
         "timelineCanRedo" => state.timeline.can_redo().into(),
         "mediaCanUndo" => state.media.can_undo().into(),
@@ -323,6 +324,48 @@ fn cycle_workspace(ctx: &mut CommandCtx, offset: i32) {
 fn status(ctx: &mut CommandCtx, msg: &str) {
     let now = ctx.now;
     ctx.state.app.set_status_message(Some(msg.to_string()), now);
+}
+
+/// Tastatur-Nudge: verschiebt die Auswahl um `frames` Frames bzw. trimmt im
+/// Trim-Werkzeug-Kontext (Ripple/Rolling) die aktive Kante. Das aktive
+/// Werkzeug entscheidet — sonst alles wie ein Move.
+fn nudge_timeline(ctx: &mut CommandCtx, frames: f64) {
+    match ctx.state.app.active_tool {
+        "ripple" => ctx.state.timeline.nudge_active_edge(frames, false),
+        "rolling" => ctx.state.timeline.nudge_active_edge(frames, true),
+        _ => ctx.state.timeline.nudge_selected_clips(frames),
+    }
+}
+
+/// Quell-Farbkorrektur für „Grade kopieren“ aus der aktuellen Auswahl
+/// auflösen. Bevorzugt — wie das Farbe-Panel (`panels::color`) den Ziel-Clip
+/// wählt — einen ausgewählten Video-Clip bzw. den Video-Partner eines
+/// ausgewählten Audio-Clips; ersatzweise den ersten ausgewählten sichtbaren
+/// Clip (Untertitel/Titel). Nie ein Audio-Clip — der trägt keine
+/// Farbkorrektur. `None`, wenn nur Audio ohne Video-Partner ausgewählt ist.
+fn selected_grade(state: &crate::state::AppState) -> Option<crate::core::grade::ColorGrade> {
+    for id in &state.timeline.selected_clip_ids {
+        let Some(clip) = state.timeline.clip(id) else {
+            continue;
+        };
+        if clip.kind == TrackKind::Video {
+            return Some(clip.grade.clone());
+        }
+        if let Some(link) = &clip.link_id {
+            if let Some(video) = state.timeline.clips.iter().find(|c| {
+                c.kind == TrackKind::Video && c.link_id.as_deref() == Some(link.as_str())
+            }) {
+                return Some(video.grade.clone());
+            }
+        }
+    }
+    state
+        .timeline
+        .selected_clip_ids
+        .iter()
+        .filter_map(|id| state.timeline.clip(id))
+        .find(|c| c.kind != TrackKind::Audio)
+        .map(|c| c.grade.clone())
 }
 
 // -------------------------------------------------------------- Multicam
@@ -953,6 +996,15 @@ pub fn build_registry() -> CommandRegistry {
         |ctx, _| {
             ctx.state.media.importing = true;
             ctx.services.open_import_dialog();
+        },
+    ));
+    commands.push(cmd(
+        "media.importFolder",
+        "Ordner importieren…",
+        "Medien",
+        |ctx, _| {
+            ctx.state.media.importing = true;
+            ctx.services.open_import_folder_dialog();
         },
     ));
     commands.push(with_when(
@@ -1705,6 +1757,12 @@ pub fn build_registry() -> CommandRegistry {
         |ctx, _| playback::dispatch(ctx.state, PlaybackCmd::ClearMarks),
     ));
     commands.push(cmd(
+        "playback.toggleLoop",
+        "Loop-Wiedergabe umschalten",
+        "Wiedergabe",
+        |ctx, _| playback::dispatch(ctx.state, PlaybackCmd::ToggleLoop),
+    ));
+    commands.push(cmd(
         "playback.toggleAudioScrub",
         "Audio-Scrubbing umschalten",
         "Wiedergabe",
@@ -1981,6 +2039,19 @@ pub fn build_registry() -> CommandRegistry {
         ),
         "timelineHasClips",
     ));
+    commands.push(with_when(
+        cmd(
+            "timeline.extendEdit",
+            "Schnitt zum Playhead ziehen (Extend Edit)",
+            "Timeline",
+            |ctx, _| {
+                if !ctx.state.timeline.extend_edit() {
+                    status(ctx, "Keine Schnittkante auf den Ziel-Spuren");
+                }
+            },
+        ),
+        "timelineHasClips",
+    ));
 
     commands.push(with_when(
         cmd("timeline.copy", "Clips kopieren", "Timeline", |ctx, _| {
@@ -2176,6 +2247,45 @@ pub fn build_registry() -> CommandRegistry {
             },
         ),
         "timelineClipSelected",
+    ));
+    // Grade kopieren/einfügen: die komplette Farbkorrektur eines Clips ins
+    // interne Klemmbrett (AppState, sequenzübergreifend) und von dort auf alle
+    // selektierten Clips. Quelle wird wie im Farbe-Panel aufgelöst (bevorzugt
+    // ein ausgewählter Video-Clip bzw. der Video-Partner eines Audio-Clips).
+    commands.push(with_when(
+        cmd(
+            "color.copyGrade",
+            "Farbkorrektur kopieren",
+            "Clip",
+            |ctx, _| {
+                if let Some(grade) = selected_grade(ctx.state) {
+                    ctx.state.grade_clipboard = Some(grade);
+                    status(ctx, "Farbkorrektur kopiert");
+                } else {
+                    status(ctx, "Kein Bild-Clip ausgewählt – Farbkorrektur nicht kopiert");
+                }
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "color.pasteGrade",
+            "Farbkorrektur einfügen",
+            "Clip",
+            |ctx, _| {
+                let Some(grade) = ctx.state.grade_clipboard.clone() else {
+                    return;
+                };
+                let ids = ctx.state.timeline.selected_clip_ids.clone();
+                let n = ctx.state.timeline.paste_grade(&grade, &ids);
+                if n > 0 {
+                    let word = if n == 1 { "Clip" } else { "Clips" };
+                    status(ctx, &format!("Farbkorrektur auf {n} {word} angewendet"));
+                }
+            },
+        ),
+        "timelineClipSelected && colorGradeClipboard",
     ));
 
     // ----------------------------------------------------- Clip: Effekte
@@ -2508,6 +2618,36 @@ pub fn build_registry() -> CommandRegistry {
         ),
         "timelineHasSubtitles",
     ));
+    commands.push(with_when(
+        cmd(
+            "subtitle.split",
+            "Untertitel am Playhead teilen",
+            "Untertitel",
+            |ctx, _| match ctx.state.timeline.subtitle_split_at_playhead() {
+                Ok(_) => ctx.state.dock.open_panel("subtitles"),
+                Err(err) => {
+                    let msg = err.clone();
+                    status(ctx, &msg);
+                }
+            },
+        ),
+        "timelineHasSubtitles",
+    ));
+    commands.push(with_when(
+        cmd(
+            "subtitle.merge",
+            "Untertitel mit Nachbarn zusammenführen",
+            "Untertitel",
+            |ctx, _| match ctx.state.timeline.subtitle_merge() {
+                Ok(_) => ctx.state.dock.open_panel("subtitles"),
+                Err(err) => {
+                    let msg = err.clone();
+                    status(ctx, &msg);
+                }
+            },
+        ),
+        "timelineHasSubtitles",
+    ));
 
     commands.push(cmd(
         "timeline.addVideoTrack",
@@ -2523,6 +2663,31 @@ pub fn build_registry() -> CommandRegistry {
         "Timeline",
         |ctx, _| {
             ctx.state.timeline.add_track(TrackKind::Audio);
+        },
+    ));
+    commands.push(cmd(
+        "timeline.removeTrack",
+        "Spur entfernen",
+        "Timeline",
+        |ctx, args| {
+            // Ziel: explizites Argument (Kontextmenü), sonst die fokussierte
+            // Spur (Tastatur — Spur des ausgewählten Clips bzw. anvisierte Spur).
+            let Some(target) = arg_str(args, "trackId")
+                .or_else(|| ctx.state.timeline.focused_track_id())
+            else {
+                status(ctx, "Keine Spur ausgewählt — zum Entfernen den Spurkopf rechtsklicken");
+                return;
+            };
+            if !ctx.state.timeline.tracks.iter().any(|t| t.id == target) {
+                return;
+            }
+            // Belegte Spur: erst bestätigen (die Clips würden mit gelöscht).
+            if ctx.state.timeline.track_clip_count(&target) > 0 {
+                ctx.state.app.remove_track_target = Some(target);
+                ctx.state.app.open_dialog = Some(DialogId::ConfirmRemoveTrack);
+                return;
+            }
+            ctx.state.timeline.remove_track(&target);
         },
     ));
 
@@ -2563,6 +2728,44 @@ pub fn build_registry() -> CommandRegistry {
         "Timeline",
         |ctx, _| ctx.state.timeline.step_playhead_frames(5.0),
     )));
+    // Feinpositionierung per Tastatur: Auswahl bzw. (im Ripple-/Rolling-
+    // Werkzeug) die aktive Schnittkante frame-genau verschieben/trimmen.
+    commands.push(with_when(
+        with_repeat(cmd(
+            "clip.nudgeLeft",
+            "Clip/Kante: ein Frame nach links",
+            "Timeline",
+            |ctx, _| nudge_timeline(ctx, -1.0),
+        )),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        with_repeat(cmd(
+            "clip.nudgeRight",
+            "Clip/Kante: ein Frame nach rechts",
+            "Timeline",
+            |ctx, _| nudge_timeline(ctx, 1.0),
+        )),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        with_repeat(cmd(
+            "clip.nudgeLeftMany",
+            "Clip/Kante: fünf Frames nach links",
+            "Timeline",
+            |ctx, _| nudge_timeline(ctx, -5.0),
+        )),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        with_repeat(cmd(
+            "clip.nudgeRightMany",
+            "Clip/Kante: fünf Frames nach rechts",
+            "Timeline",
+            |ctx, _| nudge_timeline(ctx, 5.0),
+        )),
+        "timelineClipSelected",
+    ));
     commands.push(with_repeat(cmd(
         "timeline.prevEdit",
         "Zum vorherigen Schnittpunkt",
@@ -2639,6 +2842,21 @@ mod tests {
         reg.execute(id, None, &mut ctx);
     }
 
+    /// Extend Edit ist registriert UND in allen drei Presets auf „E" gebunden
+    /// (Premiere-Konvention) — Verdrahtung gegen versehentliches Lösen sichern.
+    #[test]
+    fn extend_edit_command_bound_to_e_in_all_presets() {
+        let reg = build_registry();
+        assert!(reg.get("timeline.extendEdit").is_some(), "Command registriert");
+        for preset in crate::core::keyboard::presets() {
+            let bound = preset
+                .bindings
+                .iter()
+                .any(|b| b.command == "timeline.extendEdit" && b.keys == "E");
+            assert!(bound, "Preset {} bindet E auf Extend Edit", preset.id);
+        }
+    }
+
     /// edit.undo/redo machen Timeline- und Medien-Operationen in globaler
     /// zeitlicher Reihenfolge rückgängig (jüngste zuerst) bzw. wieder her.
     #[test]
@@ -2679,6 +2897,7 @@ mod tests {
         let mut state = AppState::default();
         // Asset + verwendender Clip.
         let mut a = crate::core::types::MediaAsset {
+            extra: Default::default(),
             id: "a1".into(),
             path: "/tmp/a1.mp4".into(),
             name: "a1".into(),
@@ -2707,6 +2926,7 @@ mod tests {
         state.media.add_asset(a);
         let v = state.timeline.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap().id.clone();
         state.timeline.clips.push(crate::core::timeline::TimelineClip {
+            extra: Default::default(),
             id: "c1".into(),
             track_id: v,
             asset_id: "a1".into(),
@@ -2743,5 +2963,79 @@ mod tests {
         assert!(state.media.asset("a1").is_none());
         assert!(state.timeline.clips.is_empty());
         assert_eq!(state.app.open_dialog, None);
+    }
+
+    /// `timeline.removeTrack`: leere Spur sofort weg, belegte Spur erst nach
+    /// Bestätigung (Clips würden mit gelöscht).
+    #[test]
+    fn remove_track_prompts_only_when_occupied() {
+        let reg = build_registry();
+        let services = Services::new();
+        let mut state = AppState::default();
+        let empty = state.timeline.tracks[0].id.clone();
+        let used = state.timeline.tracks[1].id.clone();
+        state.timeline.clips.push(crate::core::timeline::TimelineClip {
+            extra: Default::default(),
+            id: "c1".into(),
+            track_id: used.clone(),
+            asset_id: String::new(),
+            name: "Titel".into(),
+            kind: TrackKind::Video,
+            start: 0.0,
+            duration: 2.0,
+            src_in: 0.0,
+            src_duration: 5.0,
+            link_id: None,
+            enabled: true,
+            gain_db: 0.0,
+            fx: Default::default(),
+            grade: Default::default(),
+            effects: Vec::new(),
+            title: None,
+            subtitle: None,
+            speed: 1.0,
+            reverse: false,
+            freeze: false,
+            markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
+        });
+        let before = state.timeline.tracks.len();
+
+        // Leere Spur: ohne Rückfrage entfernt.
+        let args = serde_json::json!({ "trackId": empty });
+        {
+            let mut ctx = CommandCtx { state: &mut state, services: &services, now: 0.0 };
+            reg.execute("timeline.removeTrack", Some(&args), &mut ctx);
+        }
+        assert_eq!(state.app.open_dialog, None);
+        assert_eq!(state.timeline.tracks.len(), before - 1);
+        assert!(!state.timeline.tracks.iter().any(|t| t.id == empty));
+
+        // Belegte Spur: Bestätigungsdialog, Spur bleibt zunächst stehen.
+        let args = serde_json::json!({ "trackId": used });
+        {
+            let mut ctx = CommandCtx { state: &mut state, services: &services, now: 0.0 };
+            reg.execute("timeline.removeTrack", Some(&args), &mut ctx);
+        }
+        assert_eq!(state.app.open_dialog, Some(DialogId::ConfirmRemoveTrack));
+        assert_eq!(state.app.remove_track_target.as_deref(), Some(used.as_str()));
+        assert!(state.timeline.tracks.iter().any(|t| t.id == used), "noch nicht entfernt");
+    }
+
+    /// `timeline.removeTrack` ist in allen Presets gebunden (Verdrahtung sichern).
+    #[test]
+    fn track_commands_bound_in_all_presets() {
+        let reg = build_registry();
+        for id in ["timeline.addVideoTrack", "timeline.addAudioTrack", "timeline.removeTrack"] {
+            assert!(reg.get(id).is_some(), "Command {id} registriert");
+            for preset in crate::core::keyboard::presets() {
+                assert!(
+                    preset.bindings.iter().any(|b| b.command == id),
+                    "Preset {} bindet {id}",
+                    preset.id
+                );
+            }
+        }
     }
 }

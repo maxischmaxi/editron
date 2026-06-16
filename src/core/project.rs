@@ -7,6 +7,7 @@ use crate::core::transitions::Transition;
 use crate::core::types::MediaAsset;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
 pub const PROJECT_EXT: &str = "etron";
@@ -58,7 +59,18 @@ pub const PROJECT_FORMAT: &str = "editron-project";
 /// + aktiver Winkel). Ältere App-Versionen können den Multicam-Clip nicht
 /// auflösen (er hätte kein `asset_id`), deshalb der Versionssprung; v11-und-
 /// älter-Dateien laden unverändert (kein Multicam).
-pub const PROJECT_VERSION: u32 = 12;
+/// v13: Manuell verstellbare Spurhöhe (`sequences[].timeline.tracks[].height`,
+/// logische Pixel, per Sash-Drag am Spurkopf). Ältere App-Versionen ignorieren
+/// das Feld; v12-und-älter-Dateien laden unverändert (Standardhöhe der Spurart).
+/// v14: Tonwertkurven in der Farbkorrektur (`clips[].grade.curves` = Luma-
+/// Master- + R/G/B-Kanalkurven als monotone Splines). Ältere App-Versionen
+/// ignorieren das Feld; v13-und-älter-Dateien laden unverändert (Identität).
+/// v15: 3D-LUTs in der Farbkorrektur (`clips[].grade.inputLut`/`lookLut` =
+/// Pfad + Stärke einer externen `.cube`-Datei; Input am Pipeline-Anfang, Look
+/// am -Ende). Nur die Referenz wird gespeichert; fehlt die Datei, zeigt das
+/// Farbe-Panel einen Offline-Hinweis. Ältere App-Versionen ignorieren die
+/// Felder; v14-und-älter-Dateien laden unverändert (kein LUT).
+pub const PROJECT_VERSION: u32 = 15;
 const RECENT_LIMIT: usize = 10;
 
 // ------------------------------------------------------------------- Format
@@ -68,7 +80,8 @@ const RECENT_LIMIT: usize = 10;
 pub struct ProjectFile {
     /// Magic zum Erkennen fremder JSON-Dateien.
     pub format: String,
-    /// Formatversion für Migrationen; neuere Dateien werden abgelehnt.
+    /// Formatversion für Migrationen. Neuere Dateien werden best-effort geladen
+    /// (Warn-Hinweis statt Abbruch); unbekannte Felder fängt `extra` auf.
     pub version: u32,
     #[serde(default)]
     pub app_version: String,
@@ -108,6 +121,13 @@ pub struct ProjectFile {
     pub active_sequence_id: Option<String>,
     #[serde(default)]
     pub source_monitor: SourceMonitorDoc,
+    /// Felder einer NEUEREN Editron-Version, die dieser Build noch nicht kennt.
+    /// Sie werden beim Speichern unverändert wieder herausgeschrieben, damit ein
+    /// älterer Build ein neueres Projekt öffnen, bearbeiten und speichern kann,
+    /// ohne die neuen Felder stillschweigend zu verlieren (Vorwärtskompatibilität,
+    /// siehe `AppSettings::extra` in `core::settings`).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Eine persistierte Sequenz: Identität + Bin-Zuordnung + Timeline-Dokument.
@@ -120,6 +140,10 @@ pub struct SequenceDoc {
     pub bin_id: String,
     #[serde(default)]
     pub timeline: TimelineDoc,
+    /// Unbekannte Felder einer neueren Version auf Sequenz-Ebene (siehe
+    /// [`ProjectFile::extra`]).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 fn default_seq_bin() -> String {
@@ -167,6 +191,10 @@ pub struct TimelineDoc {
     /// eine Multicam-Quelle mit Winkeln + Sync-Offsets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multicam: Option<crate::core::multicam::MulticamSource>,
+    /// Unbekannte Felder einer neueren Version innerhalb des Timeline-Objekts
+    /// (siehe [`ProjectFile::extra`]).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -182,6 +210,10 @@ pub struct SourceMonitorDoc {
     pub out_mark: Option<f64>,
     #[serde(default)]
     pub looping: bool,
+    /// Unbekannte Felder einer neueren Version im Quellmonitor-Objekt (siehe
+    /// [`ProjectFile::extra`]).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl TimelineDoc {
@@ -194,6 +226,7 @@ impl TimelineDoc {
             && self.clips.is_empty()
             && self.transitions.is_empty()
             && self.markers.is_empty()
+            && self.extra.is_empty()
     }
 }
 
@@ -213,6 +246,10 @@ pub struct ProjectStore {
     pub path: Option<PathBuf>,
     pub dirty: bool,
     pub recent: Vec<String>,
+    /// Unbekannte Top-Level-Felder der zuletzt geladenen Projektdatei (Felder
+    /// einer neueren Version). Werden beim Speichern unverändert mitgeschrieben,
+    /// damit ein älterer Build neuere Projekte nicht beschneidet.
+    pub extra: Map<String, Value>,
     seen_timeline_rev: u64,
     seen_media_rev: u64,
 }
@@ -223,6 +260,7 @@ impl Default for ProjectStore {
             path: None,
             dirty: false,
             recent: load_recent(),
+            extra: Map::new(),
             seen_timeline_rev: 0,
             seen_media_rev: 0,
         }
@@ -305,8 +343,9 @@ pub fn autosave_path() -> PathBuf {
 
 // -------------------------------------------------------------- Save / Load
 
-/// Eine Timeline in ihr Persistenz-Dokument übersetzen.
-fn timeline_doc(t: &crate::core::timeline::TimelineStore) -> TimelineDoc {
+/// Eine Timeline in ihr Persistenz-Dokument übersetzen. `extra` reicht die beim
+/// Laden aufgefangenen Felder einer neueren Version unverändert wieder durch.
+fn timeline_doc(t: &crate::core::timeline::TimelineStore, extra: &Map<String, Value>) -> TimelineDoc {
     TimelineDoc {
         sequence: Some(t.settings),
         tracks: t.tracks.clone(),
@@ -322,6 +361,7 @@ fn timeline_doc(t: &crate::core::timeline::TimelineStore) -> TimelineDoc {
         master_gain_db: t.master_gain_db,
         active_subtitle_track_id: t.active_subtitle_track_id.clone(),
         multicam: t.multicam.clone(),
+        extra: extra.clone(),
     }
 }
 
@@ -334,7 +374,8 @@ pub fn collect(state: &AppState) -> ProjectFile {
             id: seq.id.clone(),
             name: seq.name.clone(),
             bin_id: seq.bin_id.clone(),
-            timeline: timeline_doc(&seq.timeline),
+            timeline: timeline_doc(&seq.timeline, &seq.timeline_extra),
+            extra: seq.extra.clone(),
         })
         .collect();
     ProjectFile {
@@ -362,7 +403,9 @@ pub fn collect(state: &AppState) -> ProjectFile {
             in_mark: state.playback.source.in_mark,
             out_mark: state.playback.source.out_mark,
             looping: state.playback.source.looping,
+            extra: state.playback.source_extra.clone(),
         },
+        extra: state.project.extra.clone(),
     }
 }
 
@@ -400,7 +443,14 @@ pub fn save_to(state: &mut AppState, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Projektdatei lesen und validieren (Format-Magic, Versionsfenster).
+/// Projektdatei lesen und validieren (Format-Magic, Deserialisierbarkeit).
+///
+/// Eine NEUERE Formatversion wird NICHT mehr hart abgelehnt: solange das
+/// Basismodell deserialisierbar ist (alle bekannten Felder passen), lädt das
+/// Projekt best-effort weiter. Unbekannte Felder fängt `#[serde(flatten)] extra`
+/// auf jeder Ebene auf und schreibt sie beim Speichern unverändert zurück, sodass
+/// ein älterer Build ein neueres Projekt bearbeiten kann, ohne neue Daten zu
+/// verlieren. Der Warn-Hinweis auf die Versionsdifferenz wird in [`apply`] gesetzt.
 pub fn load_from(path: &Path) -> Result<ProjectFile, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("{} konnte nicht gelesen werden: {e}", path.display()))?;
@@ -409,13 +459,18 @@ pub fn load_from(path: &Path) -> Result<ProjectFile, String> {
     if file.format != PROJECT_FORMAT {
         return Err("Keine Editron-Projektdatei".to_string());
     }
-    if file.version > PROJECT_VERSION {
-        return Err(format!(
-            "Projekt wurde mit einer neueren Editron-Version gespeichert (Format v{} > v{PROJECT_VERSION})",
-            file.version
-        ));
-    }
     Ok(file)
+}
+
+/// Warn-Hinweis, falls das Projekt mit einer neueren Editron-Version gespeichert
+/// wurde. `None`, wenn die Version bekannt ist.
+fn newer_version_warning(version: u32) -> Option<String> {
+    (version > PROJECT_VERSION).then(|| {
+        format!(
+            "Projekt mit einer neueren Editron-Version gespeichert (Format v{version} > v{PROJECT_VERSION}) — \
+             unbekannte Felder bleiben beim Speichern erhalten."
+        )
+    })
 }
 
 /// Ein Timeline-Dokument in eine fertige [`TimelineStore`] laden: Inhalt
@@ -479,7 +534,16 @@ fn load_timeline_doc(
 
 /// Geladenes Projekt in den App-Zustand übernehmen. Liefert die Anzahl
 /// fehlender Medien (Offline-Check passiert hier).
-pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> usize {
+pub fn apply(state: &mut AppState, mut file: ProjectFile, path: Option<PathBuf>) -> usize {
+    // Unbekannte Felder einer neueren Version (Top-Level) für späteres
+    // Wieder-Speichern aufbewahren; Warn-Hinweis bei neuerer Formatversion
+    // setzen (best-effort statt Abbruch).
+    let project_extra = std::mem::take(&mut file.extra);
+    state.app.load_warning = newer_version_warning(file.version);
+    // Geparste 3D-LUTs des Vorgängerprojekts verwerfen (Offline-Status der
+    // neuen Referenzen wird beim ersten Panel-/Monitor-Zugriff frisch geprüft).
+    state.luts = crate::core::lut::LutCache::default();
+    state.lut_reload.clear();
     // Medien übernehmen + Offline-Status prüfen; verwaiste Thumbnails
     // (Cache geleert) nicht weiterreichen, damit sie neu entstehen können.
     let mut media = file.media;
@@ -531,7 +595,10 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
     use crate::core::sequences::{Sequence, SequenceStore};
     let mut sequences: Vec<Sequence> = Vec::new();
     if !file.sequences.is_empty() {
-        for sd in file.sequences {
+        for mut sd in file.sequences {
+            // Extras VOR dem Konsumieren des Timeline-Dokuments sichern.
+            let seq_extra = std::mem::take(&mut sd.extra);
+            let tl_extra = std::mem::take(&mut sd.timeline.extra);
             let store = load_timeline_doc(sd.timeline, file.version, &asset_ids, &state.media);
             let bin_id = if state.media.bin_exists(&sd.bin_id) {
                 sd.bin_id
@@ -547,15 +614,18 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
             if !sd.id.trim().is_empty() {
                 seq.id = sd.id;
             }
+            seq.extra = seq_extra;
+            seq.timeline_extra = tl_extra;
             sequences.push(seq);
         }
     } else {
+        // Altprojekt (v≤10): das einzige `timeline`-Dokument wird zur einzigen
+        // Sequenz; etwaige unbekannte Felder wandern in deren `timeline_extra`.
+        let tl_extra = std::mem::take(&mut file.timeline.extra);
         let store = load_timeline_doc(file.timeline, file.version, &asset_ids, &state.media);
-        sequences.push(Sequence::new(
-            "Sequenz 01",
-            crate::core::bin::ROOT_BIN_ID,
-            store,
-        ));
+        let mut seq = Sequence::new("Sequenz 01", crate::core::bin::ROOT_BIN_ID, store);
+        seq.timeline_extra = tl_extra;
+        sequences.push(seq);
     }
     // Verwaiste Nest-Verweise (auf nicht existierende Sequenzen) entfernen.
     let seq_ids: std::collections::HashSet<String> =
@@ -591,6 +661,7 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
 
     let sm = file.source_monitor;
     state.playback = Default::default();
+    state.playback.source_extra = sm.extra;
     state.playback.source_asset_id = sm.asset_id.filter(|id| asset_ids.contains(id.as_str()));
     if state.playback.source_asset_id.is_some() {
         state.playback.source.position = sm.position.max(0.0);
@@ -604,6 +675,7 @@ pub fn apply(state: &mut AppState, file: ProjectFile, path: Option<PathBuf>) -> 
     }
 
     state.project.path = path.clone();
+    state.project.extra = project_extra;
     if let Some(p) = &path {
         state.project.push_recent(p);
     }
@@ -631,6 +703,9 @@ pub fn reset_to_new(state: &mut AppState) {
     state.timeline.revision += 1;
     state.playback = Default::default();
     state.project.path = None;
+    // Unbekannte Felder eines zuvor geladenen (neueren) Projekts dürfen nicht
+    // ins frische Projekt durchsickern.
+    state.project.extra.clear();
     let (t_rev, m_rev) = (state.timeline.aggregate_revision(), state.media.revision);
     state.project.mark_clean(t_rev, m_rev);
 }
@@ -686,6 +761,7 @@ mod tests {
     fn sample_state() -> AppState {
         let mut state = AppState::default();
         let asset = MediaAsset {
+            extra: Default::default(),
             id: "asset-1".into(),
             path: "/tmp/editron-test/clip.mp4".into(),
             name: "clip.mp4".into(),
@@ -713,6 +789,7 @@ mod tests {
         state.media.add_asset(asset);
         let track_id = state.timeline.tracks[0].id.clone();
         state.timeline.clips.push(TimelineClip {
+            extra: Default::default(),
             id: "clip-1".into(),
             track_id,
             asset_id: "asset-1".into(),
@@ -741,6 +818,13 @@ mod tests {
                 g.look = crate::core::grade::GradeLook::TealOrange;
                 g.gain = crate::core::grade::WheelValue { x: 0.3, y: -0.1, luma: 0.05 };
                 g.vignette_amount = 30.0;
+                g.curves.luma = crate::core::grade::Curve {
+                    points: vec![
+                        crate::core::grade::CurvePoint { x: 0.0, y: 0.02 },
+                        crate::core::grade::CurvePoint { x: 0.5, y: 0.62 },
+                        crate::core::grade::CurvePoint { x: 1.0, y: 0.97 },
+                    ],
+                };
                 g
             },
             effects: {
@@ -766,6 +850,7 @@ mod tests {
         // Standbild mit unendlicher Quelldauer (Infinity-Roundtrip).
         let track_id = state.timeline.tracks[1].id.clone();
         state.timeline.clips.push(TimelineClip {
+            extra: Default::default(),
             id: "clip-2".into(),
             track_id,
             asset_id: "asset-1".into(),
@@ -793,6 +878,7 @@ mod tests {
         // Rückwärts-Clip mit 37 % muss den Roundtrip exakt überleben.
         let track_id = state.timeline.tracks[0].id.clone();
         state.timeline.clips.push(TimelineClip {
+            extra: Default::default(),
             id: "clip-3".into(),
             track_id,
             asset_id: "asset-1".into(),
@@ -905,6 +991,9 @@ mod tests {
         assert_eq!(g.look, crate::core::grade::GradeLook::TealOrange);
         assert_eq!(g.gain.x, 0.3);
         assert_eq!(g.vignette_amount, 30.0);
+        assert_eq!(g.curves.luma.points.len(), 3);
+        assert_eq!(g.curves.luma.points[1].y, 0.62);
+        assert!(g.curves.red.is_identity());
         // Unveränderte Clips speichern kein fx-/grade-Feld (schlanke Datei).
         assert!(file.sequences[0].timeline.clips[1].fx.is_default());
         assert!(file.sequences[0].timeline.clips[1].grade.is_default());
@@ -984,27 +1073,203 @@ mod tests {
     }
 
     #[test]
-    fn rejects_foreign_and_newer_files() {
+    fn rejects_foreign_but_loads_newer_best_effort() {
+        isolate_config();
         let dir = std::env::temp_dir().join(format!("editron-proj-rej-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // Fremd-JSON ohne `format`-Feld: nicht deserialisierbar → abgelehnt.
         let foreign = dir.join("foreign.etron");
         std::fs::write(&foreign, r#"{"hello": 1}"#).unwrap();
         assert!(load_from(&foreign).is_err());
+        // Korrekte Struktur, aber fremdes Magic → abgelehnt.
+        let wrong_magic = dir.join("magic.etron");
+        std::fs::write(&wrong_magic, r#"{"format":"nope","version":1,"activeWorkspace":"edit"}"#)
+            .unwrap();
+        assert!(load_from(&wrong_magic).is_err());
 
+        // Neuere Formatversion: NICHT mehr abgelehnt, sondern best-effort geladen.
+        // Das unbekannte Top-Level-Feld landet in `extra`.
         let newer = dir.join("newer.etron");
         std::fs::write(
             &newer,
             format!(
-                r#"{{"format":"{PROJECT_FORMAT}","version":{},"activeWorkspace":"edit"}}"#,
+                r#"{{"format":"{PROJECT_FORMAT}","version":{},"activeWorkspace":"edit","futureField":7}}"#,
                 PROJECT_VERSION + 1
             ),
         )
         .unwrap();
-        let err = match load_from(&newer) {
-            Err(e) => e,
-            Ok(_) => panic!("neuere Formatversion wurde nicht abgelehnt"),
-        };
-        assert!(err.contains("neueren"), "{err}");
+        let file = load_from(&newer).expect("neuere Version lädt best-effort");
+        assert_eq!(file.version, PROJECT_VERSION + 1);
+        assert_eq!(file.extra.get("futureField"), Some(&serde_json::json!(7)));
+
+        // apply lädt den Best-Effort-Stand und setzt den Warn-Hinweis.
+        let mut state = AppState::default();
+        apply(&mut state, file, Some(newer.clone()));
+        assert!(
+            state.app.load_warning.is_some(),
+            "neuere Version setzt einen Warn-Hinweis"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_future_fields_survive_load_edit_save() {
+        use serde_json::json;
+        isolate_config();
+        // Gültiges Projekt der AKTUELLEN Version als Ausgangsbasis schreiben.
+        let mut state = sample_state();
+        let dir = std::env::temp_dir().join(format!("editron-proj-future-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("future.etron");
+        save_to(&mut state, &path).expect("save");
+
+        // Die Datei so anreichern, als hätte sie ein NEUERER Editron-Build
+        // geschrieben: höhere Version + unbekannte Felder auf jeder Ebene.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        {
+            let obj = v.as_object_mut().unwrap();
+            obj.insert("version".into(), json!(PROJECT_VERSION + 5));
+            obj.insert("futureGlobalOption".into(), json!({ "hdr": true, "nits": 1000 }));
+            let seqs = obj.get_mut("sequences").unwrap().as_array_mut().unwrap();
+            let s0 = seqs[0].as_object_mut().unwrap();
+            s0.insert("futureSeqField".into(), json!("hallo"));
+            let tl = s0.get_mut("timeline").unwrap().as_object_mut().unwrap();
+            tl.insert("futureTimelineField".into(), json!([1, 2, 3]));
+            obj.get_mut("sourceMonitor")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("futureSourceField".into(), json!(true));
+        }
+        std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+
+        // Älterer Build: best-effort laden — die Felder landen in `extra`.
+        let file = load_from(&path).expect("neuere Version lädt best-effort");
+        assert_eq!(file.version, PROJECT_VERSION + 5);
+        assert_eq!(file.extra.get("futureGlobalOption"), Some(&json!({ "hdr": true, "nits": 1000 })));
+        assert_eq!(file.sequences[0].extra.get("futureSeqField"), Some(&json!("hallo")));
+        assert_eq!(
+            file.sequences[0].timeline.extra.get("futureTimelineField"),
+            Some(&json!([1, 2, 3]))
+        );
+        assert_eq!(file.source_monitor.extra.get("futureSourceField"), Some(&json!(true)));
+
+        // In den App-Zustand laden (Warn-Hinweis), "bearbeiten" und neu speichern.
+        let mut edited = AppState::default();
+        apply(&mut edited, file, Some(path.clone()));
+        assert!(edited.app.load_warning.is_some(), "Warn-Hinweis für neuere Version");
+        edited.timeline.set_playhead(2.0); // irgendeine Bearbeitung
+        save_to(&mut edited, &path).expect("re-save");
+
+        // Erneut laden: unsere Version steht drin, ABER alle unbekannten Felder
+        // sind verlustfrei erhalten geblieben.
+        let reloaded = load_from(&path).expect("reload");
+        assert_eq!(reloaded.version, PROJECT_VERSION, "auf unsere Version zurückgeschrieben");
+        assert_eq!(
+            reloaded.extra.get("futureGlobalOption"),
+            Some(&json!({ "hdr": true, "nits": 1000 }))
+        );
+        assert_eq!(reloaded.sequences[0].extra.get("futureSeqField"), Some(&json!("hallo")));
+        assert_eq!(
+            reloaded.sequences[0].timeline.extra.get("futureTimelineField"),
+            Some(&json!([1, 2, 3]))
+        );
+        assert_eq!(reloaded.source_monitor.extra.get("futureSourceField"), Some(&json!(true)));
+        // Reload eines Projekts UNSERER Version setzt keinen Warn-Hinweis mehr.
+        let mut fresh = AppState::default();
+        apply(&mut fresh, reloaded, Some(path.clone()));
+        assert!(fresh.app.load_warning.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_per_element_fields_survive_roundtrip() {
+        use serde_json::json;
+        isolate_config();
+        // Ausgangsbasis mit Asset, Clips und Spuren.
+        let mut state = sample_state();
+        let dir = std::env::temp_dir().join(format!("editron-proj-elem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("elem.etron");
+        save_to(&mut state, &path).expect("save");
+
+        // Unbekannte Felder an EINEM Asset, EINEM Clip und EINER Spur anbringen
+        // (als hätte sie ein neuerer Build geschrieben).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        {
+            let obj = v.as_object_mut().unwrap();
+            let asset = obj.get_mut("media").unwrap().as_array_mut().unwrap()[0]
+                .as_object_mut()
+                .unwrap();
+            asset.insert("futureAssetField".into(), json!({ "lut": "aces" }));
+            let tl = obj.get_mut("sequences").unwrap().as_array_mut().unwrap()[0]
+                .as_object_mut()
+                .unwrap()
+                .get_mut("timeline")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            // Clip „clip-1" anreichern.
+            let clip = tl
+                .get_mut("clips")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|c| c["id"] == json!("clip-1"))
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            clip.insert("futureClipField".into(), json!(99));
+            // Erste Spur anreichern.
+            tl.get_mut("tracks").unwrap().as_array_mut().unwrap()[0]
+                .as_object_mut()
+                .unwrap()
+                .insert("futureTrackField".into(), json!([true, false]));
+        }
+        std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+
+        // Laden → die Felder sitzen im jeweiligen In-Memory-Struct.
+        let file = load_from(&path).expect("load");
+        let mut edited = AppState::default();
+        apply(&mut edited, file, Some(path.clone()));
+        assert_eq!(
+            edited.media.asset("asset-1").unwrap().extra.get("futureAssetField"),
+            Some(&json!({ "lut": "aces" }))
+        );
+        assert_eq!(
+            edited.timeline.clip("clip-1").unwrap().extra.get("futureClipField"),
+            Some(&json!(99))
+        );
+        assert_eq!(
+            edited.timeline.tracks[0].extra.get("futureTrackField"),
+            Some(&json!([true, false]))
+        );
+
+        // Bearbeiten + neu speichern. `collect` klont alle Clips/Spuren/Assets,
+        // `Clone` trägt `extra` mit — daher überlebt es ohne Sonderbehandlung.
+        edited.timeline.set_playhead(3.0);
+        save_to(&mut edited, &path).expect("re-save");
+
+        // Erneut laden: per-Element-Felder verlustfrei erhalten.
+        let reloaded = load_from(&path).expect("reload");
+        let tl = &reloaded.sequences[0].timeline;
+        assert_eq!(
+            reloaded.media.iter().find(|a| a.id == "asset-1").unwrap().extra.get("futureAssetField"),
+            Some(&json!({ "lut": "aces" }))
+        );
+        assert_eq!(
+            tl.clips.iter().find(|c| c.id == "clip-1").unwrap().extra.get("futureClipField"),
+            Some(&json!(99))
+        );
+        assert_eq!(
+            tl.tracks[0].extra.get("futureTrackField"),
+            Some(&json!([true, false]))
+        );
+        // Unveränderte Elemente tragen weiterhin KEIN extra (keine Pollution).
+        assert!(tl.clips.iter().find(|c| c.id == "clip-2").unwrap().extra.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1013,6 +1278,7 @@ mod tests {
         let mut tl = crate::core::timeline::TimelineStore::default();
         let track = tl.tracks[0].clone();
         let good = TimelineClip {
+            extra: Default::default(),
             id: "ok".into(),
             track_id: track.id.clone(),
             asset_id: "a".into(),
@@ -1161,6 +1427,42 @@ mod tests {
     }
 
     #[test]
+    fn track_height_survives_roundtrip_and_is_clamped() {
+        isolate_config();
+        let mut state = sample_state();
+        let v_id = state.timeline.tracks[0].id.clone();
+        let a_id = state.timeline.tracks[2].id.clone();
+        // Eine Spur manuell höher ziehen, eine über das Maximum hinaus
+        // (Klemmung), die übrigen unverändert (= Standardhöhe der Spurart).
+        state.timeline.set_track_height_live(&v_id, 96.0);
+        state.timeline.set_track_height_live(&a_id, 10_000.0);
+
+        let dir = std::env::temp_dir().join(format!("editron-proj-th-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("th.etron");
+        save_to(&mut state, &path).expect("save");
+
+        let file = load_from(&path).expect("load");
+        assert_eq!(file.version, PROJECT_VERSION);
+        let mut target = AppState::default();
+        apply(&mut target, file, Some(path.clone()));
+
+        let v = target.timeline.tracks.iter().find(|t| t.id == v_id).expect("V-Spur");
+        let a = target.timeline.tracks.iter().find(|t| t.id == a_id).expect("A-Spur");
+        assert_eq!(v.height, Some(96.0), "manuelle Höhe überlebt den Roundtrip");
+        assert_eq!(
+            a.height,
+            Some(crate::core::timeline::MAX_TRACK_HEIGHT),
+            "Höhe wird auf das Maximum geklemmt"
+        );
+        assert!(
+            target.timeline.tracks.iter().any(|t| t.height.is_none()),
+            "unveränderte Spuren bleiben ohne explizite Höhe (Standardhöhe)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn title_clips_survive_roundtrip_and_orphan_cleanup() {
         isolate_config();
         let mut state = AppState::default();
@@ -1177,6 +1479,7 @@ mod tests {
         // Laden raus — der Titel-Clip (ohne Asset) muss bleiben.
         let track_id = state.timeline.tracks[0].id.clone();
         state.timeline.clips.push(TimelineClip {
+            extra: Default::default(),
             id: "orphan".into(),
             track_id,
             asset_id: "missing-asset".into(),
@@ -1300,6 +1603,7 @@ mod tests {
     /// Hilfskonstruktor für Medien-Assets in den Bin-Tests.
     fn test_asset(id: &str, name: &str, recorded_at: Option<f64>) -> MediaAsset {
         MediaAsset {
+            extra: Default::default(),
             id: id.into(),
             path: format!("/tmp/editron-test/{id}.mp4"),
             name: name.into(),
@@ -1591,7 +1895,6 @@ mod tests {
 
         let file = load_from(&path).expect("load");
         assert_eq!(file.version, PROJECT_VERSION);
-        assert_eq!(file.version, 12);
 
         let mut target = AppState::default();
         apply(&mut target, file, Some(path.clone()));

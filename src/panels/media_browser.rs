@@ -42,6 +42,78 @@ struct Marquee {
     additive: bool,
 }
 
+/// Verwendungs-Filter: alle, nur in der aktiven Sequenz verwendete oder nur
+/// unbenutzte Assets.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum UsageFilter {
+    #[default]
+    All,
+    Used,
+    Unused,
+}
+
+/// Laufzeit-Filter des Medien-Browsers (reiner Ansichtszustand, NICHT
+/// persistiert — daher keine .etron-Formatänderung). Leere Schaltermengen
+/// bedeuten „kein Filter" (alles sichtbar), genau wie das leere Suchfeld.
+#[derive(Default)]
+struct MediaFilter {
+    /// Medientyp-Schalter; sind alle `false`, gilt kein Typ-Filter.
+    video: bool,
+    audio: bool,
+    image: bool,
+    /// Farbetikett-Schalter (parallel zu [`MediaLabel::ALL`]); alle `false` =
+    /// kein Etikett-Filter.
+    labels: [bool; 8],
+    /// Verwendungs-Filter (in der aktiven Sequenz).
+    usage: UsageFilter,
+}
+
+impl MediaFilter {
+    /// Ist überhaupt ein Filter aktiv?
+    fn active(&self) -> bool {
+        self.video
+            || self.audio
+            || self.image
+            || self.labels.iter().any(|&b| b)
+            || self.usage != UsageFilter::All
+    }
+
+    /// Braucht der Filter die (teure) Verwendungs-Information? Nur dann lohnt
+    /// es, die Clip-Liste der aktiven Sequenz zu durchsuchen.
+    fn needs_usage(&self) -> bool {
+        self.usage != UsageFilter::All
+    }
+
+    /// Passt ein Asset (Typ/Etikett/Verwendungszahl) durch den Filter?
+    fn matches(&self, kind: MediaKind, label: Option<MediaLabel>, usage: usize) -> bool {
+        // Medientyp: nur prüfen, wenn mindestens ein Typ angewählt ist.
+        if self.video || self.audio || self.image {
+            let ok = match kind {
+                MediaKind::Video => self.video,
+                MediaKind::Audio => self.audio,
+                MediaKind::Image => self.image,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        // Farbetikett: nur prüfen, wenn mindestens ein Etikett angewählt ist.
+        if self.labels.iter().any(|&b| b) {
+            let idx = label.and_then(|l| MediaLabel::ALL.iter().position(|c| *c == l));
+            match idx {
+                Some(i) if self.labels[i] => {}
+                _ => return false,
+            }
+        }
+        // Verwendung.
+        match self.usage {
+            UsageFilter::All => true,
+            UsageFilter::Used => usage > 0,
+            UsageFilter::Unused => usage == 0,
+        }
+    }
+}
+
 pub struct MediaBrowserPanel {
     search: TextInputState,
     scroll: ScrollState,
@@ -57,6 +129,8 @@ pub struct MediaBrowserPanel {
     scrub_pending: std::collections::HashMap<(String, u32), f64>,
     /// Spalte, deren Breite gerade gezogen wird (Index in COLUMNS).
     col_drag: Option<usize>,
+    /// Filterleiste-Zustand (Typ/Etikett/Verwendung); nicht persistiert.
+    filter: MediaFilter,
 }
 
 impl Default for MediaBrowserPanel {
@@ -72,6 +146,7 @@ impl Default for MediaBrowserPanel {
             marquee: None,
             scrub_pending: std::collections::HashMap::new(),
             col_drag: None,
+            filter: MediaFilter::default(),
         }
     }
 }
@@ -475,6 +550,7 @@ fn background_context_menu(current_bin: &str) -> Vec<MenuEntry> {
         ),
         MenuEntry::Separator,
         MenuEntry::Item(MenuItem::command("media.import").with_icon("import")),
+        MenuEntry::Item(MenuItem::command("media.importFolder").with_icon("folder-open")),
         MenuEntry::Item(MenuItem::command("media.createProxiesAll").with_icon("gauge")),
         MenuEntry::Item(MenuItem::command("proxy.settings").with_icon("sliders-horizontal")),
     ]
@@ -491,6 +567,9 @@ impl Panel for MediaBrowserPanel {
         let mut area = rect;
         let toolbar = area.cut_top(36.0);
         self.render_toolbar(ui, app, toolbar);
+
+        let filter_bar = area.cut_top(30.0);
+        self.render_filter_bar(ui, filter_bar);
 
         let query = self.search.text.trim().to_lowercase();
         let searching = !query.is_empty();
@@ -515,6 +594,34 @@ impl Panel for MediaBrowserPanel {
                 app.media.assets_in_bin(&current).iter().map(|a| a.id.clone()).collect();
             sort_assets(&app.media, &mut assets, app.media.view.sort, app.media.view.sort_desc);
             (folders, assets)
+        };
+        // Filterleiste (Typ/Etikett/Verwendung) auf die Asset-Liste anwenden.
+        // Ordner/Sequenzen bleiben sichtbar (Navigation), nur Medien werden
+        // ein-/ausgeblendet — analog zu Premieres Filter im Projekt-Panel.
+        let assets: Vec<String> = if self.filter.active() {
+            // Verwendungs-IDs nur EINMAL sammeln, und nur wenn der Verwendungs-
+            // Filter aktiv ist (sonst wäre es O(assets × clips) pro Frame für
+            // einen reinen Typ-/Etikett-Filter, der die Verwendung gar nicht braucht).
+            let used: Option<std::collections::HashSet<String>> = if self.filter.needs_usage() {
+                Some(app.timeline.clips.iter().map(|c| c.asset_id.clone()).collect())
+            } else {
+                None
+            };
+            assets
+                .into_iter()
+                .filter(|id| match app.media.asset(id) {
+                    Some(a) => {
+                        let usage = match &used {
+                            Some(set) => set.contains(id.as_str()) as usize,
+                            None => 0,
+                        };
+                        self.filter.matches(a.kind, a.label, usage)
+                    }
+                    None => false,
+                })
+                .collect()
+        } else {
+            assets
         };
         // Sequenzen erscheinen als eigene Browser-Einträge (eigenes Icon,
         // Doppelklick öffnet, Drag = Nesting).
@@ -549,6 +656,8 @@ impl Panel for MediaBrowserPanel {
         if folders.is_empty() && assets.is_empty() && sequences.is_empty() {
             let msg = if searching {
                 "Keine Treffer"
+            } else if self.filter.active() {
+                "Keine Medien passen zum Filter"
             } else {
                 "Dieser Ordner ist leer"
             };
@@ -579,6 +688,18 @@ impl MediaBrowserPanel {
         let import_rect = Rect::new(tb.cut_left(btn_w).x, tb.y + 6.0, btn_w, 24.0);
         if import_btn.show(ui, "media.import.btn", import_rect).clicked {
             ui.run_command("media.import");
+        }
+        tb.cut_left(6.0);
+
+        // Ordner importieren (rekursiver Scan).
+        let importfolder_rect = Rect::new(tb.cut_left(24.0).x, tb.y + 6.0, 24.0, 24.0);
+        if IconButton::new("folder-open")
+            .size(15.0)
+            .tooltip("Ordner importieren (rekursiv)")
+            .show(ui, "media.importfolder.btn", importfolder_rect)
+            .clicked
+        {
+            ui.run_command("media.importFolder");
         }
         tb.cut_left(6.0);
 
@@ -665,6 +786,123 @@ impl MediaBrowserPanel {
             14.0,
             theme::TEXT_3,
         );
+    }
+
+    // ----------------------------------------------------------- Filterleiste
+
+    /// Filterleiste: Medientyp-Schalter, Farbetikett-Punkte und Verwendungs-
+    /// Dropdown. Leere Schaltermengen = kein Filter. Rechts ein „Zurücksetzen",
+    /// sobald irgendein Filter aktiv ist.
+    fn render_filter_bar(&mut self, ui: &mut Ui, bar: Rect) {
+        ui.fill(bar, theme::SURFACE_1);
+        ui.hline(bar.x, bar.bottom() - 1.0, bar.w, theme::LINE);
+        let cy = bar.y + (bar.h - 24.0) / 2.0;
+        let mut x = bar.x + 8.0;
+
+        // Funnel-Icon als Beschriftung.
+        ui.icon(
+            "filter",
+            Rect::new(x, bar.y + (bar.h - 13.0) / 2.0, 13.0, 13.0),
+            13.0,
+            theme::TEXT_3,
+        );
+        x += 20.0;
+
+        // Medientyp-Schalter (Video/Audio/Bild).
+        let types: [(&str, &str); 3] = [
+            ("film", "Nur Video"),
+            ("music", "Nur Audio"),
+            ("image", "Nur Bilder"),
+        ];
+        for (i, (icon, tip)) in types.into_iter().enumerate() {
+            let on = match i {
+                0 => self.filter.video,
+                1 => self.filter.audio,
+                _ => self.filter.image,
+            };
+            let r = Rect::new(x, cy, 24.0, 24.0);
+            if IconButton::new(icon)
+                .size(13.0)
+                .active(on)
+                .tooltip(tip)
+                .show(ui, ("media.filter.kind", i), r)
+                .clicked
+            {
+                match i {
+                    0 => self.filter.video = !on,
+                    1 => self.filter.audio = !on,
+                    _ => self.filter.image = !on,
+                }
+            }
+            x += 24.0;
+        }
+        x += 6.0;
+
+        // Trenner.
+        ui.fill(Rect::new(x, bar.y + 6.0, 1.0, bar.h - 12.0), theme::LINE);
+        x += 9.0;
+
+        // Farbetikett-Punkte (anwählbar; aktiver Punkt mit hellem Ring).
+        for (i, label) in MediaLabel::ALL.into_iter().enumerate() {
+            let on = self.filter.labels[i];
+            let size = 14.0;
+            let dot = Rect::new(x, bar.y + (bar.h - size) / 2.0, size, size);
+            let id = ui.id(("media.filter.label", i));
+            let it = ui.interact(id, dot);
+            let r2 = size / 2.0;
+            ui.fill_rounded(dot, r2, label_color(label));
+            if on {
+                ui.stroke_rounded(dot, r2, 2.0, theme::TEXT_1);
+            } else if it.hovered {
+                ui.stroke_rounded(dot, r2, 1.0, theme::TEXT_2);
+            } else {
+                ui.stroke_rounded(dot, r2, 1.0, theme::with_alpha(theme::BLACK, 120));
+            }
+            if it.hovered {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                ui.tooltip(id, dot, label.label());
+            }
+            if it.clicked {
+                self.filter.labels[i] = !on;
+            }
+            x += size + 4.0;
+        }
+        x += 5.0;
+
+        // Trenner.
+        ui.fill(Rect::new(x, bar.y + 6.0, 1.0, bar.h - 12.0), theme::LINE);
+        x += 9.0;
+
+        // Verwendungs-Filter (Dropdown).
+        let usage_labels = ["Verwendung: alle", "Nur verwendet", "Nur unbenutzt"];
+        let cur = match self.filter.usage {
+            UsageFilter::All => 0,
+            UsageFilter::Used => 1,
+            UsageFilter::Unused => 2,
+        };
+        let sel_w = 138.0;
+        let sel_rect = Rect::new(x, cy, sel_w, 24.0);
+        if let Some(i) = select(ui, "media.filter.usage", sel_rect, &usage_labels, cur) {
+            self.filter.usage = match i {
+                1 => UsageFilter::Used,
+                2 => UsageFilter::Unused,
+                _ => UsageFilter::All,
+            };
+        }
+
+        // „Zurücksetzen" ganz rechts (nur bei aktivem Filter).
+        if self.filter.active() {
+            let clear = Rect::new(bar.right() - 28.0, cy, 24.0, 24.0);
+            if IconButton::new("x")
+                .size(13.0)
+                .tooltip("Filter zurücksetzen")
+                .danger_hover(true)
+                .show(ui, "media.filter.clear", clear)
+                .clicked
+            {
+                self.filter = MediaFilter::default();
+            }
+        }
     }
 
     // ----------------------------------------------------------- Breadcrumb
@@ -1619,5 +1857,71 @@ fn ui_tile_parts(tile: Rect, thumb_h: f32, show_path: bool) -> TileParts {
         tile,
         thumb_rect: Rect::new(tile.x, tile.y, tile.w, thumb_h),
         show_path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label_idx(label: MediaLabel) -> usize {
+        MediaLabel::ALL.iter().position(|c| *c == label).unwrap()
+    }
+
+    #[test]
+    fn empty_filter_is_inactive_and_passes_everything() {
+        let f = MediaFilter::default();
+        assert!(!f.active());
+        assert!(f.matches(MediaKind::Video, None, 0));
+        assert!(f.matches(MediaKind::Audio, Some(MediaLabel::Red), 3));
+        assert!(f.matches(MediaKind::Image, None, 7));
+    }
+
+    #[test]
+    fn kind_filter_keeps_only_selected_types() {
+        let mut f = MediaFilter::default();
+        f.audio = true;
+        assert!(f.active());
+        assert!(f.matches(MediaKind::Audio, None, 0));
+        assert!(!f.matches(MediaKind::Video, None, 0));
+        assert!(!f.matches(MediaKind::Image, None, 0));
+        // Mehrere Typen wirken als ODER.
+        f.video = true;
+        assert!(f.matches(MediaKind::Video, None, 0));
+        assert!(f.matches(MediaKind::Audio, None, 0));
+        assert!(!f.matches(MediaKind::Image, None, 0));
+    }
+
+    #[test]
+    fn label_filter_requires_matching_label() {
+        let mut f = MediaFilter::default();
+        f.labels[label_idx(MediaLabel::Red)] = true;
+        f.labels[label_idx(MediaLabel::Green)] = true;
+        assert!(f.matches(MediaKind::Video, Some(MediaLabel::Red), 0));
+        assert!(f.matches(MediaKind::Video, Some(MediaLabel::Green), 0));
+        assert!(!f.matches(MediaKind::Video, Some(MediaLabel::Blue), 0));
+        // Ohne Etikett fällt das Asset bei aktivem Etikett-Filter raus.
+        assert!(!f.matches(MediaKind::Video, None, 0));
+    }
+
+    #[test]
+    fn usage_filter_splits_used_and_unused() {
+        let mut f = MediaFilter::default();
+        f.usage = UsageFilter::Used;
+        assert!(f.matches(MediaKind::Video, None, 2));
+        assert!(!f.matches(MediaKind::Video, None, 0));
+        f.usage = UsageFilter::Unused;
+        assert!(f.matches(MediaKind::Video, None, 0));
+        assert!(!f.matches(MediaKind::Video, None, 1));
+    }
+
+    #[test]
+    fn combined_filters_are_anded() {
+        let mut f = MediaFilter::default();
+        f.video = true;
+        f.usage = UsageFilter::Used;
+        assert!(f.matches(MediaKind::Video, None, 1));
+        assert!(!f.matches(MediaKind::Video, None, 0)); // Video, aber unbenutzt
+        assert!(!f.matches(MediaKind::Audio, None, 1)); // verwendet, aber Audio
     }
 }

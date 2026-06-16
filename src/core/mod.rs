@@ -13,6 +13,7 @@ pub mod frame_cache;
 pub mod grade;
 pub mod interop;
 pub mod keyboard;
+pub mod lut;
 pub mod marker;
 pub mod multicam;
 pub mod pixbuf;

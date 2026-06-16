@@ -306,6 +306,9 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::new("subtitle.addAtPlayhead", "Mod+U"),
         Keybinding::new("subtitle.importSrt", "Mod+Alt+U"),
         Keybinding::new("subtitle.exportSrt", "Mod+Shift+U"),
+        // Segment am Playhead teilen / mit Nachbarn zusammenführen.
+        Keybinding::new("subtitle.split", "Mod+Shift+K"),
+        Keybinding::new("subtitle.merge", "Mod+Shift+J"),
         Keybinding::when("timeline.deleteSelected", "Delete", "panel == 'timeline'"),
         Keybinding::when("timeline.deleteSelected", "Backspace", "panel == 'timeline'"),
         Keybinding::when("timeline.rippleDelete", "Shift+Delete", "panel == 'timeline'"),
@@ -320,6 +323,10 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::new("timeline.liftRange", ";"),
         Keybinding::new("timeline.extractRange", "'"),
         Keybinding::new("timeline.matchFrame", "F"),
+        // Extend Edit (Premiere „E"): die nächste Schnittkante auf den
+        // Ziel-Spuren bis zum Playhead ziehen. Tastaturgetrieben, panel-
+        // unabhängig wie die übrigen Three-Point-Edits.
+        Keybinding::new("timeline.extendEdit", "E"),
         Keybinding::when("timeline.copy", "Mod+C", "panel == 'timeline'"),
         Keybinding::when("timeline.cut", "Mod+X", "panel == 'timeline'"),
         Keybinding::when("timeline.paste", "Mod+V", "panel == 'timeline'"),
@@ -329,6 +336,12 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::when("timeline.stepForward", "ArrowRight", "panel == 'timeline'"),
         Keybinding::when("timeline.stepBackward5", "Shift+ArrowLeft", "panel == 'timeline'"),
         Keybinding::when("timeline.stepForward5", "Shift+ArrowRight", "panel == 'timeline'"),
+        // Feinpositionierung: Auswahl bzw. (Ripple/Rolling) aktive Kante um
+        // 1 Frame (Alt+Pfeil) bzw. 5 Frames (Alt+Shift+Pfeil) verschieben.
+        Keybinding::when("clip.nudgeLeft", "Alt+ArrowLeft", "panel == 'timeline'"),
+        Keybinding::when("clip.nudgeRight", "Alt+ArrowRight", "panel == 'timeline'"),
+        Keybinding::when("clip.nudgeLeftMany", "Alt+Shift+ArrowLeft", "panel == 'timeline'"),
+        Keybinding::when("clip.nudgeRightMany", "Alt+Shift+ArrowRight", "panel == 'timeline'"),
         Keybinding::when("timeline.prevEdit", "ArrowUp", "panel == 'timeline'"),
         Keybinding::when("timeline.nextEdit", "ArrowDown", "panel == 'timeline'"),
         Keybinding::when("clip.prevKeyframe", "Shift+ArrowUp", "panel == 'timeline'"),
@@ -355,6 +368,13 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::when("multicam.angle7", "7", "multicamActive"),
         Keybinding::when("multicam.angle8", "8", "multicamActive"),
         Keybinding::when("multicam.angle9", "9", "multicamActive"),
+        // Spuren verwalten — in allen Presets gleich, auf die Timeline begrenzt.
+        // Räumliche Mnemonik: Videospur oben (↑), Audiospur unten (↓), passend
+        // zur Workspace-Familie Mod+Alt+←/→. Entfernen auf Entf/Rück.
+        Keybinding::when("timeline.addVideoTrack", "Mod+Alt+ArrowUp", "panel == 'timeline'"),
+        Keybinding::when("timeline.addAudioTrack", "Mod+Alt+ArrowDown", "panel == 'timeline'"),
+        Keybinding::when("timeline.removeTrack", "Mod+Alt+Delete", "panel == 'timeline'"),
+        Keybinding::when("timeline.removeTrack", "Mod+Alt+Backspace", "panel == 'timeline'"),
     ]
 }
 
@@ -385,6 +405,8 @@ fn playback_bindings(clear_in_out: &str) -> Vec<Keybinding> {
         Keybinding::new("playback.setInPoint", "I"),
         Keybinding::new("playback.setOutPoint", "O"),
         Keybinding::new("playback.clearInOut", clear_in_out),
+        // Loop-Wiedergabe (mnemonisch zur J/K/L-Shuttle-Familie).
+        Keybinding::new("playback.toggleLoop", "Shift+L"),
     ]
 }
 
@@ -423,6 +445,9 @@ fn editron_preset() -> KeymapPreset {
         Keybinding::new("clip.toggleEffects", "Mod+Shift+E"),
         Keybinding::new("clip.copyAttributes", "Mod+Alt+C"),
         Keybinding::new("clip.pasteAttributes", "Mod+Alt+V"),
+        // Farbe — nur die Farbkorrektur kopieren/einfügen (Resolve-Workflow).
+        Keybinding::new("color.copyGrade", "Mod+Shift+C"),
+        Keybinding::new("color.pasteGrade", "Mod+Shift+V"),
         // Audio — "=" zusätzlich zu "+" (siehe Zoom-Kommentar oben).
         Keybinding::new("timeline.clipGainUp", "Alt++"),
         Keybinding::new("timeline.clipGainUp", "Alt+="),
