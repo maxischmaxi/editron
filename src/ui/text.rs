@@ -71,8 +71,6 @@ pub struct FontHandle {
     font: Font,
     /// Logische Pixelgröße (CSS px) — Bezug für `measure()` und das Layout.
     pub size: f32,
-    /// Physikalische Pixelgröße für `draw_text_ex` (= `size × ui_scale`).
-    pub render_size: f32,
     /// Zeilenhöhe (CSS line-height der Tailwind-Stufe, logisch).
     pub line_height: f32,
 }
@@ -103,7 +101,6 @@ impl FontHandle {
         FontHandle {
             font,
             size,
-            render_size: size * scale,
             line_height,
         }
     }
@@ -156,28 +153,58 @@ pub struct Fonts {
     pub mono_11: FontHandle, // Timeline-Lineal
 }
 
-impl Fonts {
-    /// Lädt alle Atlanten in physikalischer Auflösung für den gegebenen
-    /// UI-Scale. Bei einem Scale-Wechsel (Monitorwechsel/Override) ruft der
-    /// Mainloop dies erneut auf und ersetzt den `Fonts`-Wert.
-    pub fn load(rl: &mut RaylibHandle, thread: &RaylibThread, scale: f32) -> Fonts {
-        let chars = codepoints();
+/// Einmalig per fontconfig aufgelöste Font-Dateipfade. Bei jedem Neu-Rastern
+/// der Atlanten (Scale-Wechsel) wiederverwendet — so entfallen die 5
+/// fontconfig-Lookups pro Rebuild (die teuer und scale-unabhängig sind).
+#[derive(Clone)]
+pub struct FontPaths {
+    sans_reg: String,
+    sans_med: String,
+    sans_semi: String,
+    sans_bold: String,
+    mono_reg: String,
+}
+
+impl FontPaths {
+    /// fontconfig-Lookups (einmal beim Start).
+    pub fn resolve() -> FontPaths {
         let sans_reg = resolve_font(SANS_STACK, FC_REGULAR).expect("kein Sans-Font gefunden");
         let sans_med = resolve_font(SANS_STACK, FC_MEDIUM).unwrap_or_else(|| sans_reg.clone());
         let sans_semi = resolve_font(SANS_STACK, FC_SEMIBOLD).unwrap_or_else(|| sans_med.clone());
         let sans_bold = resolve_font(SANS_STACK, FC_BOLD).unwrap_or_else(|| sans_semi.clone());
         let mono_reg = resolve_font(MONO_STACK, FC_REGULAR).unwrap_or_else(|| sans_reg.clone());
+        FontPaths {
+            sans_reg,
+            sans_med,
+            sans_semi,
+            sans_bold,
+            mono_reg,
+        }
+    }
+}
 
+impl Fonts {
+    /// Rastert alle Atlanten in physikalischer Auflösung für `scale` aus bereits
+    /// aufgelösten Pfaden. Bei einem Scale-Wechsel (Live-Drag/Monitorwechsel)
+    /// ruft der Mainloop dies erneut auf und ersetzt den `Fonts`-Wert — ohne
+    /// erneuten fontconfig-Query.
+    pub fn load_with(
+        rl: &mut RaylibHandle,
+        thread: &RaylibThread,
+        scale: f32,
+        p: &FontPaths,
+    ) -> Fonts {
+        let chars = codepoints();
         Fonts {
-            sans_12: FontHandle::load(rl, thread, &sans_reg, 12.0, 16.0, scale, &chars),
-            sans_12_medium: FontHandle::load(rl, thread, &sans_med, 12.0, 16.0, scale, &chars),
-            sans_12_bold: FontHandle::load(rl, thread, &sans_bold, 12.0, 16.0, scale, &chars),
-            sans_14: FontHandle::load(rl, thread, &sans_reg, 14.0, 20.0, scale, &chars),
-            sans_14_semibold: FontHandle::load(rl, thread, &sans_semi, 14.0, 20.0, scale, &chars),
-            sans_16: FontHandle::load(rl, thread, &sans_reg, 16.0, 24.0, scale, &chars),
-            sans_16_semibold: FontHandle::load(rl, thread, &sans_semi, 16.0, 24.0, scale, &chars),
-            mono_12: FontHandle::load(rl, thread, &mono_reg, 12.0, 16.0, scale, &chars),
-            mono_11: FontHandle::load(rl, thread, &mono_reg, 11.0, 14.0, scale, &chars),
+            sans_12: FontHandle::load(rl, thread, &p.sans_reg, 12.0, 16.0, scale, &chars),
+            sans_12_medium: FontHandle::load(rl, thread, &p.sans_med, 12.0, 16.0, scale, &chars),
+            sans_12_bold: FontHandle::load(rl, thread, &p.sans_bold, 12.0, 16.0, scale, &chars),
+            sans_14: FontHandle::load(rl, thread, &p.sans_reg, 14.0, 20.0, scale, &chars),
+            sans_14_semibold: FontHandle::load(rl, thread, &p.sans_semi, 14.0, 20.0, scale, &chars),
+            sans_16: FontHandle::load(rl, thread, &p.sans_reg, 16.0, 24.0, scale, &chars),
+            sans_16_semibold: FontHandle::load(rl, thread, &p.sans_semi, 16.0, 24.0, scale, &chars),
+            mono_12: FontHandle::load(rl, thread, &p.mono_reg, 12.0, 16.0, scale, &chars),
+            mono_11: FontHandle::load(rl, thread, &p.mono_reg, 11.0, 14.0, scale, &chars),
         }
     }
 }

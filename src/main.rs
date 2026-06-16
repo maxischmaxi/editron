@@ -1382,7 +1382,15 @@ fn main() {
     // gerastert; bei Laufzeit-Wechsel (Monitorwechsel) baut die Schleife sie neu.
     let mut ui_scale = app.state.settings.resolve_ui_scale(detected_dpi_scale(&rl));
     app.state.app.ui_scale = ui_scale;
-    let mut fonts = ui::text::Fonts::load(&mut rl, &thread, ui_scale);
+    // Font-Pfade einmalig per fontconfig auflösen; bei Scale-Wechseln nur die
+    // Atlanten neu rastern (kein erneuter Lookup).
+    let font_paths = ui::text::FontPaths::resolve();
+    let mut fonts = ui::text::Fonts::load_with(&mut rl, &thread, ui_scale, &font_paths);
+    // Auflösung, in der die Atlanten aktuell vorliegen (kann der angewandten
+    // `ui_scale` während eines Live-Drags hinterherhinken) + Zeitpunkt der
+    // letzten Scale-Änderung (Debounce fürs teure Neu-Rastern).
+    let mut fonts_scale = ui_scale;
+    let mut scale_changed_at = f64::NEG_INFINITY;
     let icons = ui::icons::IconSet::load();
     let mut grade_shader = ui::grade_shader::GradeShader::load(&mut rl, &thread);
 
@@ -1543,11 +1551,23 @@ fn main() {
             .state
             .settings
             .resolve_ui_scale(detected_dpi_scale(&rl));
-        if (new_scale - ui_scale).abs() > 0.005 {
+        // Angewandte Skalierung SOFORT übernehmen — das ist billig (Layout +
+        // Textgröße rechnen rein logisch × scale).
+        if (new_scale - ui_scale).abs() > 0.0005 {
             ui_scale = new_scale;
-            fonts = ui::text::Fonts::load(&mut rl, &thread, ui_scale);
+            scale_changed_at = now;
         }
         app.state.app.ui_scale = ui_scale;
+        // Atlanten erst NACHrastern, wenn die Skalierung ~120 ms zur Ruhe gekommen
+        // ist. Während eines Live-Drags (1%-Schritte des UI-Scale-Reglers) bleibt
+        // der alte Atlas stehen und wird bilinear skaliert (OVERSAMPLE=2 federt
+        // das ab); das teure Neu-Rastern (9 Atlanten) läuft genau einmal am Ende
+        // statt pro Frame. Text bleibt dabei korrekt dimensioniert, weil `Ui::text`
+        // immer zur aktuellen `ui_scale` zeichnet.
+        if (ui_scale - fonts_scale).abs() > 0.0005 && now - scale_changed_at > 0.12 {
+            fonts = ui::text::Fonts::load_with(&mut rl, &thread, ui_scale, &font_paths);
+            fonts_scale = ui_scale;
+        }
 
         let mut input = InputState::collect(&mut rl, &mut app.persist.clock);
         if let Some(pos) = test_mouse {

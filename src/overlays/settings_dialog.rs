@@ -52,6 +52,9 @@ pub struct SettingsDialog {
     synced_ffprobe: String,
     /// Letztes Validierungs-Ergebnis der ffmpeg-Pfade `(ok, Text)`.
     ffmpeg_status: Option<(bool, String)>,
+    /// UI-Scale wurde live geändert, aber noch nicht auf die Platte geschrieben
+    /// (Persistenz erst beim Loslassen — kein fsync je Frame während des Ziehens).
+    ui_scale_dirty: bool,
 }
 
 impl SettingsDialog {
@@ -356,9 +359,11 @@ impl SettingsDialog {
         let auto = state.settings.ui_scale.is_none();
         if checkbox(ui, "settings.uiAuto", row, "Automatisch (Monitor-DPI)", auto, true).clicked {
             if auto {
-                // Auf manuell umschalten: aktuellen effektiven Scale übernehmen.
-                let snap = (state.app.ui_scale / 0.25).round() * 0.25;
-                state.settings.ui_scale = Some(snap.clamp(UI_SCALE_MIN, UI_SCALE_MAX));
+                // Auf manuell umschalten: aktuellen effektiven Scale (auf ganze
+                // Prozent gerundet) übernehmen — kein Sprung beim Umschalten.
+                let cur = ((state.app.ui_scale * 100.0).round() / 100.0)
+                    .clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+                state.settings.ui_scale = Some(cur);
             } else {
                 state.settings.ui_scale = None;
             }
@@ -369,12 +374,19 @@ impl SettingsDialog {
             let r = labeled_row(ui, &mut body, "Faktor");
             let mut v = scale as f64;
             let (track, label_cell) = split_value(r);
-            slider(ui, "settings.uiScale", track, &mut v, UI_SCALE_MIN as f64, UI_SCALE_MAX as f64, theme::ACCENT);
-            // Auf 0,25er-Raster einrasten.
-            let snapped = ((v / 0.25).round() * 0.25).clamp(UI_SCALE_MIN as f64, UI_SCALE_MAX as f64) as f32;
-            if (snapped - scale).abs() > 0.001 {
+            let it = slider(ui, "settings.uiScale", track, &mut v, UI_SCALE_MIN as f64, UI_SCALE_MAX as f64, theme::ACCENT);
+            // Auf ganze Prozent (1%-Schritte) einrasten und LIVE anwenden.
+            let snapped = ((v * 100.0).round() / 100.0)
+                .clamp(UI_SCALE_MIN as f64, UI_SCALE_MAX as f64) as f32;
+            if (snapped - scale).abs() > 0.0005 {
                 state.settings.ui_scale = Some(snapped);
+                // Während des Ziehens nur im RAM anwenden (treibt den Scale); die
+                // Datei erst beim Loslassen schreiben (sonst fsync je Frame).
+                self.ui_scale_dirty = true;
+            }
+            if self.ui_scale_dirty && !it.held {
                 state.settings.save();
+                self.ui_scale_dirty = false;
             }
             ui.text_left(
                 &format!("{:.0}%", snapped * 100.0),

@@ -78,6 +78,15 @@ impl AsRef<ffi::Texture2D> for RawTex {
 // ------------------------------------------------------------------ Shader
 
 /// GLSL-330-Header: raylibs Default-Vertex-Stage liefert fragTexCoord.
+///
+/// WICHTIG: Jeder Pass-Shader MUSS sein `finalColor` mit `* colDiffuse * fragColor`
+/// abschließen (raylib-Konvention). Für den eigentlichen Effekt-Render ist das ein
+/// No-Op (gezeichnet wird immer mit `Color::WHITE` ⇒ beide = 1), ABER: Die fx-Pässe
+/// laufen ZWISCHEN den Frames in RenderTextures, und raylibs gebatchtes 2D-Rendering
+/// kann den fx-Shader als aktives GL-Programm in das anschließende BILDSCHIRM-Rendering
+/// durchsickern lassen. Ein fx-Shader OHNE `fragColor` ignoriert dann die Füllfarbe und
+/// rendert jede `ui.fill()` als nackte weiße Shapes-Textur — das verursachte das
+/// weiße Titlebar-Flackern beim Scrubben eines Clips mit animiertem Farbeffekt.
 const HEADER: &str = "#version 330\nin vec2 fragTexCoord;\nin vec4 fragColor;\nuniform sampler2D texture0;\nuniform vec4 colDiffuse;\nout vec4 finalColor;\n";
 
 /// Gemeinsame Helfer (formelgleich mit `core/effects.rs`).
@@ -112,7 +121,7 @@ void main() {
     }
     acc /= wsum;
     vec3 rgb = acc.a > 1e-5 ? acc.rgb / acc.a : vec3(0.0);
-    finalColor = vec4(clamp(rgb, 0.0, 1.0), clamp(acc.a, 0.0, 1.0));
+    finalColor = vec4(clamp(rgb, 0.0, 1.0), clamp(acc.a, 0.0, 1.0)) * colDiffuse * fragColor;
 }
 "#;
 
@@ -131,7 +140,7 @@ void main() {
     } else {
         c = vec3(1.0) - (vec3(1.0) - o.rgb) * (vec3(1.0) - b.rgb * amount);
     }
-    finalColor = vec4(clamp(c, 0.0, 1.0), o.a);
+    finalColor = vec4(clamp(c, 0.0, 1.0), o.a) * colDiffuse * fragColor;
 }
 "#;
 
@@ -164,7 +173,7 @@ void main() {
         float g = (l - 0.2126 * r - 0.0722 * b) / 0.7152;
         c = vec3(r, g, b);
     }
-    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a * mask);
+    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a * mask) * colDiffuse * fragColor;
 }
 "#;
 
@@ -175,7 +184,7 @@ void main() {
     float l = lumaOf(tex.rgb);
     float m = softEdge(lumaParams.x - lumaParams.y * 0.5, lumaParams.y, l);
     if (lumaParams.z > 0.5) { m = 1.0 - m; }
-    finalColor = vec4(tex.rgb, tex.a * m);
+    finalColor = vec4(tex.rgb, tex.a * m) * colDiffuse * fragColor;
 }
 "#;
 
@@ -192,7 +201,7 @@ void main() {
         * (1.0 - softEdge(1.0 - edges.y - feather, feather, uv.x))
         * softEdge(edges.z, feather, uv.y)
         * (1.0 - softEdge(1.0 - edges.w - feather, feather, uv.y));
-    finalColor = vec4(tex.rgb, tex.a * m);
+    finalColor = vec4(tex.rgb, tex.a * m) * colDiffuse * fragColor;
 }
 "#;
 
@@ -200,7 +209,7 @@ const FLIP_SRC: &str = r#"
 uniform vec2 flipAxes; // horizontal, vertikal (0/1)
 void main() {
     vec2 uv = mix(fragTexCoord, vec2(1.0) - fragTexCoord, flipAxes);
-    finalColor = texture(texture0, uv);
+    finalColor = texture(texture0, uv) * colDiffuse * fragColor;
 }
 "#;
 
@@ -215,7 +224,7 @@ void main() {
     vec2 sp = floor(px / blockSize) * blockSize + vec2(centerOff);
     sp = min(sp, contentSize - vec2(0.5));
     if (srcFlip > 0.5) { sp.y = contentSize.y - sp.y; }
-    finalColor = texture(texture0, sp / contentSize);
+    finalColor = texture(texture0, sp / contentSize) * colDiffuse * fragColor;
 }
 "#;
 
@@ -224,7 +233,7 @@ uniform float levels;
 void main() {
     vec4 tex = texture(texture0, fragTexCoord);
     vec3 c = floor(tex.rgb * (levels - 1.0) + 0.5) / (levels - 1.0);
-    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a);
+    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a) * colDiffuse * fragColor;
 }
 "#;
 
@@ -233,7 +242,7 @@ uniform float mixAmt;
 void main() {
     vec4 tex = texture(texture0, fragTexCoord);
     vec3 c = tex.rgb + (vec3(1.0) - 2.0 * tex.rgb) * mixAmt;
-    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a);
+    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a) * colDiffuse * fragColor;
 }
 "#;
 
@@ -248,7 +257,7 @@ void main() {
     vec3 c = vec3(dot(hueR, c0), dot(hueG, c0), dot(hueB, c0));
     float l = lumaOf(c);
     c = vec3(l) + (c - vec3(l)) * satLight.x + vec3(satLight.y * 0.5);
-    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a);
+    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a) * colDiffuse * fragColor;
 }
 "#;
 
@@ -257,7 +266,7 @@ uniform vec2 bc; // Helligkeit (−1…1), Kontrast-Steigung
 void main() {
     vec4 tex = texture(texture0, fragTexCoord);
     vec3 c = (tex.rgb - 0.5) * bc.y + 0.5 + bc.x * 0.5;
-    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a);
+    finalColor = vec4(clamp(c, 0.0, 1.0), tex.a) * colDiffuse * fragColor;
 }
 "#;
 

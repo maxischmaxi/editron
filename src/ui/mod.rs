@@ -78,6 +78,12 @@ pub struct UiPersist {
     pub clock: input::InputClock,
     /// Offenes Select-Dropdown (zentral, wird im Overlay-Pass gerendert).
     pub select: widgets::select::SelectHost,
+    /// Kontinuierlicher (ungerasterter) Wert des gerade gezogenen Sliders.
+    /// Nur ein Widget kann „active“ sein, daher genügt ein Slot. Wird beim
+    /// Drücken neu gesetzt und während des Ziehens rein aus der Mausbewegung
+    /// fortgeschrieben (siehe [`widgets::slider`]) — so koppelt ein Slider, der
+    /// das Layout selbst skaliert (HiDPI-Faktor), nicht über die Position zurück.
+    pub slider_grab: f64,
 }
 
 /// Befehl, der nach dem UI-Pass über die Registry ausgeführt wird.
@@ -565,12 +571,16 @@ impl<'f, 'rl> Ui<'f, 'rl> {
     pub fn text(&mut self, text: &str, pos: Vector2, color: Color, kind: FontKind) {
         let font = self.font(kind);
         let s = self.scale;
-        // Auf das PHYSIKALISCHE Pixelraster runden (scharfe Grundlinie), mit
-        // dem physikalischen `render_size` zeichnen (Atlas ist physikalisch
-        // gerastert).
+        // Physikalische Schriftgröße zur AKTUELLEN Skalierung (logisch × scale) —
+        // bewusst NICHT die beim Rastern gespeicherte Atlas-Auflösung. So bleibt
+        // Text exakt dimensioniert und platziert, auch wenn der Atlas (nach einem
+        // Scale-Wechsel) noch in einer anderen Auflösung vorliegt und erst
+        // verzögert neu gerastert wird — raylib skaliert die Glyphen dann
+        // bilinear (OVERSAMPLE federt das ab). Grundlinie aufs Pixelraster runden.
+        let render_size = font.size * s;
         let p = v2((pos.x * s).round(), (pos.y * s).round());
         self.d
-            .draw_text_ex(font.raw(), text, p, font.render_size, 0.0, color);
+            .draw_text_ex(font.raw(), text, p, render_size, 0.0, color);
     }
 
     /// Text vertikal zentriert in `rect`, linksbündig ab `rect.x`.

@@ -271,9 +271,24 @@ pub fn slider(
     let track = Rect::new(rect.x + 5.0, rect.y + rect.h / 2.0 - 2.0, rect.w - 10.0, 4.0);
     ui.fill_rounded(track, 2.0, theme::SURFACE_4);
 
-    if it.held {
-        let t = ((ui.input.mouse.x - track.x) / track.w).clamp(0.0, 1.0) as f64;
-        *value = min + t * (max - min);
+    if it.held && max > min {
+        if ui.input.left_pressed {
+            // Erster Frame des Drags: auf die angeklickte Position springen
+            // (absolut — das Layout ist hier noch unverändert, also korrekt).
+            let t = ((ui.input.mouse.x - track.x) / track.w).clamp(0.0, 1.0) as f64;
+            ui.persist.slider_grab = min + t * (max - min);
+        } else {
+            // Folgeframes: NUR die Mausbewegung integrieren, niemals erneut die
+            // absolute Position lesen. Ein Slider, der das UI-Layout selbst
+            // verändert (z. B. die HiDPI-Skalierung), würde sonst zurückkoppeln:
+            // Das Re-Zentrieren des Tracks und das Neu-Mappen der logischen Maus
+            // (mouse ÷ scale) verschöbe den Wert auch bei stillstehender Hand und
+            // ließe das UI an den Rasterkanten hin- und herspringen. `mouse_delta`
+            // ist rein physisch (≈0 bei stillstehender Hand) und damit immun.
+            let dv = (ui.input.mouse_delta.x as f64 / track.w as f64) * (max - min);
+            ui.persist.slider_grab = (ui.persist.slider_grab + dv).clamp(min, max);
+        }
+        *value = ui.persist.slider_grab;
     }
 
     let t = if max > min {

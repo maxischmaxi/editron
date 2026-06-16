@@ -587,6 +587,12 @@ pub struct ProgramMonitorPanel {
     scrub_active: bool,
     gizmo: TransformGizmo,
     title_editor: crate::panels::title_editor::TitleTextEditor,
+    /// Zuletzt gesehene Live-Canvas-Auflösung + Zeitpunkt ihrer letzten Änderung
+    /// — Debounce für die an die Titel-Engine gemeldete `program_canvas`: Während
+    /// eines Fenster-/Panel-Resizes ändert sich die Pixelgröße pro Frame, was
+    /// sonst jeden sichtbaren Titel/Untertitel pro Frame neu rastern würde.
+    canvas_target: (u32, u32),
+    canvas_target_since: f64,
 }
 
 /// Sichere Ränder über das Programm-Canvas zeichnen: Action-Safe (90 %)
@@ -945,11 +951,26 @@ impl Panel for ProgramMonitorPanel {
         let _ = stage.cut_bottom(SCRUBBER_H);
         let seq = app.timeline.settings;
         let canvas = stage.fit_contain(seq.width as f32, seq.height as f32);
-        // Canvas-Auflösung an die Titel-Engine melden (Raster in Anzeigegröße).
-        app.monitor.program_canvas = (
+        // Canvas-Auflösung an die Titel-Engine melden (Raster in Anzeigegröße),
+        // ABER gedebounced: Bei einem Resize ändert sich die Pixelgröße pro Frame;
+        // die Titel-Engine würde sonst jeden sichtbaren Titel/Untertitel pro Frame
+        // neu rastern + hochladen. Erst übernehmen, wenn die Größe ~120 ms stabil
+        // ist (oder beim allerersten Mal). Bis dahin bleibt der alte Raster stehen
+        // und wird auf das Live-Canvas skaliert — minimal weicher, dann scharf.
+        let live_canvas = (
             canvas.w.round().max(1.0) as u32,
             canvas.h.round().max(1.0) as u32,
         );
+        if live_canvas != self.canvas_target {
+            self.canvas_target = live_canvas;
+            self.canvas_target_since = ui.time;
+        }
+        let settled = ui.time - self.canvas_target_since > 0.12;
+        if app.monitor.program_canvas == (0, 0)
+            || (settled && app.monitor.program_canvas != live_canvas)
+        {
+            app.monitor.program_canvas = live_canvas;
+        }
 
         let layers = resolve_program_layers(ui, app, canvas, t);
 
