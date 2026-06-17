@@ -268,6 +268,7 @@ impl TimelineStore {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         };
         let id = clip.id.clone();
         self.selected_clip_ids = vec![id.clone()];
@@ -425,6 +426,7 @@ impl TimelineStore {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         }
     }
 

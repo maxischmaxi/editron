@@ -936,6 +936,7 @@ mod visual_dump {
                 quad,
                 opacity: 1.0,
                 mask: None,
+                blend_mode: compose::BlendMode::Normal,
             }],
             2,
         );

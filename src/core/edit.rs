@@ -373,6 +373,7 @@ mod tests {
                 markers: vec![],
                 nest_seq: None,
                 multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
             };
             c.name = "alt".into();
             c
@@ -427,6 +428,7 @@ mod tests {
             markers: vec![],
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         });
         s.timeline.set_playhead(6.0); // Medienzeit 2 + (6−4) = 4
         assert!(match_frame(&mut s).is_none());
@@ -487,5 +489,6 @@ fn source_clip(
         markers,
         nest_seq: None,
         multicam: None,
+        blend_mode: crate::core::compose::BlendMode::default(),
     }
 }

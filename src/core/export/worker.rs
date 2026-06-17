@@ -1960,6 +1960,8 @@ struct LayerStream {
     content: (usize, usize, usize, usize),
     /// Übergangs-Fenster dieses Layers (Exportzeit).
     transitions: Vec<PlanTransition>,
+    /// Ebenen-Mischmodus (Normal = Src-over).
+    blend_mode: crate::core::compose::BlendMode,
 }
 
 /// Ein Layer des Compositing-Pfads: Decoder-Stream, Farbfläche (Dip) oder
@@ -1996,6 +1998,8 @@ struct TitleLayer {
     grade: grade::GradeParams,
     luts: OwnedLutStack,
     transitions: Vec<PlanTransition>,
+    /// Ebenen-Mischmodus (Normal = Src-over).
+    blend_mode: crate::core::compose::BlendMode,
 }
 
 impl TitleLayer {
@@ -2226,6 +2230,8 @@ struct NestLayer {
     effects: Vec<EffectInstance>,
     transitions: Vec<PlanTransition>,
     frame: Vec<f32>,
+    /// Ebenen-Mischmodus (Normal = Src-over).
+    blend_mode: crate::core::compose::BlendMode,
 }
 
 impl NestLayer {
@@ -2332,6 +2338,7 @@ fn render_segment_composited(
                 grade: grade_params,
                 luts: title_luts,
                 transitions: plan_layer.transitions.clone(),
+                blend_mode: plan_layer.blend_mode,
             }));
             continue;
         }
@@ -2394,6 +2401,7 @@ fn render_segment_composited(
                     }
                     b
                 },
+                blend_mode: plan_layer.blend_mode,
             }));
             continue;
         }
@@ -2505,6 +2513,7 @@ fn render_segment_composited(
             luts: resolve_export_luts(&plan_layer.grade),
             content,
             transitions: plan_layer.transitions.clone(),
+            blend_mode: plan_layer.blend_mode,
         }));
     }
 
@@ -2555,6 +2564,7 @@ fn render_segment_composited(
                         quad,
                         opacity,
                         mask: t_fx.mask.map(|m| compose::mask_to_pixels(&m, tw, th)),
+                        blend_mode: l.blend_mode,
                     })
                 }
                 SegLayer::Solid { data, transitions } => {
@@ -2575,6 +2585,7 @@ fn render_segment_composited(
                         },
                         opacity: t_fx.opacity,
                         mask: None,
+                        blend_mode: compose::BlendMode::Normal,
                     })
                 }
                 // Identische Quad-Mathematik wie Streams: der Titel-Raster
@@ -2598,6 +2609,7 @@ fn render_segment_composited(
                         quad,
                         opacity,
                         mask: t_fx.mask.map(|m| compose::mask_to_pixels(&m, tw, th)),
+                        blend_mode: l.blend_mode,
                     })
                 }
                 // Nest: das innere Frame (innere Auflösung) wird contain-fit
@@ -2619,6 +2631,7 @@ fn render_segment_composited(
                         quad,
                         opacity,
                         mask: t_fx.mask.map(|m| compose::mask_to_pixels(&m, tw, th)),
+                        blend_mode: l.blend_mode,
                     })
                 }
             })

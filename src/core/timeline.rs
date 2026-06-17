@@ -2,6 +2,7 @@
 //! Snapshot-History (Undo/Redo) und allen Editier-Operationen.
 
 use crate::core::animation::{AnimatedParam, ClipFx, Interp, Keyframe, ParamId, ParamRef};
+use crate::core::compose::BlendMode;
 use crate::core::effects::{EffectInstance, EffectKind};
 use crate::core::grade::ColorGrade;
 use crate::core::marker::Marker;
@@ -280,6 +281,11 @@ pub struct TimelineClip {
     /// aufgelöst (Formatversion 12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multicam: Option<crate::core::multicam::MulticamClip>,
+    /// Ebenen-Mischmodus des Clips (Normal = klassisches Src-over). Wirkt auf
+    /// das Compositing im Programmmonitor und Export; der GPU-Blend-Shader
+    /// zieht formelgleich nach. Formatversion 17.
+    #[serde(default)]
+    pub blend_mode: BlendMode,
     /// Felder einer NEUEREN Editron-Version, die dieser Build noch nicht kennt.
     /// Werden beim Speichern unverändert zurückgeschrieben (Vorwärtskompatibilität,
     /// siehe `core::project::ProjectFile::extra`). `Clone` erhält sie, sodass
@@ -526,6 +532,7 @@ pub fn new_media_clip(
         markers: Vec::new(),
         nest_seq: None,
         multicam: None,
+        blend_mode: BlendMode::default(),
     }
 }
 
@@ -580,6 +587,7 @@ pub fn test_clip(track_id: &str) -> TimelineClip {
         nest_seq: None,
         multicam: None,
         extra: Default::default(),
+        blend_mode: BlendMode::default(),
     }
 }
 

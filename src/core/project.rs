@@ -75,7 +75,10 @@ pub const PROJECT_FORMAT: &str = "editron-project";
 /// Begrenzen den Effekt auf eine Region; mehrere werden vereinigt. Ältere App-
 /// Versionen ignorieren das Feld; v15-und-älter-Dateien laden unverändert
 /// (Effekt wirkt aufs ganze Bild).
-pub const PROJECT_VERSION: u32 = 16;
+/// v17: Ebenen-Mischmodi (`clips[].blendMode` = Normal/Multiply/Screen/
+/// Overlay/Add/...). W3C-Compositing-Formeln, formelgleich auf CPU und GPU.
+/// `#[serde(default)]` ⇒ ältere Dateien laden als Normal (klassisches Src-over).
+pub const PROJECT_VERSION: u32 = 17;
 const RECENT_LIMIT: usize = 10;
 
 // ------------------------------------------------------------------- Format
@@ -863,6 +866,7 @@ mod tests {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         });
         // Standbild mit unendlicher Quelldauer (Infinity-Roundtrip).
         let track_id = state.timeline.tracks[1].id.clone();
@@ -891,6 +895,7 @@ mod tests {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         });
         // Rückwärts-Clip mit 37 % muss den Roundtrip exakt überleben.
         let track_id = state.timeline.tracks[0].id.clone();
@@ -919,6 +924,7 @@ mod tests {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         });
         // Übergang (Einblenden auf clip-1) muss den Roundtrip überleben.
         state.timeline.transitions.push({
@@ -1333,6 +1339,7 @@ mod tests {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         };
         let mut orphan = good.clone();
         orphan.id = "orphan".into();
@@ -1534,6 +1541,7 @@ mod tests {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         });
 
         let dir = std::env::temp_dir().join(format!("editron-proj-title-{}", std::process::id()));

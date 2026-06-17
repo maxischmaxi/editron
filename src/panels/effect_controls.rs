@@ -23,6 +23,7 @@ use crate::state::AppState;
 use crate::theme;
 use crate::ui::geom::{v2, Rect};
 use crate::ui::widgets::scroll::ScrollState;
+use crate::ui::widgets::select::select;
 use crate::ui::widgets::text_input::TextInputState;
 use crate::ui::widgets::IconButton;
 use crate::ui::{DragPayload, FontKind, Ui};
@@ -143,6 +144,10 @@ enum Row {
         pref: ParamRef,
     },
     UniformToggle {
+        clip: usize,
+    },
+    /// Ebenen-Mischmodus des Clips (Dropdown über `BlendMode::ALL`).
+    BlendMode {
         clip: usize,
     },
     /// Kopfzeile einer Effekt-Instanz (Bypass/Reorder/Reset/Löschen).
@@ -527,6 +532,7 @@ impl Panel for EffectControlsPanel {
             });
             if self.open_opacity {
                 rows.push(Row::Param { clip: vi, pref: ParamId::Opacity.into() });
+                rows.push(Row::BlendMode { clip: vi });
             }
             // Video-Effekt-Stapel.
             self.push_effect_rows(&mut rows, vi, &clips[vi]);
@@ -599,6 +605,7 @@ impl Panel for EffectControlsPanel {
             CommitEdit(String, ParamRef, f64),
             Reset(ResetKind, usize),
             SetUniform(String, bool),
+            SetBlendMode(String, compose::BlendMode),
             /// Einzelwert mit Undo-Schritt setzen (Bool-Toggles).
             SetValue(String, ParamRef, f64),
             SelectKey { key: SelKey, additive: bool, toggle: bool },
@@ -936,6 +943,30 @@ impl Panel for EffectControlsPanel {
                         acts.push(Act::SetUniform(
                             clip_ref.id.clone(),
                             !clip_ref.fx.uniform_scale,
+                        ));
+                    }
+                    y += ROW_H;
+                }
+                Row::BlendMode { clip } => {
+                    let clip_ref = &clips[*clip];
+                    let label = Rect::new(x + 30.0, y, 84.0, ROW_H);
+                    ui.text_left("Mischmodus", label, theme::TEXT_2, FontKind::Sans12);
+                    let field = Rect::new(
+                        label.right() + 4.0,
+                        y + (ROW_H - 24.0) / 2.0,
+                        (left_w - 8.0 - (label.right() + 4.0 - x)).clamp(80.0, 168.0),
+                        24.0,
+                    );
+                    let options: Vec<&str> =
+                        compose::BlendMode::ALL.iter().map(|m| m.label()).collect();
+                    let cur = compose::BlendMode::ALL
+                        .iter()
+                        .position(|m| *m == clip_ref.blend_mode)
+                        .unwrap_or(0);
+                    if let Some(idx) = select(ui, ("fx.blend", &clip_ref.id), field, &options, cur) {
+                        acts.push(Act::SetBlendMode(
+                            clip_ref.id.clone(),
+                            compose::BlendMode::ALL[idx],
                         ));
                     }
                     y += ROW_H;
@@ -1508,6 +1539,9 @@ impl Panel for EffectControlsPanel {
                 }
                 Act::SetUniform(id, uniform) => {
                     app.timeline.fx_set_uniform_scale(&id, uniform)
+                }
+                Act::SetBlendMode(id, mode) => {
+                    app.timeline.set_clip_blend_mode(&id, mode)
                 }
                 Act::SelectKey { key, additive, toggle } => {
                     let already = self.is_selected(&key.clip_id, &key.pref, key.t);

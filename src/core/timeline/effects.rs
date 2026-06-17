@@ -227,6 +227,19 @@ impl TimelineStore {
         }
     }
 
+    /// Ebenen-Mischmodus eines Clips setzen (undoable). Wirkt auf das
+    /// Compositing in Programmmonitor und Export (siehe `core::compose`).
+    pub fn set_clip_blend_mode(&mut self, id: &str, mode: crate::core::compose::BlendMode) {
+        let Some(clip) = self.clip(id) else { return };
+        if clip.blend_mode == mode {
+            return;
+        }
+        self.push_history();
+        if let Some(clip) = self.fx_clip_mut(id) {
+            clip.blend_mode = mode;
+        }
+    }
+
     pub fn fx_set_uniform_scale(&mut self, id: &str, uniform: bool) {
         let Some(clip) = self.clip(id) else { return };
         if clip.fx.uniform_scale == uniform {

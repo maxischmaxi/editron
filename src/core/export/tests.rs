@@ -60,6 +60,7 @@
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         }
     }
 

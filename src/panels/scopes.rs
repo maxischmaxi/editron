@@ -164,6 +164,7 @@ impl ScopesPanel {
                 quad: l.quad,
                 opacity: l.opacity,
                 mask: None,
+                blend_mode: compose::BlendMode::Normal,
             })
             .collect();
         compose::composite_frame(&mut canvas, CANVAS_W, CANVAS_H, &frames, 1);

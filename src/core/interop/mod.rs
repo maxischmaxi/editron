@@ -733,6 +733,7 @@ fn emit_track_clips(
                     markers: Vec::new(),
                     nest_seq: None,
                     multicam: None,
+                    blend_mode: crate::core::compose::BlendMode::default(),
                 };
                 let clip_id = clip.id.clone();
                 if let (Some(tr), Some(prev)) = (pending_transition.take(), last_clip_id.clone()) {

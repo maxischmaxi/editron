@@ -6,6 +6,7 @@
 //! Interaktion in einem Pass.
 
 pub mod fx_shader;
+pub mod blend_shader;
 pub mod geom;
 pub mod grade_shader;
 pub mod icons;
@@ -143,6 +144,11 @@ pub struct Ui<'f, 'rl> {
     /// Effekt-Renderer (Lesezugriff auf die `fx://`-Ergebnis-Texturen);
     /// wird in main() nach `Ui::new` gesetzt.
     pub fx_outputs: Option<&'f fx_shader::EffectChainRenderer>,
+    /// Raylib-Thread-Handle (für `begin_texture_mode` im Blend-Compositor);
+    /// wird in main() nach `Ui::new` gesetzt.
+    pub thread: Option<&'f raylib::RaylibThread>,
+    /// Blend-Compositor (Lesezugriff auf das Ergebnis; Mainloop setzt es).
+    pub blend_compositor: Option<&'f blend_shader::BlendCompositor>,
     /// Effekt-Jobs für den nächsten Frame (Pendant zu `texture_requests`;
     /// der Mainloop verarbeitet sie zwischen den Frames).
     pub effect_requests: Vec<fx_shader::EffectJob>,
@@ -188,6 +194,8 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             grade_shader: None,
             lut_textures: None,
             fx_outputs: None,
+            thread: None,
+            blend_compositor: None,
             effect_requests: Vec::new(),
             scrub_requests: Vec::new(),
             clip_stack: Vec::new(),
@@ -749,6 +757,14 @@ impl<'f, 'rl> Ui<'f, 'rl> {
             let (tw, th) = (out.tex.width as f32, out.tex.height as f32);
             let src_h = if out.flipped { -th } else { th };
             (RawTex(out.tex), Rect::new(0.0, 0.0, tw, src_h))
+        } else if key == blend_shader::blend_output_key() {
+            // Ergebnis des Blend-Compositors (Ping-Pong-RenderTexture, vertikal
+            // gespiegelt gespeichert wie alle RenderTextures).
+            let Some(t) = self.blend_compositor.and_then(|bc| bc.output_texture()) else {
+                return false;
+            };
+            let (tw, th) = (t.width as f32, t.height as f32);
+            (RawTex(t), Rect::new(0.0, 0.0, tw, -th))
         } else {
             match self.textures.get(key) {
                 Some(tex) => {
@@ -841,6 +857,13 @@ impl<'f, 'rl> Ui<'f, 'rl> {
     pub fn fx_output_size(&self, key: &str) -> Option<(f32, f32)> {
         let out = self.fx_outputs?.output(key)?;
         Some((out.tex.width as f32, out.tex.height as f32))
+    }
+
+    /// Hat der Blend-Compositor ein Ergebnis? (Größe in physischen Pixeln.)
+    pub fn blend_output_size(&self) -> Option<(f32, f32)> {
+        let bc = self.blend_compositor?;
+        let tex = bc.output_texture()?;
+        Some((tex.width as f32, tex.height as f32))
     }
 
     /// Bild als object-contain (Monitore): eingepasst, Seitenverhältnis bleibt.

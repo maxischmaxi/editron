@@ -1,16 +1,3 @@
-==== G15 — Blend-Modi im Compositor (Multiply/Screen/Overlay/Add/...) ====
-Ziel: Ebenen-Mischmodi ueber das reine Src-over hinaus. Schaltet ein grosses kreatives Feld frei
-(Lichteffekte, Texturen, Doppelbelichtungen) bei sehr geringem Aufwand relativ zur Wirkung.
-Fertig wenn: Pro Clip ein BlendMode-Enum (Normal/Multiply/Screen/Overlay/Add/Darken/Lighten/SoftLight/...).
-Die Mischformel an der zentralen Compositing-Stelle waehlt nach Modus; GPU-Compositing im Monitor zieht
-formelgleich nach. Auswahl im Effekt-/Clip-Inspektor.
-Anker: EINZIGE Mischstelle ist fn composite_band in src/core/compose.rs (heute dst = src*a + dst*(1-a)).
-GPU-Gegenstueck im Monitor-Compositing (src/panels/monitor.rs / src/ui/fx_shader.rs). Clip-Feld am
-TimelineClip (src/core/timeline.rs).
-Konventionen: GPU==CPU formelgleich. .etron-Version erhoehen + #[serde(default)].
-Verifikation: cargo test (Multiply/Screen treffen Referenzformeln); Screenshot zweier Layer.
-Aufwand: M
-
 ==== G16 — Replace Edit (+ Fit-to-Fill / echtes 4-Punkt) ====
 Ziel: Quellmaterial in einen vorhandenen Timeline-Clip einsetzen, dabei Dauer UND Position erhalten
 (Replace), mit Match-Frame-Sync; plus Fit-to-Fill (4-Punkt), das die Geschwindigkeit so setzt, dass die

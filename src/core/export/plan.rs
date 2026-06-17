@@ -78,6 +78,8 @@ pub struct VideoLayerPlan {
     /// Verschachtelte Sequenz statt Medien: die Ebene wird rekursiv aus
     /// `RenderPlan::nests` komponiert (ID der inneren Sequenz).
     pub nest_seq: Option<String>,
+    /// Ebenen-Mischmodus (Normal = Src-over).
+    pub blend_mode: crate::core::compose::BlendMode,
 }
 
 impl VideoLayerPlan {
@@ -810,6 +812,7 @@ pub(crate) fn plan_video_segments(
         solid: Option<[u8; 3]>,
         title: Option<crate::core::title::TitleSpec>,
         nest_seq: Option<String>,
+        blend_mode: crate::core::compose::BlendMode,
     }
 
     let frame_of = |t: f64| -> u64 {
@@ -882,6 +885,7 @@ pub(crate) fn plan_video_segments(
                 solid: None,
                 title: Some(spec),
                 nest_seq: None,
+                blend_mode: clip.blend_mode,
             });
             continue;
         }
@@ -923,6 +927,7 @@ pub(crate) fn plan_video_segments(
                 solid: None,
                 title: Some(spec.clone()),
                 nest_seq: None,
+                blend_mode: clip.blend_mode,
             });
             continue;
         }
@@ -961,6 +966,7 @@ pub(crate) fn plan_video_segments(
                 solid: None,
                 title: None,
                 nest_seq: Some(inner_id.clone()),
+                blend_mode: clip.blend_mode,
             });
             continue;
         }
@@ -1018,6 +1024,7 @@ pub(crate) fn plan_video_segments(
                 solid: None,
                 title: None,
                 nest_seq: None,
+                blend_mode: clip.blend_mode,
             });
             continue;
         }
@@ -1064,6 +1071,7 @@ pub(crate) fn plan_video_segments(
             solid: None,
             title: None,
             nest_seq: None,
+            blend_mode: clip.blend_mode,
         });
     }
 
@@ -1157,6 +1165,7 @@ pub(crate) fn plan_video_segments(
                 solid: Some(color),
                 title: None,
                 nest_seq: None,
+                blend_mode: crate::core::compose::BlendMode::Normal,
             });
         }
     }
@@ -1228,6 +1237,7 @@ pub(crate) fn plan_video_segments(
                 solid: c.solid,
                 title: c.title.clone(),
                 nest_seq: c.nest_seq.clone(),
+                blend_mode: c.blend_mode,
             })
             .collect();
         // Fortsetzungen desselben Layer-Stapels verschmelzen (spart

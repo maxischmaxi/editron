@@ -158,6 +158,7 @@ impl TimelineStore {
                 markers: Vec::new(),
                 nest_seq: Some(seq_id.clone()),
                 multicam: None,
+                blend_mode: crate::core::compose::BlendMode::default(),
             };
             inserted_ids.push(vid.id.clone());
             clips.push(vid);
@@ -198,6 +199,7 @@ impl TimelineStore {
                     markers: Vec::new(),
                     nest_seq: Some(seq_id.clone()),
                     multicam: None,
+                    blend_mode: crate::core::compose::BlendMode::default(),
                 };
                 inserted_ids.push(aud.id.clone());
                 clips.push(aud);

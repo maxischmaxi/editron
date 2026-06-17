@@ -52,6 +52,7 @@ pub struct ResolvedLayer {
     pub extend_k: f64,
     /// Titel-Clip (Doppelklick öffnet die Textbearbeitung im Monitor).
     pub is_title: bool,
+    pub blend_mode: crate::core::compose::BlendMode,
 }
 
 /// Ein Eintrag der Programm-Zeichenliste: Clip-Layer oder Farbfläche (Dip).
@@ -770,6 +771,7 @@ fn resolve_program_layers(
                 mask,
                 extend_k,
                 is_title: clip.is_title(),
+                blend_mode: clip.blend_mode,
             }))
         })
         .collect()
@@ -1023,14 +1025,74 @@ impl Panel for ProgramMonitorPanel {
                 mask: None,
                 extend_k: 1.0,
                 is_title: false,
+                blend_mode: crate::core::compose::BlendMode::Normal,
             })]
         } else {
             Vec::new()
         };
-        let stage_layers: &[StageLayer] = if cache_layers.is_empty() {
-            &layers
-        } else {
+
+        // ---- Blend-Compositing (Mischmodi) ----
+        let has_blend = layers.iter().any(|l| match l {
+            StageLayer::Clip(c) => c.blend_mode != crate::core::compose::BlendMode::Normal,
+            _ => false,
+        });
+        if has_blend && !app.monitor.program_from_cache {
+            let sc = ui.scale;
+            let req = crate::ui::blend_shader::BlendCompositingRequest {
+                canvas_w: ((canvas.w * sc).round() as u32).max(1),
+                canvas_h: ((canvas.h * sc).round() as u32).max(1),
+                layers: layers.iter().filter_map(|l| match l {
+                    StageLayer::Clip(c) => Some(crate::ui::blend_shader::BlendLayerRequest {
+                        tex_key: c.tex_key.clone(),
+                        cx: ((c.quad.cx - canvas.x as f64) * sc as f64) as f32,
+                        cy: ((c.quad.cy - canvas.y as f64) * sc as f64) as f32,
+                        w: (c.quad.w * sc as f64) as f32,
+                        h: (c.quad.h * sc as f64) as f32,
+                        rot_deg: c.quad.rot_deg as f32,
+                        alpha: c.alpha,
+                        blend_mode: c.blend_mode,
+                        grade: c.grade.clone(),
+                        input_lut: c.input_lut.clone(),
+                        look_lut: c.look_lut.clone(),
+                    }),
+                    StageLayer::Solid { .. } => None,
+                }).collect(),
+            };
+            app.monitor.blend_request = Some(req);
+        }
+        let blend_layers: Vec<StageLayer> =
+            if has_blend && ui.blend_output_size().is_some() && !app.monitor.program_from_cache {
+                vec![StageLayer::Clip(ResolvedLayer {
+                    clip_id: String::new(),
+                    tex_key: crate::ui::blend_shader::blend_output_key().to_string(),
+                    quad: LayerQuad {
+                        cx: (canvas.x + canvas.w / 2.0) as f64,
+                        cy: (canvas.y + canvas.h / 2.0) as f64,
+                        w: canvas.w as f64,
+                        h: canvas.h as f64,
+                        rot_deg: 0.0,
+                    },
+                    alpha: 255,
+                    grade: crate::core::grade::precompute(
+                        &crate::core::grade::ColorGrade::default(),
+                    ),
+                    input_lut: None,
+                    look_lut: None,
+                    mask: None,
+                    extend_k: 1.0,
+                    is_title: false,
+                    blend_mode: crate::core::compose::BlendMode::Normal,
+                })]
+            } else {
+                Vec::new()
+            };
+
+        let stage_layers: &[StageLayer] = if !cache_layers.is_empty() {
             &cache_layers
+        } else if !blend_layers.is_empty() {
+            &blend_layers
+        } else {
+            &layers
         };
 
         let chrome = MonitorChrome {

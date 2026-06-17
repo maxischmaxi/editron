@@ -11,6 +11,7 @@ use crate::core::animation::ClipFx;
 use crate::core::timeline::{TimelineClip, TimelineStore, TrackKind};
 use crate::core::title::TitleSpec;
 use crate::core::transitions::{self, TransitionFx, TransitionRole};
+use serde::{Deserialize, Serialize};
 
 /// Ausgewertete Parameter zu einem Zeitpunkt (Deckkraft normiert 0–1).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -210,6 +211,148 @@ pub fn layer_title_spec(timeline: &TimelineStore, clip: &TimelineClip) -> Option
     let sub = clip.subtitle.as_ref()?;
     Some(timeline.subtitle_style(&clip.track_id).title_spec(&sub.text))
 }
+/// Ebenen-Mischmodus eines Clips (Porter-Duff-Erweiterung der einfachen
+/// Src-over-Komposition). Die Mischformel `B(src, dst)` wird pro Kanal
+/// angewendet und anschließend per `result = B·α + dst·(1−α)` mit der
+/// Layer-Deckkraft komponiert (W3C Compositing & Blending Level 1).
+/// GPU- und CPU-Pfad verwenden **dieselbe Formel** — der Modus-Code im
+/// GLSL-Blend-Shader ist eine 1:1-Übersetzung von [`BlendMode::blend`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    /// Linear Dodge (Add): `min(1, src + dst)`.
+    Add,
+    Darken,
+    Lighten,
+    SoftLight,
+    HardLight,
+    Difference,
+    Exclusion,
+}
+
+impl BlendMode {
+    /// Anzeige-Label für den Inspektor (deutsch, wie die übrigen UI-Strings).
+    pub fn label(&self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiplizieren",
+            BlendMode::Screen => "Ineinanderkopieren",
+            BlendMode::Overlay => "Überlagern",
+            BlendMode::Add => "Hinzufügen",
+            BlendMode::Darken => "Abdunkeln",
+            BlendMode::Lighten => "Aufhellen",
+            BlendMode::SoftLight => "Weiches Licht",
+            BlendMode::HardLight => "Hartes Licht",
+            BlendMode::Difference => "Differenz",
+            BlendMode::Exclusion => "Ausschluss",
+        }
+    }
+
+    /// Alle Modi als statische Liste (für Drop-down-Auswahl).
+    pub const ALL: [BlendMode; 11] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Add,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+    ];
+
+    /// Modus aus einem Schlüssel (case-insensitiv, camelCase-Namen wie in der
+    /// serde-Repräsentation) — für Test-Flags/CLI. None bei Unbekanntem.
+    pub fn from_key(key: &str) -> Option<BlendMode> {
+        Some(match key.trim().to_ascii_lowercase().as_str() {
+            "normal" => BlendMode::Normal,
+            "multiply" => BlendMode::Multiply,
+            "screen" => BlendMode::Screen,
+            "overlay" => BlendMode::Overlay,
+            "add" | "lineardodge" => BlendMode::Add,
+            "darken" => BlendMode::Darken,
+            "lighten" => BlendMode::Lighten,
+            "softlight" => BlendMode::SoftLight,
+            "hardlight" => BlendMode::HardLight,
+            "difference" => BlendMode::Difference,
+            "exclusion" => BlendMode::Exclusion,
+            _ => return None,
+        })
+    }
+
+    /// Integer-Code für den GPU-Shader (gleiche Reihenfolge wie `ALL`).
+    pub fn shader_code(&self) -> i32 {
+        match self {
+            BlendMode::Normal => 0,
+            BlendMode::Multiply => 1,
+            BlendMode::Screen => 2,
+            BlendMode::Overlay => 3,
+            BlendMode::Add => 4,
+            BlendMode::Darken => 5,
+            BlendMode::Lighten => 6,
+            BlendMode::SoftLight => 7,
+            BlendMode::HardLight => 8,
+            BlendMode::Difference => 9,
+            BlendMode::Exclusion => 10,
+        }
+    }
+
+    /// Mischformel `B(src, dst)` pro Kanal (W3C Compositing & Blending).
+    /// `src` und `dst` sind RGB-Werte im Bereich 0..1.
+    pub fn blend(&self, src: f32, dst: f32) -> f32 {
+        match self {
+            BlendMode::Normal => src,
+            BlendMode::Multiply => src * dst,
+            BlendMode::Screen => src + dst - src * dst,
+            BlendMode::Overlay => {
+                if dst <= 0.5 {
+                    2.0 * src * dst
+                } else {
+                    1.0 - 2.0 * (1.0 - src) * (1.0 - dst)
+                }
+            }
+            BlendMode::Add => (src + dst).min(1.0),
+            BlendMode::Darken => src.min(dst),
+            BlendMode::Lighten => src.max(dst),
+            BlendMode::SoftLight => {
+                if src <= 0.5 {
+                    dst - (1.0 - 2.0 * src) * dst * (1.0 - dst)
+                } else {
+                    let d = if dst <= 0.25 {
+                        ((16.0 * dst - 12.0) * dst + 4.0) * dst
+                    } else {
+                        dst.sqrt()
+                    };
+                    dst + (2.0 * src - 1.0) * (d - dst)
+                }
+            }
+            BlendMode::HardLight => {
+                if src <= 0.5 {
+                    2.0 * src * dst
+                } else {
+                    1.0 - 2.0 * (1.0 - src) * (1.0 - dst)
+                }
+            }
+            BlendMode::Difference => (src - dst).abs(),
+            BlendMode::Exclusion => src + dst - 2.0 * src * dst,
+        }
+    }
+}
+
+/// Komposition mit Deckkraft: `result = B(src, dst) · α + dst · (1 − α)`.
+/// Die EINZIGE Mischstelle im CPU-Pfad (`composite_band`) ruft diese
+/// Funktion auf; der GPU-Blend-Shader implementiert sie formelgleich.
+#[inline]
+pub fn blend_composite(mode: BlendMode, src: f32, dst: f32, alpha: f32) -> f32 {
+    mode.blend(src, dst) * alpha + dst * (1.0 - alpha)
+}
 
 /// Übergangs-Auswirkung auf ein Layer-Quad anwenden: Versatz in Frame-
 /// Bruchteilen, Skalierung um den Quad-Mittelpunkt. Eine Formel für GPU-
@@ -259,6 +402,8 @@ pub struct CpuLayerFrame<'a> {
     /// Sichtbarer Canvas-Ausschnitt in Pixeln (x0, y0, x1, y1 — Ende
     /// exklusiv); None = voll sichtbar. Harte Kante (Wipe-Übergang).
     pub mask: Option<(usize, usize, usize, usize)>,
+    /// Ebenen-Mischmodus (Normal = klassisches Src-over).
+    pub blend_mode: BlendMode,
 }
 
 /// Alle Layer (unten → oben) auf ein opakes f32-Canvas mischen; Zeilenbänder
@@ -363,7 +508,7 @@ fn composite_band(band: &mut [f32], w: usize, y0: usize, rows: usize, layer: &Cp
             }
             let dst = &mut row[x * 4..x * 4 + 4];
             for c in 0..3 {
-                dst[c] = sample[c] * alpha + dst[c] * (1.0 - alpha);
+                dst[c] = blend_composite(layer.blend_mode, sample[c], dst[c], alpha);
             }
             // Canvas bleibt opak (Hintergrund ist deckend schwarz).
             dst[3] = 1.0;
@@ -422,8 +567,8 @@ pub fn composite_sequence_frame(
     let layers = visible_program_layers(timeline, t);
     // Layer-Puffer am Leben halten und am Ende in einem Rutsch komponieren.
     let mut buffers: Vec<Vec<f32>> = Vec::new();
-    // (quad, opacity, mask, layer_w, layer_h)
-    type Meta = (LayerQuad, f64, Option<(usize, usize, usize, usize)>, usize, usize);
+    // (quad, opacity, mask, layer_w, layer_h, blend_mode)
+    type Meta = (LayerQuad, f64, Option<(usize, usize, usize, usize)>, usize, usize, BlendMode);
     let mut metas: Vec<Meta> = Vec::new();
 
     for layer in &layers {
@@ -449,6 +594,7 @@ pub fn composite_sequence_frame(
                     None,
                     2,
                     2,
+                    BlendMode::Normal,
                 ));
             }
             ProgramLayer::Clip { clip, t_fx } => {
@@ -500,7 +646,7 @@ pub fn composite_sequence_frame(
                 apply_transition_to_quad(&mut quad, t_fx, w as f64, h as f64);
                 let mask = t_fx.mask.map(|m| mask_to_pixels(&m, w, h));
                 buffers.push(data);
-                metas.push((quad, opacity, mask, w, h));
+                metas.push((quad, opacity, mask, w, h, clip.blend_mode));
             }
         }
     }
@@ -508,13 +654,14 @@ pub fn composite_sequence_frame(
     let frames: Vec<CpuLayerFrame> = metas
         .iter()
         .enumerate()
-        .map(|(i, (quad, opacity, mask, lw, lh))| CpuLayerFrame {
+        .map(|(i, (quad, opacity, mask, lw, lh, bm))| CpuLayerFrame {
             data: &buffers[i],
             w: *lw,
             h: *lh,
             quad: *quad,
             opacity: *opacity,
             mask: *mask,
+            blend_mode: *bm,
         })
         .collect();
     composite_frame(&mut canvas, w, h, &frames, threads);
@@ -728,7 +875,7 @@ mod tests {
             &mut canvas,
             w,
             h,
-            &[CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0, mask: None }],
+            &[CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0, mask: None, blend_mode: BlendMode::Normal }],
             2,
         );
         assert_eq!(px(&canvas, w, 4, 4)[0], 1.0, "Mitte muss rot sein");
@@ -747,7 +894,7 @@ mod tests {
             &mut canvas,
             w,
             h,
-            &[CpuLayerFrame { data: &white, w, h, quad, opacity: 0.5, mask: None }],
+            &[CpuLayerFrame { data: &white, w, h, quad, opacity: 0.5, mask: None, blend_mode: BlendMode::Normal }],
             1,
         );
         let p = px(&canvas, w, 2, 2);
@@ -768,7 +915,7 @@ mod tests {
             &mut canvas,
             w,
             h,
-            &[CpuLayerFrame { data: &white, w, h, quad, opacity: 1.0, mask: Some(mask) }],
+            &[CpuLayerFrame { data: &white, w, h, quad, opacity: 1.0, mask: Some(mask), blend_mode: BlendMode::Normal }],
             1,
         );
         assert_eq!(px(&canvas, w, 1, 2)[0], 1.0, "links sichtbar");
@@ -788,8 +935,8 @@ mod tests {
             w,
             h,
             &[
-                CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0, mask: None },
-                CpuLayerFrame { data: &green, w, h, quad, opacity: 1.0, mask: None },
+                CpuLayerFrame { data: &red, w, h, quad, opacity: 1.0, mask: None, blend_mode: BlendMode::Normal },
+                CpuLayerFrame { data: &green, w, h, quad, opacity: 1.0, mask: None, blend_mode: BlendMode::Normal },
             ],
             1,
         );
@@ -821,5 +968,118 @@ mod tests {
         // Oben-links (-10,-10) wird zu (+10,-10) relativ zum Zentrum.
         assert!((c[0].0 - 110.0).abs() < 1e-9);
         assert!((c[0].1 - 90.0).abs() < 1e-9);
+    }
+
+    // ------------------------------------------------------ Mischmodi
+
+    /// Jeder Modus trifft die W3C-Referenzformel (`B(src, dst)`); GPU-Shader
+    /// (`ui/blend_shader.rs`) ist eine 1:1-Übersetzung dieser Funktion.
+    #[test]
+    fn blend_modes_match_reference_formulas() {
+        use BlendMode::*;
+        let eq = |a: f32, b: f32, name: &str| {
+            assert!((a - b).abs() < 1e-6, "{name}: {a} != {b}")
+        };
+        // Normal reicht die Quelle durch.
+        eq(Normal.blend(0.3, 0.7), 0.3, "normal");
+        // Multiply = s·d.
+        eq(Multiply.blend(0.5, 0.5), 0.25, "multiply");
+        eq(Multiply.blend(0.8, 0.5), 0.4, "multiply2");
+        // Screen = s + d − s·d.
+        eq(Screen.blend(0.5, 0.5), 0.75, "screen");
+        eq(Screen.blend(1.0, 0.2), 1.0, "screen-white");
+        eq(Screen.blend(0.0, 0.6), 0.6, "screen-zero");
+        // Add = min(1, s + d).
+        eq(Add.blend(0.2, 0.3), 0.5, "add");
+        eq(Add.blend(0.6, 0.6), 1.0, "add-clamp");
+        // Darken/Lighten.
+        eq(Darken.blend(0.3, 0.7), 0.3, "darken");
+        eq(Lighten.blend(0.3, 0.7), 0.7, "lighten");
+        // Overlay (= HardLight mit vertauschten Operanden).
+        eq(Overlay.blend(0.5, 0.4), 2.0 * 0.5 * 0.4, "overlay-dark");
+        eq(Overlay.blend(0.5, 0.6), 1.0 - 2.0 * 0.5 * 0.4, "overlay-light");
+        eq(HardLight.blend(0.4, 0.5), Overlay.blend(0.5, 0.4), "hardlight=overlay-swap");
+        eq(HardLight.blend(0.6, 0.5), Overlay.blend(0.5, 0.6), "hardlight2");
+        // SoftLight: neutrales Grau s=0.5 lässt d unverändert.
+        eq(SoftLight.blend(0.5, 0.4), 0.4, "softlight-neutral");
+        // Difference/Exclusion.
+        eq(Difference.blend(0.7, 0.2), 0.5, "difference");
+        eq(Exclusion.blend(0.5, 0.5), 0.5, "exclusion");
+    }
+
+    /// Komposition mit Deckkraft: `B(src,dst)·α + dst·(1−α)`.
+    #[test]
+    fn blend_composite_applies_opacity() {
+        // Multiply (0.5·0.8 = 0.4) bei α=0.5: 0.4·0.5 + 0.8·0.5 = 0.6.
+        assert!((blend_composite(BlendMode::Multiply, 0.5, 0.8, 0.5) - 0.6).abs() < 1e-6);
+        // Volle Deckkraft, Normal → reine Quelle.
+        assert!((blend_composite(BlendMode::Normal, 0.3, 0.9, 1.0) - 0.3).abs() < 1e-6);
+        // α=0 lässt das Ziel unberührt (egal welcher Modus).
+        assert!((blend_composite(BlendMode::Screen, 0.5, 0.42, 0.0) - 0.42).abs() < 1e-6);
+    }
+
+    /// Der CPU-Compositor zieht den Modus durch: grauer Layer (0,5) im Screen
+    /// über grauem Canvas (0,5) ergibt 0,75.
+    #[test]
+    fn composite_frame_honors_blend_mode() {
+        let (w, h) = (4usize, 4usize);
+        let mut canvas = vec![0.5f32; w * h * 4];
+        for px in canvas.chunks_exact_mut(4) {
+            px[3] = 1.0;
+        }
+        let gray: Vec<f32> = std::iter::repeat([0.5f32, 0.5, 0.5, 1.0])
+            .take(w * h)
+            .flatten()
+            .collect();
+        let fx = eval_fx(&ClipFx::default(), 0.0);
+        let quad = layer_quad(w as f64, h as f64, w as f64, h as f64, &fx);
+        composite_frame(
+            &mut canvas,
+            w,
+            h,
+            &[CpuLayerFrame {
+                data: &gray,
+                w,
+                h,
+                quad,
+                opacity: 1.0,
+                mask: None,
+                blend_mode: BlendMode::Screen,
+            }],
+            1,
+        );
+        let p = px(&canvas, w, 2, 2);
+        assert!((p[0] - 0.75).abs() < 1e-5, "Screen 0,5 über 0,5 = 0,75: {p:?}");
+        assert_eq!(p[3], 1.0);
+    }
+
+    /// camelCase-Serialisierung; Default = Normal (Vorwärtskompatibilität:
+    /// ältere `.etron` ohne `blendMode` laden als klassisches Src-over).
+    #[test]
+    fn blend_mode_serde_and_default() {
+        assert_eq!(BlendMode::default(), BlendMode::Normal);
+        let j = serde_json::to_string(&BlendMode::SoftLight).unwrap();
+        assert_eq!(j, "\"softLight\"");
+        let back: BlendMode = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, BlendMode::SoftLight);
+    }
+
+    /// Ein Clip mit nicht-Standard-Modus überlebt den serde-Roundtrip; fehlt
+    /// das Feld (alte Datei), lädt er als Normal.
+    #[test]
+    fn clip_blend_mode_roundtrips() {
+        let mut clip = crate::core::timeline::test_clip("track-1");
+        clip.blend_mode = BlendMode::Multiply;
+        let json = serde_json::to_string(&clip).unwrap();
+        assert!(json.contains("\"blendMode\":\"multiply\""), "{json}");
+        let back: crate::core::timeline::TimelineClip =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(back.blend_mode, BlendMode::Multiply);
+        // Feld entfernen ⇒ Default Normal.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("blendMode");
+        let old: crate::core::timeline::TimelineClip =
+            serde_json::from_value(v).unwrap();
+        assert_eq!(old.blend_mode, BlendMode::Normal);
     }
 }

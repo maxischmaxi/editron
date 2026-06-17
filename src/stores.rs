@@ -1023,6 +1023,7 @@ pub struct MonitorStore {
     /// Der Programmmonitor zeigt in diesem Frame den Sequenz-Render-Cache
     /// (ein Decoder statt Live-Compositing) — vom Player je Frame gesetzt.
     pub program_from_cache: bool,
+    pub blend_request: Option<crate::ui::blend_shader::BlendCompositingRequest>,
 }
 
 /// Performance-Telemetrie der Wiedergabe (nicht persistiert). Decode-/Upload-/
@@ -1082,6 +1083,7 @@ impl Default for MonitorStore {
             show_perf_overlay: false,
             perf: PerfStats::default(),
             program_from_cache: false,
+            blend_request: None,
         }
     }
 }

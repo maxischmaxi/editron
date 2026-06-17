@@ -3059,6 +3059,7 @@ mod tests {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         });
         state.media.select(vec!["a1".into()]);
 
@@ -3108,6 +3109,7 @@ mod tests {
             markers: Vec::new(),
             nest_seq: None,
             multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
         });
         let before = state.timeline.tracks.len();
 

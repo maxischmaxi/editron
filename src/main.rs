@@ -597,6 +597,48 @@ impl App {
                                         .collect();
                                 }
                             }
+                            // Mischmodus für Smoke-Tests, z. B.
+                            // EDITRON_TEST_BLEND="screen": dupliziert den ersten
+                            // Video-Clip auf eine neue Spur DARÜBER, setzt dessen
+                            // Mischmodus und skaliert/verschiebt ihn, damit zwei
+                            // Ebenen sichtbar übereinanderliegen (GPU-Blend-Pfad).
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_BLEND") {
+                                if let Some(mode) =
+                                    crate::core::compose::BlendMode::from_key(&spec)
+                                {
+                                    let base = self
+                                        .state
+                                        .timeline
+                                        .clips
+                                        .iter()
+                                        .find(|c| {
+                                            c.kind == crate::core::timeline::TrackKind::Video
+                                        })
+                                        .cloned();
+                                    if let Some(base) = base {
+                                        let track = self.state.timeline.add_track(
+                                            crate::core::timeline::TrackKind::Video,
+                                        );
+                                        let mut top = base.clone();
+                                        top.id = crate::core::types::new_id();
+                                        top.track_id = track;
+                                        top.link_id = None;
+                                        top.blend_mode = mode;
+                                        // Sichtbar versetzt/verkleinert, damit
+                                        // sich die Ebenen erkennbar überlagern.
+                                        use crate::core::animation::AnimatedParam;
+                                        top.fx.scale_x = AnimatedParam::fixed(68.0);
+                                        top.fx.scale_y = AnimatedParam::fixed(68.0);
+                                        top.fx.pos_x = AnimatedParam::fixed(16.0);
+                                        top.fx.pos_y = AnimatedParam::fixed(-16.0);
+                                        let mid = (base.start + base.end()) / 2.0;
+                                        self.state.timeline.clips.push(top);
+                                        self.state.timeline.selected_clip_ids =
+                                            vec![base.id.clone()];
+                                        self.state.timeline.set_playhead(mid);
+                                    }
+                                }
+                            }
                             // Effekt-Maske für Smoke-Tests, z. B.
                             // EDITRON_TEST_MASK="ellipse:cx=0.5,cy=0.5,rx=0.3,ry=0.3,feather=0.1"
                             // Hängt die Maske(n) an den ersten Video-Effekt
@@ -1541,6 +1583,8 @@ fn main() {
         return;
     }
     let mut fx_renderer = ui::fx_shader::EffectChainRenderer::load(&mut rl, &thread);
+    let mut blend_compositor = ui::blend_shader::BlendCompositor::new();
+    blend_compositor.load(&mut rl, &thread);
     // Hochgeladene 3D-LUT-Texturen (pfad-indiziert), persistent über Frames —
     // vor jedem Frame mit den von sichtbaren Clips referenzierten LUTs befüllt.
     let mut lut_gpu = ui::lut_gpu::LutGpuCache::default();
@@ -1852,6 +1896,18 @@ fn main() {
             &app.textures,
             std::mem::take(&mut pending_fx_jobs),
         );
+        // Blend-Compositing verarbeiten (zwischen den Frames, wie Effekte).
+        if let Some(req) = app.state.monitor.blend_request.take() {
+            blend_compositor.process(
+                &mut rl,
+                &thread,
+                &app.textures,
+                Some(&fx_renderer),
+                grade_shader.as_mut(),
+                Some(&lut_gpu),
+                req,
+            );
+        }
         // Audio-Scrubbing-Flag zurücksetzen: die Panels (Lineal/Scrubber)
         // setzen es im folgenden UI-Frame neu, solange aktiv gezogen wird.
         app.state.playback.scrub_active = false;
@@ -1888,6 +1944,8 @@ fn main() {
         ui.grade_shader = grade_shader.as_mut();
         ui.lut_textures = Some(&lut_gpu);
         ui.fx_outputs = Some(&fx_renderer);
+        ui.thread = Some(&thread);
+        ui.blend_compositor = Some(&blend_compositor);
 
         ui.begin_main_layer(overlay_open);
         let mut area = screen;
