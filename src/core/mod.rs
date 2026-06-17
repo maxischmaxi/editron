@@ -15,6 +15,7 @@ pub mod interop;
 pub mod keyboard;
 pub mod lut;
 pub mod marker;
+pub mod mask;
 pub mod multicam;
 pub mod pixbuf;
 pub mod playback;

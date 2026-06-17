@@ -143,6 +143,9 @@ pub struct AppStore {
     /// Aktive Farbpipette (Chroma-Key): Zielparameter, die der nächste Klick
     /// in den Programmmonitor mit der angeklickten Quellfarbe füllt.
     pub color_pick: Option<ColorPickRequest>,
+    /// Gerade im Monitor bearbeitete Effekt-Maske (Gizmo-Handles); None = das
+    /// Transform-Gizmo ist aktiv.
+    pub active_mask: Option<MaskSelection>,
     /// Übergangs-ID, deren Dauer-Eingabe die Timeline öffnen soll
     /// (gesetzt vom Kontextmenü, gelesen + geleert vom Timeline-Panel).
     pub edit_transition_duration: Option<String>,
@@ -194,6 +197,16 @@ pub struct ColorPickRequest {
     pub p_idx: usize,
 }
 
+/// Gerade im Monitor bearbeitete Maske (Effekt-Instanz eines Clips). Solange
+/// gesetzt, zeigt der Programmmonitor das Masken-Gizmo (Handles) statt des
+/// Transform-Gizmos. Vom Effekt-Panel / den `mask.*`-Commands gesetzt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskSelection {
+    pub clip_id: String,
+    pub fx_id: String,
+    pub mask_id: String,
+}
+
 impl Default for AppStore {
     fn default() -> Self {
         AppStore {
@@ -207,6 +220,7 @@ impl Default for AppStore {
             encoders: None,
             focused_panel: String::new(),
             color_pick: None,
+            active_mask: None,
             edit_transition_duration: None,
             marker_editor: None,
             bin_delete_target: None,

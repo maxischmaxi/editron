@@ -8,6 +8,7 @@ pub mod effects;
 pub mod graphics;
 pub mod info;
 pub mod markers;
+pub mod mask_gizmo;
 pub mod media_browser;
 pub mod monitor;
 pub mod scopes;

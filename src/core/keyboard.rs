@@ -463,6 +463,10 @@ fn editron_preset() -> KeymapPreset {
         // Wiedergabe-Performance
         Keybinding::new("render.inToOut", "Mod+Shift+R"),
         Keybinding::new("monitor.togglePerfOverlay", "Mod+Alt+Shift+P"),
+        // Effekt-Masken
+        Keybinding::new("mask.addEllipse", "Mod+Alt+E"),
+        Keybinding::when("mask.toggleInvert", "Mod+Alt+I", "maskEditing"),
+        Keybinding::when("mask.finishEdit", "Escape", "maskEditing && !dialogOpen"),
         // Anwendung
         Keybinding::new("app.export", "Mod+E"),
         Keybinding::new("sequence.settings", "Mod+Alt+S"),

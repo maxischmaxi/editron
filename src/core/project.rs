@@ -70,7 +70,12 @@ pub const PROJECT_FORMAT: &str = "editron-project";
 /// am -Ende). Nur die Referenz wird gespeichert; fehlt die Datei, zeigt das
 /// Farbe-Panel einen Offline-Hinweis. Ältere App-Versionen ignorieren die
 /// Felder; v14-und-älter-Dateien laden unverändert (kein LUT).
-pub const PROJECT_VERSION: u32 = 15;
+/// v16: Geometrische Effekt-Masken (`clips[].effects[].masks` = Ellipse/
+/// Rechteck/Polygon in normierten UVs, mit Feather, Invertierung, Deckkraft).
+/// Begrenzen den Effekt auf eine Region; mehrere werden vereinigt. Ältere App-
+/// Versionen ignorieren das Feld; v15-und-älter-Dateien laden unverändert
+/// (Effekt wirkt aufs ganze Bild).
+pub const PROJECT_VERSION: u32 = 16;
 const RECENT_LIMIT: usize = 10;
 
 // ------------------------------------------------------------------- Format
@@ -833,6 +838,18 @@ mod tests {
                     crate::core::effects::EffectInstance::new(crate::core::effects::EffectKind::GaussianBlur);
                 blur.params[0].upsert_key(0.5, 0.0);
                 blur.params[0].upsert_key(4.5, 60.0);
+                // Effekt-Masken (Ellipse + invertiertes Polygon) müssen den
+                // Roundtrip überleben.
+                let mut ell = crate::core::mask::Mask::new(crate::core::mask::MaskShape::Ellipse);
+                ell.center = [0.4, 0.6];
+                ell.radius = [0.25, 0.18];
+                ell.rotation = 12.0;
+                ell.feather = 0.08;
+                let mut poly = crate::core::mask::Mask::new(crate::core::mask::MaskShape::Polygon);
+                poly.points = vec![[0.1, 0.1], [0.9, 0.2], [0.7, 0.8]];
+                poly.inverted = true;
+                poly.opacity = 0.5;
+                blur.masks = vec![ell, poly];
                 let mut key =
                     crate::core::effects::EffectInstance::new(crate::core::effects::EffectKind::ChromaKey);
                 key.enabled = false;
@@ -994,6 +1011,20 @@ mod tests {
         assert_eq!(g.curves.luma.points.len(), 3);
         assert_eq!(g.curves.luma.points[1].y, 0.62);
         assert!(g.curves.red.is_identity());
+        // Effekt-Masken vollständig erhalten (Ellipse + invertiertes Polygon).
+        let masks = &file.sequences[0].timeline.clips[0].effects[0].masks;
+        assert_eq!(masks.len(), 2);
+        assert_eq!(masks[0].shape, crate::core::mask::MaskShape::Ellipse);
+        assert_eq!(masks[0].center, [0.4, 0.6]);
+        assert_eq!(masks[0].radius, [0.25, 0.18]);
+        assert_eq!(masks[0].rotation, 12.0);
+        assert_eq!(masks[0].feather, 0.08);
+        assert_eq!(masks[1].shape, crate::core::mask::MaskShape::Polygon);
+        assert_eq!(masks[1].points.len(), 3);
+        assert!(masks[1].inverted);
+        assert_eq!(masks[1].opacity, 0.5);
+        // Unmaskierter Effekt (ChromaKey) trägt keine Masken.
+        assert!(file.sequences[0].timeline.clips[0].effects[1].masks.is_empty());
         // Unveränderte Clips speichern kein fx-/grade-Feld (schlanke Datei).
         assert!(file.sequences[0].timeline.clips[1].fx.is_default());
         assert!(file.sequences[0].timeline.clips[1].grade.is_default());

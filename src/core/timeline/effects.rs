@@ -607,6 +607,114 @@ impl TimelineStore {
         }
     }
 
+    // -------------------------------------------------- Effekt-Masken
+
+    /// Findet eine Effekt-Instanz eines (entsperrten) Clips mutabel.
+    fn effect_mut<'a>(
+        clips: &'a mut [TimelineClip],
+        locked: &std::collections::HashSet<String>,
+        clip_id: &str,
+        fx_id: &str,
+    ) -> Option<&'a mut crate::core::effects::EffectInstance> {
+        clips
+            .iter_mut()
+            .find(|c| c.id == clip_id && !locked.contains(&c.track_id))?
+            .effects
+            .iter_mut()
+            .find(|e| e.id == fx_id)
+    }
+
+    /// Neue Maske an einen Effekt hängen; gibt die neue Masken-ID zurück.
+    pub fn mask_add(
+        &mut self,
+        clip_id: &str,
+        fx_id: &str,
+        shape: crate::core::mask::MaskShape,
+    ) -> Option<String> {
+        let exists = self
+            .clip(clip_id)
+            .is_some_and(|c| c.effects.iter().any(|e| e.id == fx_id));
+        if !exists {
+            return None;
+        }
+        let locked = locked_track_ids(&self.tracks);
+        // Auf MAX_MASKS deckeln (GPU-Uniform-Array-Grenze ⇒ Vorschau == Export).
+        let at_cap = Self::effect_mut(&mut self.clips, &locked, clip_id, fx_id)
+            .map(|e| e.masks.len() >= crate::core::mask::MAX_MASKS)
+            .unwrap_or(true);
+        if at_cap {
+            return None;
+        }
+        self.push_history();
+        let locked = locked_track_ids(&self.tracks);
+        let m = crate::core::mask::Mask::new(shape);
+        let id = m.id.clone();
+        Self::effect_mut(&mut self.clips, &locked, clip_id, fx_id)?
+            .masks
+            .push(m);
+        Some(id)
+    }
+
+    /// Maske von einem Effekt entfernen.
+    pub fn mask_remove(&mut self, clip_id: &str, fx_id: &str, mask_id: &str) {
+        let locked = locked_track_ids(&self.tracks);
+        let present = Self::effect_mut(&mut self.clips, &locked, clip_id, fx_id)
+            .is_some_and(|e| e.masks.iter().any(|m| m.id == mask_id));
+        if !present {
+            return;
+        }
+        self.push_history();
+        let locked = locked_track_ids(&self.tracks);
+        if let Some(e) = Self::effect_mut(&mut self.clips, &locked, clip_id, fx_id) {
+            e.masks.retain(|m| m.id != mask_id);
+        }
+    }
+
+    /// Maske mit Undo-Snapshot bearbeiten (Panel-Schalter/Slider).
+    pub fn mask_update(
+        &mut self,
+        clip_id: &str,
+        fx_id: &str,
+        mask_id: &str,
+        f: impl FnOnce(&mut crate::core::mask::Mask),
+    ) {
+        let locked = locked_track_ids(&self.tracks);
+        let present = Self::effect_mut(&mut self.clips, &locked, clip_id, fx_id)
+            .is_some_and(|e| e.masks.iter().any(|m| m.id == mask_id));
+        if !present {
+            return;
+        }
+        self.push_history();
+        self.mask_update_live(clip_id, fx_id, mask_id, f);
+    }
+
+    /// Maske OHNE Snapshot bearbeiten (laufende Drag-Geste; der Aufrufer ruft
+    /// zu Gestenbeginn `begin_fx_edit()`).
+    pub fn mask_update_live(
+        &mut self,
+        clip_id: &str,
+        fx_id: &str,
+        mask_id: &str,
+        f: impl FnOnce(&mut crate::core::mask::Mask),
+    ) {
+        let locked = locked_track_ids(&self.tracks);
+        if let Some(e) = Self::effect_mut(&mut self.clips, &locked, clip_id, fx_id) {
+            if let Some(m) = e.masks.iter_mut().find(|m| m.id == mask_id) {
+                f(m);
+            }
+        }
+    }
+
+    /// Invertierung einer Maske umschalten (mit Snapshot).
+    pub fn mask_toggle_invert(&mut self, clip_id: &str, fx_id: &str, mask_id: &str) {
+        self.mask_update(clip_id, fx_id, mask_id, |m| m.inverted = !m.inverted);
+    }
+
+    /// Maske bypassen/aktivieren (mit Snapshot).
+    pub fn mask_toggle_enabled(&mut self, clip_id: &str, fx_id: &str, mask_id: &str) {
+        self.mask_update(clip_id, fx_id, mask_id, |m| m.enabled = !m.enabled);
+    }
+
     // -------------------------------------------------- Spur-Effekte (Bus)
 
     /// Index einer editierbaren (entsperrten) Audio-Spur.

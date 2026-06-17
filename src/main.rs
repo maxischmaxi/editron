@@ -597,6 +597,54 @@ impl App {
                                         .collect();
                                 }
                             }
+                            // Effekt-Maske für Smoke-Tests, z. B.
+                            // EDITRON_TEST_MASK="ellipse:cx=0.5,cy=0.5,rx=0.3,ry=0.3,feather=0.1"
+                            // Hängt die Maske(n) an den ersten Video-Effekt
+                            // jedes Video-Clips (legt ersatzweise einen
+                            // Gaußschen Weichzeichner an) und öffnet das Gizmo.
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_MASK") {
+                                let masks = crate::core::mask::parse_test_masks(&spec);
+                                if !masks.is_empty() {
+                                    let mut first: Option<(String, String, String)> = None;
+                                    for clip in &mut self.state.timeline.clips {
+                                        if clip.kind != crate::core::timeline::TrackKind::Video {
+                                            continue;
+                                        }
+                                        if clip.effects.iter().all(|e| e.kind.is_audio()) {
+                                            // Kein Video-Effekt → Weichzeichner als
+                                            // Maskenträger (für „maskierter Blur“).
+                                            let mut blur = crate::core::effects::EffectInstance::new(
+                                                crate::core::effects::EffectKind::GaussianBlur,
+                                            );
+                                            blur.params[0] =
+                                                crate::core::animation::AnimatedParam::fixed(70.0);
+                                            clip.effects.insert(0, blur);
+                                        }
+                                        if let Some(fx) =
+                                            clip.effects.iter_mut().find(|e| !e.kind.is_audio())
+                                        {
+                                            fx.masks = masks.clone();
+                                            if first.is_none() {
+                                                if let Some(m0) = fx.masks.first() {
+                                                    first = Some((
+                                                        clip.id.clone(),
+                                                        fx.id.clone(),
+                                                        m0.id.clone(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some((clip_id, fx_id, mask_id)) = first {
+                                        self.state.app.active_mask =
+                                            Some(crate::stores::MaskSelection {
+                                                clip_id,
+                                                fx_id,
+                                                mask_id,
+                                            });
+                                    }
+                                }
+                            }
                             // Geschwindigkeit für Smoke-Tests, z. B.
                             // EDITRON_TEST_SPEED="0.5" (Faktor; negativ =
                             // rückwärts, "freeze" = Standbild) auf die

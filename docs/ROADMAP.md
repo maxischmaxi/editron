@@ -1,18 +1,3 @@
-==== G14 — Form-Masken mit Feather (pro Effekt und pro Clip) ====
-Ziel: Geometrische Masken (Ellipse, Rechteck, Polygon; spaeter Bezier-Pen) mit weicher Kante, die einen
-Effekt oder Grade auf eine Region begrenzen — invertierbar, mehrere Masken kombinierbar. Groesste einzelne
-Effekt-Luecke; blockiert Alltagsaufgaben (Gesicht verpixeln, partielle Korrektur, Compositing-Cutout).
-Fertig wenn: Maskendaten haengen an EffectInstance (bzw. am Grade); Maske wird im Monitor editierbar
-angezeigt (Handles). Maske moduliert die Effekt-/Grade-Anwendung mit Feather. Wirkt im GPU- UND CPU-Pfad.
-Mehrere Masken pro Effekt, jeweils invertierbar/addierbar.
-Anker: struct EffectInstance in src/core/effects.rs (Maskenfeld ergaenzen); per-Pixel-Anwendung in
-fn per_pixel (normierte UVs liegen vor) und im GPU-Shader src/ui/fx_shader.rs; weicher Rand analog
-vorhandener soft_edge/Feather-Helfer. Editier-Gizmo analog src/panels/transform_gizmo.rs.
-Konventionen: GPU==CPU formelgleich. .etron-Version erhoehen + #[serde(default)] + Roundtrip-Test.
-Maskeneditor als Command-getriebenes Werkzeug. EDITRON_TEST-Flag fuer einen maskierten Effekt.
-Verifikation: cargo test (Maske begrenzt Effekt korrekt, Feather-Rampe); Screenshot maskierter Blur.
-Aufwand: M-L
-
 ==== G15 — Blend-Modi im Compositor (Multiply/Screen/Overlay/Add/...) ====
 Ziel: Ebenen-Mischmodi ueber das reine Src-over hinaus. Schaltet ein grosses kreatives Feld frei
 (Lichteffekte, Texturen, Doppelbelichtungen) bei sehr geringem Aufwand relativ zur Wirkung.

@@ -11,6 +11,7 @@
 //! Inhaltsmaße), damit Vorschau und Export identisch aussehen.
 
 use crate::core::animation::AnimatedParam;
+use crate::core::mask::{self, Mask};
 use crate::core::types::new_id;
 use serde::{Deserialize, Serialize};
 
@@ -472,6 +473,11 @@ pub struct EffectInstance {
     /// mit Defaults aufgefüllt.
     #[serde(default)]
     pub params: Vec<AnimatedParam>,
+    /// Geometrische Masken: begrenzen diesen Effekt auf eine Region. Leer ⇒
+    /// Effekt wirkt aufs ganze Bild. Mehrere Masken werden vereinigt; jede ist
+    /// invertierbar (siehe [`crate::core::mask`]).
+    #[serde(default)]
+    pub masks: Vec<Mask>,
 }
 
 fn default_true() -> bool {
@@ -489,6 +495,7 @@ impl EffectInstance {
                 .iter()
                 .map(|s| AnimatedParam::fixed(s.default))
                 .collect(),
+            masks: Vec::new(),
         }
     }
 
@@ -538,6 +545,10 @@ impl EffectInstance {
                     v.clamp(s.min, s.max)
                 })
                 .collect(),
+            // Masken sind statisch (nicht keyframe-animiert) — nur aktive
+            // übernehmen, damit GPU/CPU bei „alle Masken deaktiviert“ den
+            // Effekt unmaskiert (aufs ganze Bild) anwenden.
+            masks: self.masks.iter().filter(|m| m.enabled).cloned().collect(),
         }
     }
 }
@@ -561,11 +572,13 @@ pub fn has_active_video_effects(effects: &[EffectInstance]) -> bool {
     })
 }
 
-/// Zur Medienzeit ausgewertete Parameter eines Effekts.
+/// Zur Medienzeit ausgewertete Parameter eines Effekts (+ aktive Masken).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedEffect {
     pub kind: EffectKind,
     pub values: Vec<f64>,
+    /// Aktive Masken (leer ⇒ Effekt wirkt aufs ganze Bild).
+    pub masks: Vec<Mask>,
 }
 
 impl ResolvedEffect {
@@ -647,6 +660,9 @@ pub fn apply_effects_buffer(
         if fx.is_identity() {
             continue;
         }
+        // Maskierter Effekt: Zustand VOR dem Effekt sichern, danach per
+        // Maskendeckung zurückblenden (`mix(vorher, nachher, m)`).
+        let pre_mask = (!fx.masks.is_empty()).then(|| extract_content(data, w, content));
         match fx.kind {
             EffectKind::GaussianBlur => {
                 let sigma = blur_sigma(fx.v(0), cw);
@@ -745,6 +761,43 @@ pub fn apply_effects_buffer(
             }
             // Audio-Effekte: kein Bildpfad.
             _ => {}
+        }
+        if let Some(before) = pre_mask {
+            blend_masked(data, w, content, &before, &fx.masks);
+        }
+    }
+}
+
+/// Effekt-Ergebnis (`data`) per Maskendeckung mit dem Vorzustand `before`
+/// (Inhalts-Kopie) zurückblenden: `out = mix(before, data, m)`. `m` aus
+/// [`mask::combined_mask`] in denselben Inhalts-UVs wie [`per_pixel`].
+/// Formelgleich zum GPU-Mask-Blend-Pass in `ui/fx_shader`.
+fn blend_masked(
+    data: &mut [f32],
+    w: usize,
+    content: (usize, usize, usize, usize),
+    before: &[f32],
+    masks: &[Mask],
+) {
+    let (cx, cy, cw, ch) = content;
+    if cw == 0 || ch == 0 || masks.is_empty() {
+        return;
+    }
+    let inv_cw = 1.0 / cw as f32;
+    let inv_ch = 1.0 / ch as f32;
+    for y in 0..ch {
+        let v = (y as f32 + 0.5) * inv_ch;
+        for x in 0..cw {
+            let u = (x as f32 + 0.5) * inv_cw;
+            let m = mask::combined_mask(masks, u, v);
+            if m >= 1.0 {
+                continue; // voller Effekt — nichts zurückzublenden
+            }
+            let d = ((cy + y) * w + cx + x) * 4;
+            let s = (y * cw + x) * 4;
+            for c in 0..4 {
+                data[d + c] = before[s + c] + (data[d + c] - before[s + c]) * m;
+            }
         }
     }
 }
@@ -1201,6 +1254,15 @@ mod tests {
         ResolvedEffect {
             kind,
             values: values.to_vec(),
+            masks: Vec::new(),
+        }
+    }
+
+    fn resolved_masked(kind: EffectKind, values: &[f64], masks: Vec<Mask>) -> ResolvedEffect {
+        ResolvedEffect {
+            kind,
+            values: values.to_vec(),
+            masks,
         }
     }
 
@@ -1213,6 +1275,24 @@ mod tests {
             let back: EffectInstance = serde_json::from_str(&json).unwrap();
             assert_eq!(inst, back);
         }
+    }
+
+    #[test]
+    fn effect_instance_with_masks_roundtrips_and_old_files_default_empty() {
+        use crate::core::mask::{Mask, MaskShape};
+        let mut inst = EffectInstance::new(EffectKind::GaussianBlur);
+        let mut m = Mask::new(MaskShape::Rectangle);
+        m.center = [0.3, 0.7];
+        m.corner = 0.05;
+        m.inverted = true;
+        inst.masks.push(m);
+        let json = serde_json::to_string(&inst).unwrap();
+        let back: EffectInstance = serde_json::from_str(&json).unwrap();
+        assert_eq!(inst, back);
+        // Alte Projektdateien ohne `masks` laden mit leerer Maskenliste.
+        let old = r#"{"id":"x","kind":"gaussianBlur","enabled":true,"params":[]}"#;
+        let parsed: EffectInstance = serde_json::from_str(old).unwrap();
+        assert!(parsed.masks.is_empty());
     }
 
     #[test]
@@ -1454,6 +1534,50 @@ mod tests {
         );
         assert_eq!(px(&buf, w, 0, 0)[0], 100, "Padding unangetastet");
         assert_eq!(px(&buf, w, 5, 0)[0], 155, "Inhalt invertiert");
+    }
+
+    #[test]
+    fn mask_limits_invert_to_region_with_feather_ramp() {
+        use crate::core::mask::{Mask, MaskShape};
+        // Großes graues Bild; Invert nur in einer zentralen Ellipse (harte Kante).
+        let (w, h) = (40usize, 40usize);
+        let mut mk = Mask::new(MaskShape::Ellipse);
+        mk.center = [0.5, 0.5];
+        mk.radius = [0.25, 0.25];
+        mk.feather = 0.0;
+        let mut buf = solid(w, h, [200, 200, 200, 255]);
+        apply_effects_buffer(
+            &mut buf,
+            w,
+            h,
+            (0, 0, w, h),
+            &[resolved_masked(EffectKind::Invert, &[100.0], vec![mk])],
+            2,
+        );
+        // Zentrum invertiert (200 → 55), Ecke unberührt (200).
+        assert_eq!(px(&buf, w, 20, 20)[0], 55, "Maskenzentrum invertiert");
+        assert_eq!(px(&buf, w, 0, 0)[0], 200, "außerhalb der Maske unberührt");
+
+        // Feather-Rampe: weiche Kante ⇒ Übergang zwischen voll/ungemischt.
+        let mut mk2 = Mask::new(MaskShape::Ellipse);
+        mk2.center = [0.5, 0.5];
+        mk2.radius = [0.25, 0.25];
+        mk2.feather = 0.2;
+        let mut buf2 = solid(w, h, [200, 200, 200, 255]);
+        apply_effects_buffer(
+            &mut buf2,
+            w,
+            h,
+            (0, 0, w, h),
+            &[resolved_masked(EffectKind::Invert, &[100.0], vec![mk2])],
+            2,
+        );
+        // Auf dem Weg vom Zentrum nach außen steigt der Rotwert monoton
+        // (55 voll invertiert → 200 unberührt) — die Feather-Rampe.
+        let center = px(&buf2, w, 20, 20)[0];
+        let mid = px(&buf2, w, 30, 20)[0];
+        let outer = px(&buf2, w, 38, 20)[0];
+        assert!(center < mid && mid < outer, "Rampe: {center} < {mid} < {outer}");
     }
 
     #[test]

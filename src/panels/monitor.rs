@@ -598,6 +598,7 @@ impl Panel for SourceMonitorPanel {
 pub struct ProgramMonitorPanel {
     scrub_active: bool,
     gizmo: TransformGizmo,
+    mask_gizmo: crate::panels::mask_gizmo::MaskGizmo,
     title_editor: crate::panels::title_editor::TitleTextEditor,
     /// Zuletzt gesehene Live-Canvas-Auflösung + Zeitpunkt ihrer letzten Änderung
     /// — Debounce für die an die Titel-Engine gemeldete `program_canvas`: Während
@@ -1089,6 +1090,10 @@ impl Panel for ProgramMonitorPanel {
             handle_color_pick(ui, app, stage, &clip_only, t);
         } else if self.title_editor.update(ui, app, stage, canvas, &clip_only) {
             // Texteingabe direkt im Monitor — Gizmo pausiert.
+        } else if self.mask_gizmo.update(ui, app, stage, &clip_only) {
+            // Eine sichtbare Maske wird bearbeitet — Transform-Gizmo pausiert.
+            // (Bei nicht-auflösbarer Maske gibt update() false zurück und das
+            // Transform-Gizmo übernimmt.)
         } else {
             // Direkte Manipulation des ausgewählten Clips (über den Layern).
             self.gizmo.update(ui, app, stage, canvas, &clip_only);

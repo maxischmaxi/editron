@@ -126,6 +126,8 @@ pub fn context_value(state: &AppState, key: &str) -> Value {
         "multicamActive" => {
             (state.monitor.view == crate::stores::MonitorView::Multicam).into()
         }
+        // Eine Effekt-Maske wird gerade im Monitor bearbeitet (Gizmo aktiv).
+        "maskEditing" => state.app.active_mask.is_some().into(),
         // Mindestens ein ausgewählter Clip ist ein Multicam-Clip.
         "multicamClipSelected" => state
             .timeline
@@ -324,6 +326,29 @@ fn cycle_workspace(ctx: &mut CommandCtx, offset: i32) {
 fn status(ctx: &mut CommandCtx, msg: &str) {
     let now = ctx.now;
     ctx.state.app.set_status_message(Some(msg.to_string()), now);
+}
+
+/// Ziel-Effekt für „Maske hinzufügen“: der gerade bearbeitete Masken-Effekt,
+/// sonst der erste Video-Effekt des ersten ausgewählten Clips. None, wenn kein
+/// ausgewählter Clip einen Video-Effekt trägt.
+fn mask_target_effect(state: &AppState) -> Option<(String, String)> {
+    if let Some(sel) = &state.app.active_mask {
+        let still = state
+            .timeline
+            .clip(&sel.clip_id)
+            .is_some_and(|c| c.effects.iter().any(|e| e.id == sel.fx_id));
+        if still {
+            return Some((sel.clip_id.clone(), sel.fx_id.clone()));
+        }
+    }
+    for clip_id in &state.timeline.selected_clip_ids {
+        if let Some(clip) = state.timeline.clip(clip_id) {
+            if let Some(fx) = clip.effects.iter().find(|e| !e.kind.is_audio()) {
+                return Some((clip.id.clone(), fx.id.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// Tastatur-Nudge: verschiebt die Auswahl um `frames` Frames bzw. trimmt im
@@ -1293,6 +1318,90 @@ pub fn build_registry() -> CommandRegistry {
         "Proxy-Einstellungen…",
         "Medien",
         |ctx, _| ctx.state.app.open_dialog = Some(DialogId::ProxySettings),
+    ));
+
+    // ---- Effekt-Masken (geometrische Begrenzung eines Effekts) ----
+    fn add_mask(ctx: &mut CommandCtx, shape: crate::core::mask::MaskShape) {
+        let Some((clip_id, fx_id)) = mask_target_effect(ctx.state) else {
+            status(
+                ctx,
+                "Keine Maske möglich — erst einen Clip mit Video-Effekt auswählen",
+            );
+            return;
+        };
+        // Maskenlimit je Effekt (GPU-Grenze) erreicht?
+        let at_cap = ctx
+            .state
+            .timeline
+            .clip(&clip_id)
+            .and_then(|c| c.effects.iter().find(|e| e.id == fx_id))
+            .is_some_and(|e| e.masks.len() >= crate::core::mask::MAX_MASKS);
+        if at_cap {
+            status(ctx, "Maximal 8 Masken pro Effekt erreicht");
+            return;
+        }
+        if let Some(mask_id) = ctx.state.timeline.mask_add(&clip_id, &fx_id, shape) {
+            ctx.state.app.active_mask = Some(crate::stores::MaskSelection {
+                clip_id,
+                fx_id,
+                mask_id,
+            });
+            status(ctx, &format!("{}-Maske hinzugefügt — im Monitor ziehen", shape.label()));
+        }
+    }
+    commands.push(with_when(
+        cmd("mask.addEllipse", "Maske: Ellipse", "Effekte", |ctx, _| {
+            add_mask(ctx, crate::core::mask::MaskShape::Ellipse)
+        }),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd("mask.addRectangle", "Maske: Rechteck", "Effekte", |ctx, _| {
+            add_mask(ctx, crate::core::mask::MaskShape::Rectangle)
+        }),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd("mask.addPolygon", "Maske: Polygon", "Effekte", |ctx, _| {
+            add_mask(ctx, crate::core::mask::MaskShape::Polygon)
+        }),
+        "timelineClipSelected",
+    ));
+    commands.push(with_when(
+        cmd(
+            "mask.toggleInvert",
+            "Maske invertieren",
+            "Effekte",
+            |ctx, _| {
+                if let Some(sel) = ctx.state.app.active_mask.clone() {
+                    ctx.state
+                        .timeline
+                        .mask_toggle_invert(&sel.clip_id, &sel.fx_id, &sel.mask_id);
+                    status(ctx, "Maske invertiert");
+                }
+            },
+        ),
+        "maskEditing",
+    ));
+    commands.push(with_when(
+        cmd("mask.delete", "Maske löschen", "Effekte", |ctx, _| {
+            if let Some(sel) = ctx.state.app.active_mask.take() {
+                ctx.state
+                    .timeline
+                    .mask_remove(&sel.clip_id, &sel.fx_id, &sel.mask_id);
+                status(ctx, "Maske gelöscht");
+            }
+        }),
+        "maskEditing",
+    ));
+    commands.push(with_when(
+        cmd(
+            "mask.finishEdit",
+            "Maskenbearbeitung beenden",
+            "Effekte",
+            |ctx, _| ctx.state.app.active_mask = None,
+        ),
+        "maskEditing",
     ));
 
     // ---- Wiedergabe-Performance: Render-Cache, Hardware-Decode, Overlay ----

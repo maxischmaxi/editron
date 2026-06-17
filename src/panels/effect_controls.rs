@@ -167,6 +167,18 @@ enum Row {
         clip: usize,
         fx_idx: usize,
     },
+    /// „Masken“-Leiste eines Video-Effekts: Hinzufügen-Buttons (Ellipse/
+    /// Rechteck/Polygon).
+    MaskBar {
+        clip: usize,
+        fx_idx: usize,
+    },
+    /// Eine Maske eines Effekts (Bearbeiten/Invertieren/Bypass/Löschen).
+    MaskItem {
+        clip: usize,
+        fx_idx: usize,
+        mask_idx: usize,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -416,6 +428,13 @@ impl EffectControlsPanel {
                     }
                 }
             }
+            // Masken (nur Video-Effekte): Hinzufügen-Leiste + je Maske eine Zeile.
+            if !inst.kind.is_audio() {
+                rows.push(Row::MaskBar { clip: clip_idx, fx_idx });
+                for mask_idx in 0..inst.masks.len() {
+                    rows.push(Row::MaskItem { clip: clip_idx, fx_idx, mask_idx });
+                }
+            }
         }
     }
 }
@@ -593,6 +612,11 @@ impl Panel for EffectControlsPanel {
             EffectReset(String, String),
             EffectCollapse(String),
             OpenEffectMenu { clip_id: String, fx_id: String, fx_idx: usize, count: usize },
+            MaskAdd(String, String, crate::core::mask::MaskShape),
+            MaskEdit(String, String, String),
+            MaskRemove(String, String, String),
+            MaskToggleInvert(String, String, String),
+            MaskToggleEnabled(String, String, String),
         }
         let mut acts: Vec<Act> = Vec::new();
         let mut hover_any_key = false;
@@ -765,6 +789,127 @@ impl Panel for EffectControlsPanel {
                         _ => {}
                     }
                     y += VIZ_H;
+                }
+                Row::MaskBar { clip, fx_idx } => {
+                    let clip_ref = &clips[*clip];
+                    let Some(inst) = clip_ref.effects.get(*fx_idx) else {
+                        y += ROW_H;
+                        continue;
+                    };
+                    let label_cell = Rect::new(x + 30.0, y, 90.0, ROW_H);
+                    ui.text_left("Masken", label_cell, theme::TEXT_2, FontKind::Sans12);
+                    // Hinzufügen-Buttons rechtsbündig (Polygon, Rechteck, Ellipse).
+                    let mut bx = x + left_w - 8.0;
+                    for shape in [
+                        crate::core::mask::MaskShape::Polygon,
+                        crate::core::mask::MaskShape::Rectangle,
+                        crate::core::mask::MaskShape::Ellipse,
+                    ] {
+                        bx -= 22.0;
+                        let b = Rect::new(bx, y + (ROW_H - 18.0) / 2.0, 18.0, 18.0);
+                        if IconButton::new(shape.icon())
+                            .size(12.0)
+                            .tooltip(shape.label())
+                            .show(ui, ("fx.mask.add", &inst.id, shape.key()), b)
+                            .clicked
+                        {
+                            acts.push(Act::MaskAdd(clip_ref.id.clone(), inst.id.clone(), shape));
+                        }
+                    }
+                    let plus = Rect::new(bx - 14.0, y, 12.0, ROW_H);
+                    ui.text_right("+", plus, theme::TEXT_3, FontKind::Sans12Medium);
+                    y += ROW_H;
+                }
+                Row::MaskItem { clip, fx_idx, mask_idx } => {
+                    let clip_ref = &clips[*clip];
+                    let Some(inst) = clip_ref.effects.get(*fx_idx) else {
+                        y += ROW_H;
+                        continue;
+                    };
+                    let Some(mask) = inst.masks.get(*mask_idx) else {
+                        y += ROW_H;
+                        continue;
+                    };
+                    let editing = app
+                        .app
+                        .active_mask
+                        .as_ref()
+                        .is_some_and(|s| s.mask_id == mask.id);
+                    if editing {
+                        ui.fill(
+                            Rect::new(x, y, rect.w - 12.0, ROW_H),
+                            theme::with_alpha(theme::ACCENT, 36),
+                        );
+                    }
+                    // Form-Icon + Name (eingerückt).
+                    let mut hi = Rect::new(x + 44.0, y, left_w - 52.0, ROW_H);
+                    let ic = hi.cut_left(16.0);
+                    let dim = if mask.enabled { theme::TEXT_2 } else { theme::TEXT_3 };
+                    ui.icon(mask.shape.icon(), ic, 12.0, dim);
+                    hi.cut_left(4.0);
+                    // Aktions-Buttons rechtsbündig: Löschen, Bypass, Invertieren, Bearbeiten.
+                    let mut bx = x + left_w - 8.0;
+                    let mut button = |ui: &mut Ui,
+                                      icon: &'static str,
+                                      tip: &'static str,
+                                      active: bool,
+                                      idkey: &str|
+                     -> bool {
+                        bx -= 20.0;
+                        let b = Rect::new(bx, y + (ROW_H - 18.0) / 2.0, 18.0, 18.0);
+                        IconButton::new(icon)
+                            .size(12.0)
+                            .active(active)
+                            .tooltip(tip)
+                            .show(ui, ("fx.mask.btn", &mask.id, idkey), b)
+                            .clicked
+                    };
+                    if button(ui, "trash-2", "Maske löschen", false, "del") {
+                        acts.push(Act::MaskRemove(
+                            clip_ref.id.clone(),
+                            inst.id.clone(),
+                            mask.id.clone(),
+                        ));
+                    }
+                    if button(
+                        ui,
+                        if mask.enabled { "eye" } else { "eye-off" },
+                        "Maske umgehen",
+                        mask.enabled,
+                        "eye",
+                    ) {
+                        acts.push(Act::MaskToggleEnabled(
+                            clip_ref.id.clone(),
+                            inst.id.clone(),
+                            mask.id.clone(),
+                        ));
+                    }
+                    if button(
+                        ui,
+                        "flip-horizontal-2",
+                        "Maske invertieren",
+                        mask.inverted,
+                        "inv",
+                    ) {
+                        acts.push(Act::MaskToggleInvert(
+                            clip_ref.id.clone(),
+                            inst.id.clone(),
+                            mask.id.clone(),
+                        ));
+                    }
+                    if button(ui, "move", "Maske im Monitor bearbeiten", editing, "edit") {
+                        acts.push(Act::MaskEdit(
+                            clip_ref.id.clone(),
+                            inst.id.clone(),
+                            mask.id.clone(),
+                        ));
+                    }
+                    // Name zwischen Icon und Buttons.
+                    let name = format!("{} {}", mask.shape.label(), mask_idx + 1);
+                    let name_cell = Rect::new(hi.x, y, (bx - hi.x - 6.0).max(20.0), ROW_H);
+                    let display = ui.font(FontKind::Sans12).ellipsize(&name, name_cell.w);
+                    ui.text_left(&display, name_cell, dim, FontKind::Sans12);
+                    y += ROW_H;
                 }
                 Row::UniformToggle { clip } => {
                     let clip_ref = &clips[*clip];
@@ -1420,6 +1565,15 @@ impl Panel for EffectControlsPanel {
                     app.timeline.effects_reorder(&clip_id, &fx_id, dest);
                 }
                 Act::EffectRemove(clip_id, fx_id) => {
+                    // Bearbeitete Maske dieses Effekts ggf. abwählen.
+                    if app
+                        .app
+                        .active_mask
+                        .as_ref()
+                        .is_some_and(|s| s.clip_id == clip_id && s.fx_id == fx_id)
+                    {
+                        app.app.active_mask = None;
+                    }
                     app.timeline.effects_remove(&clip_id, &fx_id);
                     self.selected_keys.clear();
                 }
@@ -1552,6 +1706,45 @@ impl Panel for EffectControlsPanel {
                             ),
                         ],
                     );
+                }
+                Act::MaskAdd(clip_id, fx_id, shape) => {
+                    if let Some(mask_id) = app.timeline.mask_add(&clip_id, &fx_id, shape) {
+                        app.app.active_mask = Some(crate::stores::MaskSelection {
+                            clip_id,
+                            fx_id,
+                            mask_id,
+                        });
+                    }
+                }
+                Act::MaskEdit(clip_id, fx_id, mask_id) => {
+                    // Bearbeiten umschalten: zweiter Klick auf dieselbe Maske beendet.
+                    let same = app
+                        .app
+                        .active_mask
+                        .as_ref()
+                        .is_some_and(|s| s.mask_id == mask_id);
+                    app.app.active_mask = if same {
+                        None
+                    } else {
+                        Some(crate::stores::MaskSelection { clip_id, fx_id, mask_id })
+                    };
+                }
+                Act::MaskRemove(clip_id, fx_id, mask_id) => {
+                    app.timeline.mask_remove(&clip_id, &fx_id, &mask_id);
+                    if app
+                        .app
+                        .active_mask
+                        .as_ref()
+                        .is_some_and(|s| s.mask_id == mask_id)
+                    {
+                        app.app.active_mask = None;
+                    }
+                }
+                Act::MaskToggleInvert(clip_id, fx_id, mask_id) => {
+                    app.timeline.mask_toggle_invert(&clip_id, &fx_id, &mask_id);
+                }
+                Act::MaskToggleEnabled(clip_id, fx_id, mask_id) => {
+                    app.timeline.mask_toggle_enabled(&clip_id, &fx_id, &mask_id);
                 }
             }
         }

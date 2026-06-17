@@ -21,6 +21,7 @@ use crate::core::effects::{
     blur_sigma, gaussian_kernel, glow_sigma, hue_matrix, pixelate_block, sharpen_sigma,
     EffectKind, ResolvedEffect,
 };
+use crate::core::mask;
 use crate::ui::textures::TextureCache;
 use raylib::color::Color;
 use raylib::consts::BlendMode;
@@ -270,6 +271,27 @@ void main() {
 }
 "#;
 
+/// Mask-Blend-Pass: blendet das maskierte Effekt-Ergebnis (`texture0` = NACHHER)
+/// per Maskendeckung mit dem Vorzustand (`texBefore` = VORHER) zurück —
+/// `mix(vorher, nachher, m)`, formelgleich zu `core/effects::blend_masked`.
+/// Wird hinter mask::MASK_GLSL gehängt (liefert `maskCoverage`).
+/// `maskFlip` = vertikale Parität des aktuellen RT (Mask-UV-Korrektur),
+/// `beforeFlip` = Paritätsdifferenz vorher/nachher (Sampling-Ausrichtung).
+const MASK_BLEND_BODY: &str = r#"
+uniform sampler2D texBefore;
+uniform float maskFlip;
+uniform float beforeFlip;
+void main() {
+    vec2 uv = fragTexCoord;
+    vec2 muv = (maskFlip > 0.5) ? vec2(uv.x, 1.0 - uv.y) : uv;
+    float m = maskCoverage(muv);
+    vec2 buv = (beforeFlip > 0.5) ? vec2(uv.x, 1.0 - uv.y) : uv;
+    vec4 a = texture(texture0, uv);
+    vec4 b = texture(texBefore, buv);
+    finalColor = mix(b, a, m) * colDiffuse * fragColor;
+}
+"#;
+
 /// Kompilierter Pass-Shader mit aufgelösten Uniform-Locations.
 struct PassShader {
     shader: Shader,
@@ -321,6 +343,8 @@ struct ShaderSet {
     invert: Option<PassShader>,
     hue_sat: Option<PassShader>,
     brightness: Option<PassShader>,
+    /// Maskierungs-Pass (begrenzt einen Effekt auf eine Region).
+    mask_blend: Option<PassShader>,
 }
 
 impl ShaderSet {
@@ -476,6 +500,17 @@ impl EffectChainRenderer {
                 invert: PassShader::load(rl, thread, "invert", INVERT_SRC, &["mixAmt"], false),
                 hue_sat: PassShader::load(rl, thread, "hueSaturation", HUE_SAT_SRC, &["hueR", "hueG", "hueB", "satLight"], true),
                 brightness: PassShader::load(rl, thread, "brightnessContrast", BRIGHTNESS_SRC, &["bc"], false),
+                mask_blend: PassShader::load(
+                    rl,
+                    thread,
+                    "maskBlend",
+                    &format!("{}{}", mask::MASK_GLSL, MASK_BLEND_BODY),
+                    &[
+                        "texBefore", "maskFlip", "beforeFlip", "uMaskCount", "uMaskA", "uMaskB",
+                        "uMaskC", "uMaskD", "uPolyPts",
+                    ],
+                    false,
+                ),
             },
             targets: HashMap::new(),
         }
@@ -559,6 +594,9 @@ impl EffectChainRenderer {
         };
 
         for fx in &job.effects {
+            // Zustand VOR diesem Effekt für die spätere Maskierung merken.
+            let prev_input = input;
+            let prev_flipped = flipped;
             match fx.kind {
                 EffectKind::GaussianBlur => {
                     let sigma = blur_sigma(fx.values.first().copied().unwrap_or(0.0), w as usize);
@@ -628,6 +666,39 @@ impl EffectChainRenderer {
                     applied_any = true;
                 }
             }
+
+            // Maskierung: hat dieser Effekt gewirkt (input geändert) und trägt
+            // er Masken, das Ergebnis per Maskendeckung mit dem Vorzustand
+            // zurückblenden — `mix(vorher, nachher, m)`, formelgleich zur CPU.
+            if !fx.masks.is_empty() && input != prev_input {
+                if let Some(ps) = shaders.mask_blend.as_mut() {
+                    let avoid: Vec<usize> = [rt_index(prev_input), rt_index(input)]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    if let Some(out_idx) = pick_free(rl, thread, target, &avoid) {
+                        let before_raw = raw_of(target, prev_input);
+                        let after_raw = raw_of(target, input);
+                        let u = mask::pack_uniforms(&fx.masks);
+                        ps.shader.set_shader_value(ps.loc("uMaskCount"), u.count);
+                        ps.shader.set_shader_value_v(ps.loc("uMaskA"), &u.a[..]);
+                        ps.shader.set_shader_value_v(ps.loc("uMaskB"), &u.b[..]);
+                        ps.shader.set_shader_value_v(ps.loc("uMaskC"), &u.c[..]);
+                        ps.shader.set_shader_value_v(ps.loc("uMaskD"), &u.d[..]);
+                        ps.shader.set_shader_value_v(ps.loc("uPolyPts"), &u.pts[..]);
+                        ps.shader
+                            .set_shader_value(ps.loc("maskFlip"), if flipped { 1.0f32 } else { 0.0 });
+                        ps.shader.set_shader_value(
+                            ps.loc("beforeFlip"),
+                            if flipped != prev_flipped { 1.0f32 } else { 0.0 },
+                        );
+                        let extra = Some((ps.loc("texBefore"), before_raw));
+                        run_pass(rl, thread, target, &mut ps.shader, after_raw, out_idx, w, h, extra);
+                        input = Input::Rt(out_idx);
+                        flipped = !flipped;
+                    }
+                }
+            }
         }
 
         let keep = match (applied_any, input) {
@@ -672,6 +743,25 @@ fn pick_one(
     input: Input,
 ) -> Option<usize> {
     let idx = (0..3usize).find(|i| input != Input::Rt(*i))?;
+    ensure_rt(rl, thread, target, idx).then_some(idx)
+}
+
+/// RT-Index eines Eingangs (None = Quelltexture).
+fn rt_index(input: Input) -> Option<usize> {
+    match input {
+        Input::Rt(i) => Some(i),
+        Input::Src => None,
+    }
+}
+
+/// Freien RT-Index (0..3) wählen, der keinen der `avoid`-Indizes belegt.
+fn pick_free(
+    rl: &mut RaylibHandle,
+    thread: &RaylibThread,
+    target: &mut FxTarget,
+    avoid: &[usize],
+) -> Option<usize> {
+    let idx = (0..3usize).find(|i| !avoid.contains(i))?;
     ensure_rt(rl, thread, target, idx).then_some(idx)
 }
 

@@ -87,6 +87,10 @@ impl TimelineStore {
                 .map(|e| {
                     let mut e = e.clone();
                     e.id = new_id();
+                    // Masken bekommen ebenfalls frische IDs (global eindeutig).
+                    for m in &mut e.masks {
+                        m.id = new_id();
+                    }
                     e
                 })
                 .collect();
