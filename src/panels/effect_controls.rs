@@ -14,7 +14,7 @@ use crate::core::animation::{AnimatedParam, Keyframe, ParamId, ParamRef, KF_TIME
 use crate::core::audio_fx;
 use crate::core::compose;
 use crate::core::effects::{EffectKind, ParamUi};
-use crate::core::timeline::{TimelineClip, TimelineStore, TrackKind};
+use crate::core::timeline::{TimelineClip, TimelineStore, TrackKind, MAX_CLIP_SPEED};
 use crate::overlays::context_menu::{CustomAction, MenuEntry, MenuItem};
 use crate::panels::color::section_header;
 use crate::panels::Panel;
@@ -184,6 +184,10 @@ enum Row {
         fx_idx: usize,
         mask_idx: usize,
     },
+    /// Geschwindigkeit/Time-Remap: Wertzeile + Retime-Kurve (clip-lokale Zeit).
+    Speed {
+        clip: usize,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -191,7 +195,11 @@ enum ResetKind {
     Motion,
     Opacity,
     Audio,
+    Speed,
 }
+
+/// Höhe der Geschwindigkeits-Zeile (Wertzelle oben + Retime-Kurve darunter).
+const SPEED_H: f32 = 64.0;
 
 pub struct EffectControlsPanel {
     /// Primärer Ziel-Clip (frischer State bei Wechsel).
@@ -212,6 +220,43 @@ pub struct EffectControlsPanel {
     /// Box-Auswahl: Startpunkt in Bildschirmkoordinaten.
     box_select: Option<Vector2>,
     ruler_drag: bool,
+    /// Zeit-Remap geöffnet?
+    open_speed: bool,
+    /// Inline-Eingabe des Tempos: (Clip, Feld).
+    speed_edit: Option<(String, TextInputState)>,
+    /// Wert-Scrubbing des Tempos.
+    speed_drag: Option<SpeedDrag>,
+    /// Keyframe-Drag in der Tempo-Kurve.
+    speed_key_drag: Option<SpeedKeyDrag>,
+}
+
+/// Laufendes Wert-Scrubbing des Tempos (Wertzelle).
+struct SpeedDrag {
+    clip_id: String,
+    /// Clip-lokale Zeit, an der editiert wird.
+    tc: f64,
+    start_value: f64,
+    start_x: f32,
+    history_pushed: bool,
+}
+
+/// Laufendes Ziehen eines Tempo-Keyframes im Lane (Zeit + Wert). Die Lane-
+/// Geometrie wird beim Gestenbeginn festgehalten, damit das Post-Loop-Update
+/// die Maus ohne den Lane-Kontext auf (tc, Tempo) abbilden kann.
+struct SpeedKeyDrag {
+    clip_id: String,
+    /// Index des gezogenen Keyframes in der Originalkurve.
+    key_idx: usize,
+    orig: Vec<Keyframe>,
+    start_mouse: Vector2,
+    history_pushed: bool,
+    lane_x: f32,
+    lane_w: f32,
+    lane_top: f32,
+    lane_bottom: f32,
+    pad: f32,
+    dur: f64,
+    vmax: f64,
 }
 
 impl Default for EffectControlsPanel {
@@ -230,6 +275,10 @@ impl Default for EffectControlsPanel {
             edit: None,
             box_select: None,
             ruler_drag: false,
+            open_speed: true,
+            speed_edit: None,
+            speed_drag: None,
+            speed_key_drag: None,
         }
     }
 }
@@ -404,8 +453,15 @@ impl EffectControlsPanel {
             if self.collapsed_fx.contains(&inst.id) {
                 continue;
             }
-            // Visualisierung über den Reglern: EQ-Kurve bzw. Kompressor-Kennlinie.
-            if matches!(inst.kind, EffectKind::Equalizer | EffectKind::Compressor) {
+            // Visualisierung über den Reglern: EQ-Kurve bzw. Kompressor-
+            // Kennlinie + GR-Meter (auch für De-Esser/Ducking).
+            if matches!(
+                inst.kind,
+                EffectKind::Equalizer
+                    | EffectKind::Compressor
+                    | EffectKind::DeEsser
+                    | EffectKind::Ducking
+            ) {
                 rows.push(Row::FxViz { clip: clip_idx, fx_idx });
             }
             let specs = inst.kind.specs();
@@ -549,6 +605,19 @@ impl Panel for EffectControlsPanel {
             // Audio-Effekt-Stapel.
             self.push_effect_rows(&mut rows, ai, &clips[ai]);
         }
+        // Geschwindigkeit / Time-Remap auf dem primären Medien-Clip (nicht für
+        // Generatoren). Video bevorzugt; bei reiner Audioauswahl der Audio-Clip.
+        if !primary.is_generator() {
+            let si = video_idx.or(audio_idx).unwrap_or(0);
+            rows.push(Row::Section {
+                key: "fx.sec.speed",
+                title: "Geschwindigkeit",
+                reset: ResetKind::Speed,
+            });
+            if self.open_speed {
+                rows.push(Row::Speed { clip: si });
+            }
+        }
 
         // ---- Kopf + Geometrie ----
         let mut area = rect;
@@ -587,6 +656,7 @@ impl Panel for EffectControlsPanel {
                 Row::Section { .. } => SECTION_H,
                 Row::EffectHeader { .. } => EFFECT_H,
                 Row::FxViz { .. } => VIZ_H,
+                Row::Speed { .. } => SPEED_H,
                 _ => ROW_H,
             })
             .sum::<f32>()
@@ -624,6 +694,15 @@ impl Panel for EffectControlsPanel {
             MaskRemove(String, String, String),
             MaskToggleInvert(String, String, String),
             MaskToggleEnabled(String, String, String),
+            // Geschwindigkeit / Time-Remap (clip-lokale Zeit `tc`).
+            SpeedToggleAnim(String, f64),
+            SpeedToggleKey(String, f64),
+            SpeedSeek(f64),
+            SpeedOpenEdit(String, f64),
+            SpeedCommitEdit(String, f64, f64),
+            SpeedBeginDrag(String, f64, f64, f32),
+            SpeedReset(String),
+            SpeedAddKeyAt(String, f64),
         }
         let mut acts: Vec<Act> = Vec::new();
         let mut hover_any_key = false;
@@ -641,6 +720,7 @@ impl Panel for EffectControlsPanel {
                         ResetKind::Motion => &mut self.open_motion,
                         ResetKind::Opacity => &mut self.open_opacity,
                         ResetKind::Audio => &mut self.open_audio,
+                        ResetKind::Speed => &mut self.open_speed,
                     };
                     section_header(ui, key, header, title, open);
                     let reset_rect = Rect::new(x + left_w - 38.0, y + 5.0, 22.0, 22.0);
@@ -652,6 +732,7 @@ impl Panel for EffectControlsPanel {
                     {
                         let clip_idx = match reset {
                             ResetKind::Audio => audio_idx.unwrap_or(0),
+                            ResetKind::Speed => video_idx.or(audio_idx).unwrap_or(0),
                             _ => video_idx.unwrap_or(0),
                         };
                         acts.push(Act::Reset(*reset, clip_idx));
@@ -782,16 +863,28 @@ impl Panel for EffectControlsPanel {
                     let area_box = Rect::new(x + 10.0, y + 6.0, (rect.w - 28.0).max(80.0), VIZ_H - 16.0);
                     ui.fill_rounded(area_box, theme::RADIUS_SM, theme::SURFACE_0);
                     ui.stroke_rounded(area_box, theme::RADIUS_SM, 1.0, theme::LINE);
+                    let gr_of = |app: &AppState| {
+                        app.audio
+                            .fx_gain_reduction
+                            .get(&inst.id)
+                            .copied()
+                            .unwrap_or(0.0)
+                    };
                     match inst.kind {
                         EffectKind::Equalizer => draw_eq_curve(ui, area_box, &values),
-                        EffectKind::Compressor => {
-                            let gr = app
-                                .audio
-                                .fx_gain_reduction
-                                .get(&inst.id)
-                                .copied()
-                                .unwrap_or(0.0);
-                            draw_comp_curve(ui, area_box, &values, gr);
+                        EffectKind::Compressor | EffectKind::Ducking => {
+                            // Specs beginnen jeweils mit [Threshold, Ratio, …] —
+                            // direkt als Kompressor-Kennlinie darstellbar.
+                            draw_comp_curve(ui, area_box, &values, gr_of(app));
+                        }
+                        EffectKind::DeEsser => {
+                            // Specs: [freq, threshold, ratio, q] → für die
+                            // Kennlinie auf [threshold, ratio, …] umlegen.
+                            let v = [
+                                values.get(1).copied().unwrap_or(-30.0),
+                                values.get(2).copied().unwrap_or(6.0),
+                            ];
+                            draw_comp_curve(ui, area_box, &v, gr_of(app));
                         }
                         _ => {}
                     }
@@ -1349,6 +1442,263 @@ impl Panel for EffectControlsPanel {
 
                     y += ROW_H;
                 }
+                Row::Speed { clip } => {
+                    let clip_ref = &clips[*clip];
+                    let dur = clip_ref.duration.max(1e-9);
+                    let animated = clip_ref.speed.is_animated();
+                    // Clip-lokale Zeit am Playhead (auf [0, dur] geklemmt).
+                    let tc = (playhead - clip_ref.start).clamp(0.0, dur);
+                    let cur = crate::core::timeline::clamp_speed(clip_ref.speed.eval(tc));
+
+                    // -- Linke Spalte: Stopwatch, Label, Nav, Wertzelle --
+                    let mut inner = Rect::new(x + 8.0, y, left_w - 16.0, ROW_H);
+                    let sw = inner.cut_left(20.0);
+                    let sw_rect = Rect::new(sw.x, y + (ROW_H - 18.0) / 2.0, 18.0, 18.0);
+                    let sw_id = ui.id(("fx.spd.sw", &clip_ref.id));
+                    let sw_it = ui.interact(sw_id, sw_rect);
+                    let sw_color = if animated {
+                        theme::ACCENT
+                    } else if sw_it.hovered {
+                        theme::TEXT_1
+                    } else {
+                        theme::with_alpha(theme::TEXT_3, 180)
+                    };
+                    ui.icon("timer", sw_rect, 14.0, sw_color);
+                    if sw_it.hovered {
+                        ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                        ui.tooltip(sw_id, sw_rect, "Time-Remap an/aus (Tempo-Keyframes)");
+                    }
+                    if sw_it.clicked {
+                        acts.push(Act::SpeedToggleAnim(clip_ref.id.clone(), tc));
+                    }
+                    inner.cut_left(4.0);
+                    let label_cell = inner.cut_left(92.0);
+                    ui.text_left("Geschwindigkeit", label_cell, theme::TEXT_2, FontKind::Sans12);
+                    inner.cut_left(6.0);
+
+                    if animated {
+                        let nav = inner.cut_right(58.0);
+                        let mut nx = nav.x;
+                        let prev_t = clip_ref.speed.prev_key_time(tc);
+                        let next_t = clip_ref.speed.next_key_time(tc);
+                        let on_key = clip_ref.speed.key_index_at(tc).is_some();
+                        let b = Rect::new(nx, y + (ROW_H - 18.0) / 2.0, 18.0, 18.0);
+                        if IconButton::new("chevron-left")
+                            .size(13.0)
+                            .disabled(prev_t.is_none())
+                            .tooltip("Zum vorherigen Keyframe")
+                            .show(ui, ("fx.spd.prev", &clip_ref.id), b)
+                            .clicked
+                        {
+                            if let Some(t) = prev_t {
+                                acts.push(Act::SpeedSeek(clip_ref.start + t));
+                            }
+                        }
+                        nx += 20.0;
+                        let b = Rect::new(nx, y + (ROW_H - 18.0) / 2.0, 18.0, 18.0);
+                        let kid = ui.id(("fx.spd.key", &clip_ref.id));
+                        let kit = ui.interact(kid, b);
+                        let (fill, line) = if on_key {
+                            (theme::ACCENT, theme::ACCENT)
+                        } else if kit.hovered {
+                            (theme::SURFACE_1, theme::TEXT_1)
+                        } else {
+                            (theme::SURFACE_1, theme::TEXT_3)
+                        };
+                        draw_diamond(ui, b.x + 9.0, b.y + 9.0, 4.5, fill, line);
+                        if kit.hovered {
+                            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                            ui.tooltip(kid, b, "Keyframe setzen/entfernen");
+                        }
+                        if kit.clicked {
+                            acts.push(Act::SpeedToggleKey(clip_ref.id.clone(), tc));
+                        }
+                        nx += 20.0;
+                        let b = Rect::new(nx, y + (ROW_H - 18.0) / 2.0, 18.0, 18.0);
+                        if IconButton::new("chevron-right")
+                            .size(13.0)
+                            .disabled(next_t.is_none())
+                            .tooltip("Zum nächsten Keyframe")
+                            .show(ui, ("fx.spd.next", &clip_ref.id), b)
+                            .clicked
+                        {
+                            if let Some(t) = next_t {
+                                acts.push(Act::SpeedSeek(clip_ref.start + t));
+                            }
+                        }
+                        inner.cut_right(6.0);
+                    }
+
+                    let unit_cell = inner.cut_right(ui.font(FontKind::Sans12).width("%") + 4.0);
+                    let value_cell = Rect::new(inner.x, y + 3.0, inner.w.min(72.0), ROW_H - 6.0);
+                    ui.text_left("%", unit_cell, theme::TEXT_3, FontKind::Sans12);
+                    let pct = cur * 100.0;
+                    let editing = matches!(&self.speed_edit, Some((cid, _)) if cid == &clip_ref.id);
+                    if editing {
+                        let mut taken = self.speed_edit.take().expect("speed edit state");
+                        let res = taken.1.show(ui, ("fx.spd.edit", &clip_ref.id), value_cell, "");
+                        if res.submitted || !res.focused {
+                            if let Some(v) = parse_value(&taken.1.text) {
+                                acts.push(Act::SpeedCommitEdit(clip_ref.id.clone(), tc, v / 100.0));
+                            }
+                            if res.submitted {
+                                ui.persist.keyboard_focus = 0;
+                            }
+                        } else {
+                            self.speed_edit = Some(taken);
+                        }
+                    } else {
+                        let vid = ui.id(("fx.spd.value", &clip_ref.id));
+                        let vit = ui.interact(vid, value_cell);
+                        ui.fill_rounded(value_cell, theme::RADIUS_SM, theme::SURFACE_3);
+                        ui.stroke_rounded(
+                            value_cell,
+                            theme::RADIUS_SM,
+                            1.0,
+                            if vit.hovered { theme::LINE_STRONG } else { theme::LINE },
+                        );
+                        ui.text_right(
+                            &fmt_value(pct, 0),
+                            value_cell.inset_xy(6.0, 0.0),
+                            if animated { theme::ACCENT_HOVER } else { theme::TEXT_1 },
+                            FontKind::Mono12,
+                        );
+                        if vit.hovered {
+                            ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_EW);
+                            ui.tooltip(vid, value_cell, "Ziehen ändert das Tempo — Doppelklick zum Eingeben, Rechtsklick: 100 %");
+                        }
+                        if vit.double_clicked {
+                            acts.push(Act::SpeedOpenEdit(clip_ref.id.clone(), pct));
+                        } else if ui.input.left_pressed && vit.hovered && self.speed_drag.is_none() {
+                            acts.push(Act::SpeedBeginDrag(
+                                clip_ref.id.clone(),
+                                tc,
+                                cur,
+                                ui.input.mouse.x,
+                            ));
+                        }
+                        if vit.right_clicked {
+                            acts.push(Act::SpeedReset(clip_ref.id.clone()));
+                        }
+                    }
+
+                    // -- Retime-Kurve (clip-lokale Zeit × Tempo) --
+                    if has_lanes {
+                        let lane = Rect::new(lane_x, y, lane_w, SPEED_H);
+                        ui.fill(lane, theme::with_alpha(theme::SURFACE_0, 120));
+                        ui.hline(lane.x, lane.bottom() - 1.0, lane.w, theme::LINE);
+                        let pad = 8.0_f32;
+                        let mut vmax = 2.0_f64;
+                        for k in &clip_ref.speed.keyframes {
+                            vmax = vmax.max(k.value);
+                        }
+                        vmax = (vmax * 1.15).min(MAX_CLIP_SPEED);
+                        let span_h = (lane.h - 2.0 * pad).max(1.0);
+                        let y_of = |v: f64| -> f32 {
+                            lane.bottom() - pad - (v / vmax).clamp(0.0, 1.0) as f32 * span_h
+                        };
+                        let x_of = |t: f64| -> f32 { lane.x + (t / dur) as f32 * lane.w };
+                        // 100-%-Referenzlinie.
+                        let y100 = y_of(1.0);
+                        ui.hline(lane.x, y100, lane.w, theme::with_alpha(theme::LINE_STRONG, 110));
+                        ui.text_left(
+                            "100 %",
+                            Rect::new(lane.x + 3.0, y100 - 12.0, 44.0, 11.0),
+                            theme::TEXT_3,
+                            FontKind::Mono11,
+                        );
+                        // Kurve abtasten.
+                        let steps = (lane.w as i32 / 3).max(2);
+                        let mut prev: Option<Vector2> = None;
+                        for i in 0..=steps {
+                            let t = dur * i as f64 / steps as f64;
+                            let v = crate::core::timeline::clamp_speed(clip_ref.speed.eval(t));
+                            let p = v2(lane.x + (i as f32 / steps as f32) * lane.w, y_of(v));
+                            if let Some(pp) = prev {
+                                ui.line(pp, p, 1.6, theme::ACCENT);
+                            }
+                            prev = Some(p);
+                        }
+                        // Keyframes (Rauten) + Drag-Start.
+                        let mut hover_key = false;
+                        for (idx, k) in clip_ref.speed.keyframes.iter().enumerate() {
+                            let kx = x_of(k.t);
+                            let ky = y_of(crate::core::timeline::clamp_speed(k.value));
+                            let hit = Rect::new(kx - KEY_HIT, ky - KEY_HIT, KEY_HIT * 2.0, KEY_HIT * 2.0);
+                            let hovered = ui.mouse_in(hit) && self.speed_key_drag.is_none();
+                            if hovered {
+                                hover_key = true;
+                                ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+                            }
+                            draw_diamond(
+                                ui,
+                                kx,
+                                ky,
+                                KEY_R,
+                                if hovered { theme::WHITE } else { theme::ACCENT },
+                                theme::SURFACE_0,
+                            );
+                            if hovered && ui.input.left_pressed && ui.nothing_active() {
+                                self.speed_key_drag = Some(SpeedKeyDrag {
+                                    clip_id: clip_ref.id.clone(),
+                                    key_idx: idx,
+                                    orig: clip_ref.speed.keyframes.clone(),
+                                    start_mouse: ui.input.mouse,
+                                    history_pushed: false,
+                                    lane_x: lane.x,
+                                    lane_w: lane.w,
+                                    lane_top: lane.y,
+                                    lane_bottom: lane.bottom(),
+                                    pad,
+                                    dur,
+                                    vmax,
+                                });
+                            }
+                            if hovered && ui.input.right_pressed {
+                                acts.push(Act::SpeedToggleKey(clip_ref.id.clone(), k.t));
+                            }
+                        }
+                        // Playhead-Markierung.
+                        let px = x_of(tc);
+                        ui.fill(
+                            Rect::new(px - 0.5, lane.y, 1.0, lane.h),
+                            theme::with_alpha(theme::ACCENT, 150),
+                        );
+                        // Doppelklick auf leere Kurve: Keyframe anlegen + dorthin.
+                        if ui.mouse_in(lane) && ui.input.double_click && !hover_key {
+                            let t = ((ui.input.mouse.x - lane.x) / lane.w).clamp(0.0, 1.0) as f64 * dur;
+                            acts.push(Act::SpeedAddKeyAt(clip_ref.id.clone(), t));
+                        }
+                    }
+
+                    y += SPEED_H;
+                }
+            }
+        }
+
+        // Laufender Keyframe-Drag in der Tempo-Kurve (Geometrie aus dem Drag).
+        if let Some(drag) = &mut self.speed_key_drag {
+            if ui.input.left_down {
+                if !drag.history_pushed {
+                    app.timeline.begin_fx_edit();
+                    drag.history_pushed = true;
+                }
+                let _ = drag.start_mouse;
+                let new_t = (((ui.input.mouse.x - drag.lane_x) / drag.lane_w).clamp(0.0, 1.0) as f64
+                    * drag.dur)
+                    .clamp(0.0, drag.dur);
+                let span_h = (drag.lane_bottom - drag.lane_top - 2.0 * drag.pad).max(1.0);
+                let f = ((drag.lane_bottom - drag.pad - ui.input.mouse.y) / span_h).clamp(0.0, 1.0) as f64;
+                let new_v = (f * drag.vmax)
+                    .clamp(crate::core::timeline::MIN_CLIP_SPEED, crate::core::timeline::MAX_CLIP_SPEED);
+                let mut keys = drag.orig.clone();
+                if let Some(k) = keys.get_mut(drag.key_idx) {
+                    k.t = new_t;
+                    k.value = new_v;
+                }
+                app.timeline.speed_replace_keys_live(&drag.clip_id, keys);
+            } else {
+                self.speed_key_drag = None;
             }
         }
 
@@ -1404,6 +1754,8 @@ impl Panel for EffectControlsPanel {
                 && ui.nothing_active()
                 && !ui.input.double_click
                 && self.value_drag.is_none()
+                && self.speed_drag.is_none()
+                && self.speed_key_drag.is_none()
                 && !self.ruler_drag
             {
                 self.box_select = Some(ui.input.mouse);
@@ -1534,6 +1886,7 @@ impl Panel for EffectControlsPanel {
                         ResetKind::Motion => app.timeline.fx_reset_motion(&[id]),
                         ResetKind::Opacity => app.timeline.fx_reset_param(&id, ParamId::Opacity),
                         ResetKind::Audio => app.timeline.fx_reset_param(&id, ParamId::VolumeDb),
+                        ResetKind::Speed => app.timeline.speed_reset(&id),
                     }
                     self.selected_keys.clear();
                 }
@@ -1588,6 +1941,37 @@ impl Panel for EffectControlsPanel {
                 }
                 Act::AddKeyframe(id, pref, t) => {
                     app.timeline.kf_toggle_keyframe(&id, &pref, t);
+                }
+                Act::SpeedToggleAnim(id, tc) => app.timeline.speed_toggle_animated(&id, tc),
+                Act::SpeedToggleKey(id, tc) => app.timeline.speed_toggle_keyframe(&id, tc),
+                Act::SpeedSeek(t) => app.timeline.set_playhead(t),
+                Act::SpeedOpenEdit(id, pct) => {
+                    let mut state = TextInputState::default();
+                    state.set_text(fmt_value(pct, 0));
+                    let edit_id = ui.id(("fx.spd.edit", &id));
+                    ui.persist.keyboard_focus = edit_id;
+                    self.speed_edit = Some((id, state));
+                }
+                Act::SpeedCommitEdit(id, tc, v) => {
+                    app.timeline.begin_fx_edit();
+                    app.timeline.speed_set_value_live(&id, tc, v);
+                    self.speed_edit = None;
+                }
+                Act::SpeedBeginDrag(id, tc, start_value, start_x) => {
+                    self.speed_drag = Some(SpeedDrag {
+                        clip_id: id,
+                        tc,
+                        start_value,
+                        start_x,
+                        history_pushed: false,
+                    });
+                }
+                Act::SpeedReset(id) => app.timeline.speed_reset(&id),
+                Act::SpeedAddKeyAt(id, tc) => {
+                    app.timeline.speed_add_key(&id, tc);
+                    if let Some(st) = app.timeline.clip(&id).map(|c| c.start) {
+                        app.timeline.set_playhead(st + tc);
+                    }
                 }
                 Act::EffectToggle(clip_id, fx_id) => {
                     app.timeline.effects_toggle_enabled(&clip_id, &fx_id);
@@ -1807,6 +2191,31 @@ impl Panel for EffectControlsPanel {
                 }
             } else {
                 self.value_drag = None;
+            }
+        }
+
+        // ---- Tempo-Wert-Scrubbing (Geschwindigkeits-Wertzelle) ----
+        if let Some(drag) = &mut self.speed_drag {
+            if ui.input.left_down {
+                ui.want_cursor(MouseCursor::MOUSE_CURSOR_RESIZE_EW);
+                let dx = ui.input.mouse.x - drag.start_x;
+                if dx.abs() >= 1.0 || drag.history_pushed {
+                    if !drag.history_pushed {
+                        app.timeline.begin_fx_edit();
+                        drag.history_pushed = true;
+                    }
+                    // 0,4 %/px (Shift fein, Ctrl/Meta grob).
+                    let mut step = 0.004;
+                    if ui.input.shift {
+                        step *= 0.25;
+                    } else if ui.input.ctrl || ui.input.meta {
+                        step *= 2.5;
+                    }
+                    let v = drag.start_value + dx as f64 * step;
+                    app.timeline.speed_set_value_live(&drag.clip_id, drag.tc, v);
+                }
+            } else {
+                self.speed_drag = None;
             }
         }
 

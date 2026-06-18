@@ -78,7 +78,31 @@ pub const PROJECT_FORMAT: &str = "editron-project";
 /// v17: Ebenen-Mischmodi (`clips[].blendMode` = Normal/Multiply/Screen/
 /// Overlay/Add/...). W3C-Compositing-Formeln, formelgleich auf CPU und GPU.
 /// `#[serde(default)]` ⇒ ältere Dateien laden als Normal (klassisches Src-over).
-pub const PROJECT_VERSION: u32 = 17;
+/// v18: Time-Remap — `clips[].speed` ist eine animierbare Kurve (AnimatedParam,
+/// Keyframe-Zeiten in clip-lokalen Timeline-Sekunden). Statische Speed wird
+/// weiter als blanke Zahl serialisiert ⇒ v5-Dateien (`"speed": 0.37`) laden
+/// unverändert; nur Time-Remap-Clips schreiben das Objekt `{value, keyframes}`.
+/// v19: Audio-Cleanup-Effekte De-Esser (`deEsser`) und Auto-Ducking
+/// (`ducking`) im Effekt-Katalog (`clips[].effects[].kind`/`tracks[].effects`).
+/// Rein additive `EffectKind`-Werte; ältere Dateien enthalten sie nie und laden
+/// unverändert. Auto-Ducking nutzt als Sidechain-Key die Summe der anderen
+/// Spuren — kein zusätzliches serialisiertes Feld.
+/// v20: Adjustment Layer / Einstellungsebene (`clips[].adjustment`): ein
+/// synthetischer Clip ohne Mediendatei, dessen `grade`/`effects` als
+/// Korrektur-Pass auf das zusammengesetzte Bild ALLER darunterliegenden Spuren
+/// wirken (Player == Export über den CPU-Compositing-Kern). Additiv mit
+/// `#[serde(default)]`; ältere Dateien enthalten das Feld nie.
+/// v21: Portable/relative Medienpfade (`portable`). Ein konsolidiertes Projekt
+/// (Datei-Menü „Projekt konsolidieren …“) liegt mit seinen Medien in einem
+/// gemeinsamen Ordner; ist `portable` gesetzt, schreibt der Speichervorgang
+/// alle Medienpfade UNTERHALB des Projektordners RELATIV zur `.etron`-Datei
+/// (`media/clip.mp4` statt `/abs/.../media/clip.mp4`). Beim Laden werden
+/// relative Pfade gegen den Ordner der Projektdatei aufgelöst, sodass das
+/// gesamte Projekt verschiebbar/archivierbar wird. Ältere App-Versionen würden
+/// die relativen Pfade als Literale lesen und alle Medien offline melden,
+/// deshalb der Versionssprung; v20-und-älter-Dateien (absolute Pfade) laden
+/// unverändert (`portable` default = false).
+pub const PROJECT_VERSION: u32 = 21;
 const RECENT_LIMIT: usize = 10;
 
 // ------------------------------------------------------------------- Format
@@ -115,6 +139,12 @@ pub struct ProjectFile {
     pub proxy_settings: crate::core::proxy::ProxySettings,
     #[serde(default)]
     pub selected_asset_ids: Vec<String>,
+    /// Portables Projekt (ab Formatversion 21): Medienpfade unterhalb des
+    /// Projektordners werden RELATIV zur `.etron`-Datei gespeichert und beim
+    /// Laden gegen deren Ordner aufgelöst. Wird von „Projekt konsolidieren“
+    /// gesetzt. `default` = false ⇒ absolute Pfade (Altverhalten).
+    #[serde(default)]
+    pub portable: bool,
     /// Einzel-Timeline (Formatversionen ≤ 10). Ab v11 leer; der Loader
     /// bevorzugt `sequences`, wenn vorhanden, und liest dieses Feld nur als
     /// Altprojekt-Fallback (= genau eine Sequenz).
@@ -253,6 +283,11 @@ fn default_true() -> bool {
 pub struct ProjectStore {
     pub path: Option<PathBuf>,
     pub dirty: bool,
+    /// Portables Projekt: Medien liegen relativ zur `.etron` (konsolidiert).
+    /// Steuert, ob [`save_to`] Medienpfade unterhalb des Projektordners relativ
+    /// schreibt. Wird beim Laden aus der Datei übernommen und von „Projekt
+    /// konsolidieren“ gesetzt.
+    pub portable: bool,
     pub recent: Vec<String>,
     /// Unbekannte Top-Level-Felder der zuletzt geladenen Projektdatei (Felder
     /// einer neueren Version). Werden beim Speichern unverändert mitgeschrieben,
@@ -267,6 +302,7 @@ impl Default for ProjectStore {
         ProjectStore {
             path: None,
             dirty: false,
+            portable: false,
             recent: load_recent(),
             extra: Map::new(),
             seen_timeline_rev: 0,
@@ -349,6 +385,66 @@ pub fn autosave_path() -> PathBuf {
         .join("autosave.etron")
 }
 
+// ------------------------------------------------------ Portable Medienpfade
+
+/// Einen Medienpfad RELATIV zum Projektordner machen, sofern er unterhalb davon
+/// liegt — sonst unverändert lassen. Für portable (konsolidierte) Projekte:
+/// `<ziel>/media/clip.mp4` mit base `<ziel>` ⇒ `media/clip.mp4`. Pfade außerhalb
+/// des Projektordners (z. B. Thumbnails im App-Cache) bleiben absolut.
+fn relativize_media_path(base: &Path, p: &str) -> String {
+    let path = Path::new(p);
+    if path.is_relative() {
+        return p.to_string();
+    }
+    match path.strip_prefix(base) {
+        // Auf '/' normieren, damit der Pfad plattformübergreifend portabel ist.
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => p.to_string(),
+    }
+}
+
+/// Umkehrung: einen ggf. relativen Medienpfad gegen den Projektordner auflösen.
+/// Absolute Pfade bleiben unverändert.
+fn resolve_media_path(base: &Path, p: &str) -> String {
+    let path = Path::new(p);
+    if path.is_absolute() || p.is_empty() {
+        return p.to_string();
+    }
+    base.join(path).to_string_lossy().into_owned()
+}
+
+/// Alle Medienpfade eines Projektdokuments relativ zum Projektordner schreiben
+/// (nur Pfade unterhalb von `base`). Für portable Projekte vor dem
+/// Serialisieren angewandt; der App-Zustand selbst bleibt absolut.
+fn relativize_media(file: &mut ProjectFile, base: &Path) {
+    for asset in &mut file.media {
+        asset.path = relativize_media_path(base, &asset.path);
+        asset.info.path = relativize_media_path(base, &asset.info.path);
+        if let Some(t) = asset.thumbnail_path.take() {
+            asset.thumbnail_path = Some(relativize_media_path(base, &t));
+        }
+        if let Some(pp) = asset.proxy_path.take() {
+            asset.proxy_path = Some(relativize_media_path(base, &pp));
+        }
+    }
+}
+
+/// Umkehrung von [`relativize_media`] beim Laden: relative Medienpfade gegen den
+/// Ordner der Projektdatei auflösen, sodass der App-Zustand wieder absolute
+/// Pfade führt (Decoder/ffprobe brauchen absolute Pfade).
+fn resolve_media(assets: &mut [MediaAsset], base: &Path) {
+    for asset in assets {
+        asset.path = resolve_media_path(base, &asset.path);
+        asset.info.path = resolve_media_path(base, &asset.info.path);
+        if let Some(t) = asset.thumbnail_path.take() {
+            asset.thumbnail_path = Some(resolve_media_path(base, &t));
+        }
+        if let Some(pp) = asset.proxy_path.take() {
+            asset.proxy_path = Some(resolve_media_path(base, &pp));
+        }
+    }
+}
+
 // -------------------------------------------------------------- Save / Load
 
 /// Eine Timeline in ihr Persistenz-Dokument übersetzen. `extra` reicht die beim
@@ -401,6 +497,7 @@ pub fn collect(state: &AppState) -> ProjectFile {
         use_proxies: state.media.use_proxies,
         proxy_settings: state.media.proxy_settings.clone(),
         selected_asset_ids: state.media.selected_asset_ids.clone(),
+        portable: state.project.portable,
         // Ab v11 leer (skip_serializing_if); alle Daten stehen in `sequences`.
         timeline: TimelineDoc::default(),
         sequences,
@@ -428,7 +525,17 @@ pub fn ensure_extension(path: PathBuf) -> PathBuf {
 /// Atomar speichern: in Temp-Datei schreiben, bestehende Datei als .bak
 /// sichern, dann rename. Eine halbe/korrupte Projektdatei gibt es so nie.
 pub fn save_to(state: &mut AppState, path: &Path) -> Result<(), String> {
-    let file = collect(state);
+    let mut file = collect(state);
+    // Portables Projekt: Medienpfade unterhalb des Projektordners relativ zur
+    // `.etron` schreiben (der App-Zustand bleibt absolut). So bleibt das Projekt
+    // samt `media/`-Ordner verschiebbar/archivierbar.
+    if file.portable {
+        if let Some(base) = path.parent() {
+            if !base.as_os_str().is_empty() {
+                relativize_media(&mut file, base);
+            }
+        }
+    }
     let json = serde_json::to_string(&file).map_err(|e| format!("Serialisierung: {e}"))?;
 
     if let Some(dir) = path.parent() {
@@ -555,6 +662,13 @@ pub fn apply(state: &mut AppState, mut file: ProjectFile, path: Option<PathBuf>)
     // Medien übernehmen + Offline-Status prüfen; verwaiste Thumbnails
     // (Cache geleert) nicht weiterreichen, damit sie neu entstehen können.
     let mut media = file.media;
+    // Portable Projekte: relative Medienpfade gegen den Ordner der Projektdatei
+    // auflösen, bevor Existenz/Decode-Pfade greifen (App-Zustand = absolut).
+    if let Some(dir) = path.as_deref().and_then(|p| p.parent()) {
+        if !dir.as_os_str().is_empty() {
+            resolve_media(&mut media, dir);
+        }
+    }
     let mut offline = 0usize;
     for asset in &mut media {
         asset.offline = !Path::new(&asset.path).exists();
@@ -683,6 +797,7 @@ pub fn apply(state: &mut AppState, mut file: ProjectFile, path: Option<PathBuf>)
     }
 
     state.project.path = path.clone();
+    state.project.portable = file.portable;
     state.project.extra = project_extra;
     if let Some(p) = &path {
         state.project.push_recent(p);
@@ -711,6 +826,7 @@ pub fn reset_to_new(state: &mut AppState) {
     state.timeline.revision += 1;
     state.playback = Default::default();
     state.project.path = None;
+    state.project.portable = false;
     // Unbekannte Felder eines zuvor geladenen (neueren) Projekts dürfen nicht
     // ins frische Projekt durchsickern.
     state.project.extra.clear();
@@ -860,7 +976,8 @@ mod tests {
             },
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),
@@ -889,7 +1006,8 @@ mod tests {
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),
@@ -918,7 +1036,8 @@ mod tests {
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 0.37,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(0.37),
             reverse: true,
             freeze: false,
             markers: Vec::new(),
@@ -993,11 +1112,11 @@ mod tests {
         assert_eq!(file.sequences[0].timeline.playhead_sec, 3.25);
         // Clip-Geschwindigkeit exakt erhalten (rückwärts, 37 %).
         let speedy = file.sequences[0].timeline.clips.iter().find(|c| c.id == "clip-3").unwrap();
-        assert_eq!(speedy.speed, 0.37);
+        assert_eq!(speedy.eff_speed(), 0.37);
         assert!(speedy.reverse);
         assert!(!speedy.freeze);
         // Normale Clips bleiben bei 100 % vorwärts.
-        assert_eq!(file.sequences[0].timeline.clips[0].speed, 1.0);
+        assert_eq!(file.sequences[0].timeline.clips[0].eff_speed(), 1.0);
         assert!(!file.sequences[0].timeline.clips[0].reverse);
         assert_eq!(file.sequences[0].timeline.in_point, Some(1.0));
         assert!(file.sequences[0].timeline.clips[1].src_duration.is_infinite());
@@ -1071,7 +1190,7 @@ mod tests {
         assert!(target.timeline.settings.drop_frame);
         assert_eq!(target.timeline.clips.len(), 3);
         assert_eq!(target.timeline.clips[0].start, 1.0);
-        assert_eq!(target.timeline.clip("clip-3").unwrap().speed, 0.37);
+        assert_eq!(target.timeline.clip("clip-3").unwrap().eff_speed(), 0.37);
         assert!(target.timeline.clip("clip-3").unwrap().reverse);
         assert_eq!(target.timeline.transitions.len(), 1, "Übergang geladen");
         assert_eq!(target.timeline.master_gain_db, -4.5);
@@ -1107,6 +1226,166 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relativize_and_resolve_media_paths_roundtrip() {
+        let base = Path::new("/projects/film");
+        // Unterhalb des Projektordners → relativ (mit '/'-Trennern).
+        assert_eq!(
+            relativize_media_path(base, "/projects/film/media/clip.mp4"),
+            "media/clip.mp4"
+        );
+        // Außerhalb → unverändert absolut.
+        assert_eq!(
+            relativize_media_path(base, "/cache/thumbs/a.png"),
+            "/cache/thumbs/a.png"
+        );
+        // Bereits relativ → unverändert.
+        assert_eq!(relativize_media_path(base, "media/clip.mp4"), "media/clip.mp4");
+        // Auflösen kehrt das wieder um (absolut bleibt absolut).
+        assert_eq!(
+            resolve_media_path(base, "media/clip.mp4"),
+            "/projects/film/media/clip.mp4"
+        );
+        assert_eq!(
+            resolve_media_path(base, "/cache/thumbs/a.png"),
+            "/cache/thumbs/a.png"
+        );
+    }
+
+    /// Ein portables Projekt schreibt Medienpfade relativ; nach dem Verschieben
+    /// des Projektordners sind alle Medien wieder online (gegen den neuen Ordner
+    /// aufgelöst). Das ist die Kern-Verifikation der Konsolidierung.
+    #[test]
+    fn portable_project_relinks_after_move() {
+        isolate_config();
+        let root = std::env::temp_dir().join(format!("editron-portable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("media")).unwrap();
+        // Echte Mediendatei, damit der Offline-Check greift.
+        let media_file = src.join("media").join("clip.mp4");
+        std::fs::write(&media_file, b"\x00\x00\x00fake").unwrap();
+
+        // Minimaler Zustand mit einem Asset im Projektordner.
+        let mut state = AppState::default();
+        let abs = media_file.to_string_lossy().into_owned();
+        let asset = MediaAsset {
+            extra: Default::default(),
+            id: "a1".into(),
+            path: abs.clone(),
+            name: "clip.mp4".into(),
+            kind: crate::core::types::MediaKind::Video,
+            info: crate::core::types::MediaInfo {
+                path: abs.clone(),
+                file_name: "clip.mp4".into(),
+                container: "mov,mp4".into(),
+                duration_sec: 5.0,
+                size_bytes: 7,
+                video: Vec::new(),
+                audio: Vec::new(),
+                recorded_at: None,
+            },
+            thumbnail_path: None,
+            imported_at: 0.0,
+            bin_id: crate::core::bin::ROOT_BIN_ID.to_string(),
+            label: None,
+            offline: false,
+            markers: Vec::new(),
+            proxy_path: None,
+            proxy_src_mtime: None,
+            proxy_offline: false,
+        };
+        state.media.add_asset(asset);
+        state.project.portable = true;
+
+        let etron = src.join("film.etron");
+        save_to(&mut state, &etron).expect("save portable");
+
+        // Datei trägt RELATIVE Medienpfade (verschiebbar).
+        let raw = std::fs::read_to_string(&etron).unwrap();
+        assert!(
+            raw.contains("\"path\":\"media/clip.mp4\""),
+            "Medienpfad relativ gespeichert, war: {raw}"
+        );
+        assert!(!raw.contains(&abs), "kein absoluter Medienpfad in der Datei");
+
+        // Ganzen Projektordner verschieben (Übergabe/Archiv).
+        let moved = root.join("moved");
+        std::fs::rename(&src, &moved).unwrap();
+        let moved_etron = moved.join("film.etron");
+
+        // Laden gegen den NEUEN Ordner: Medium ist online und absolut.
+        let mut target = AppState::default();
+        let file = load_from(&moved_etron).expect("load moved");
+        assert!(file.portable);
+        let offline = apply(&mut target, file, Some(moved_etron.clone()));
+        assert_eq!(offline, 0, "Medium nach Verschieben online");
+        assert!(target.project.portable);
+        let resolved = moved.join("media").join("clip.mp4");
+        assert_eq!(
+            target.media.assets[0].path,
+            resolved.to_string_lossy(),
+            "Pfad gegen neuen Ordner aufgelöst"
+        );
+        assert!(!target.media.assets[0].offline);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ohne portable-Flag bleiben Pfade absolut (Altverhalten, abwärtskompatibel).
+    #[test]
+    fn non_portable_save_keeps_absolute_paths() {
+        isolate_config();
+        let dir = std::env::temp_dir().join(format!("editron-abspath-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("media")).unwrap();
+        let media_file = dir.join("media").join("x.mp4");
+        std::fs::write(&media_file, b"data").unwrap();
+        let abs = media_file.to_string_lossy().into_owned();
+
+        let mut state = AppState::default();
+        let mut asset = sample_asset();
+        asset.path = abs.clone();
+        asset.info.path = abs.clone();
+        state.media.add_asset(asset);
+        // portable bleibt false (Default).
+
+        let etron = dir.join("p.etron");
+        save_to(&mut state, &etron).unwrap();
+        let raw = std::fs::read_to_string(&etron).unwrap();
+        assert!(raw.contains(&abs), "absoluter Pfad bleibt erhalten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Minimal-Asset für Pfad-Tests (Felder, die der Roundtrip nicht prüft).
+    fn sample_asset() -> MediaAsset {
+        MediaAsset {
+            extra: Default::default(),
+            id: crate::core::types::new_id(),
+            path: String::new(),
+            name: "x.mp4".into(),
+            kind: crate::core::types::MediaKind::Video,
+            info: crate::core::types::MediaInfo {
+                path: String::new(),
+                file_name: "x.mp4".into(),
+                container: "mov,mp4".into(),
+                duration_sec: 3.0,
+                size_bytes: 4,
+                video: Vec::new(),
+                audio: Vec::new(),
+                recorded_at: None,
+            },
+            thumbnail_path: None,
+            imported_at: 0.0,
+            bin_id: crate::core::bin::ROOT_BIN_ID.to_string(),
+            label: None,
+            offline: false,
+            markers: Vec::new(),
+            proxy_path: None,
+            proxy_src_mtime: None,
+            proxy_offline: false,
+        }
     }
 
     #[test]
@@ -1333,7 +1612,8 @@ mod tests {
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),
@@ -1535,7 +1815,8 @@ mod tests {
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),

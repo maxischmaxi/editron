@@ -29,6 +29,14 @@ pub const SOURCE_KEY: &str = "player://source";
 /// Decoder statt Live-Compositing während der Wiedergabe gecachter Bereiche).
 pub const RENDER_CACHE_KEY: &str = "player://rendercache";
 
+/// Texture-Schlüssel des CPU-komponierten Programmbildes (Vollbild). Wird
+/// belegt, wenn am Playhead ein Adjustment Layer aktiv ist: dessen Korrektur-
+/// Pass wirkt auf das zusammengesetzte Bild ALLER Spuren darunter, was die
+/// GPU-Per-Layer-Pipeline nicht abbilden kann — der Player komponiert das
+/// Programm dann über den geteilten Compositing-Kern (`composite_sequence_frame`,
+/// formelgleich zum Export) und der Monitor zeichnet diese eine Textur.
+pub const PROGRAM_COMPOSITE_KEY: &str = "player://programcomposite";
+
 /// Texture-Schlüssel eines Programm-Layers (Decoder je Clip).
 pub fn clip_texture_key(clip_id: &str) -> String {
     format!("player://clip/{clip_id}")
@@ -73,6 +81,9 @@ const AUDIO_CHUNK_FRAMES: usize = 4096;
 /// Seeks und Loop-Sprünge während der Wiedergabe ab; der Puffer-Vorlauf
 /// (~1–2 Blöcke) bleibt darunter.
 const AUDIO_RESYNC_TOLERANCE: f64 = 0.35;
+/// Positionssprung (Sekunden), ab dem die Integrated-Lautheitsmessung neu
+/// startet. Ein bloßes Fortsetzen nach Pause liegt darunter ⇒ Messung bleibt.
+const LOUDNESS_RESET_TOLERANCE: f64 = 0.75;
 /// Anti-Klick-Rampe an harten Schnittkanten (Frames; ~5 ms bei 48 kHz).
 const CLICK_RAMP_FRAMES: usize = 240;
 /// Sub-Block der Hüllkurven-Auswertung (Frames; ~5 ms) — glatt genug für
@@ -1426,6 +1437,18 @@ pub struct PlayerEngine {
     /// Frame-Index, w, h) — überspringt das (teure) Neurendern bei stehendem
     /// Playhead. Schlüssel = Clip-ID.
     nest_sig: std::collections::HashMap<String, (String, i64, u32, u32)>,
+    /// Signatur des zuletzt CPU-komponierten Programmbildes (Adjustment-Layer-
+    /// Vorschau): (timeline-Revision, media-Revision, Frame-Index, Inhalts-Hash,
+    /// w, h) — überspringt das Neukomponieren bei stehendem Playhead/unverändertem
+    /// Inhalt. Der Inhalts-Hash deckt Live-Gesten ab (Grade-/fx-Slider bumpen
+    /// `revision` NICHT). None ⇒ kein Adjustment aktiv / Textur freigegeben.
+    program_composite_sig: Option<(u64, u64, i64, u64, u32, u32)>,
+    /// BS.1770-Lautheitsmesser des Master-Mixblocks (Mixer-Metering).
+    loudness: crate::core::loudness::LoudnessMeter,
+    /// Playhead-Position des zuletzt in den Lautheitsmesser gefütterten Blocks
+    /// — unterscheidet Fortsetzen nach Pause (Integrated bleibt) von einem Seek
+    /// (Integrated startet neu).
+    loudness_last_pos: f64,
 }
 
 impl PlayerEngine {
@@ -1470,6 +1493,9 @@ impl PlayerEngine {
             debug_ticks: 0,
             debug_slew: 0.0,
             nest_sig: Default::default(),
+            program_composite_sig: None,
+            loudness: crate::core::loudness::LoudnessMeter::new(AUDIO_RATE, AUDIO_CHANNELS),
+            loudness_last_pos: f64::NAN,
         }
     }
 
@@ -1496,7 +1522,8 @@ impl PlayerEngine {
                         .nest_seq
                         .clone()
                         .map(|n| (clip.id.clone(), n, compose::nest_inner_time(clip, t))),
-                    compose::ProgramLayer::Solid { .. } => None,
+                    compose::ProgramLayer::Solid { .. }
+                    | compose::ProgramLayer::Adjustment { .. } => None,
                 })
                 .collect();
         let mut alive: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1531,6 +1558,93 @@ impl PlayerEngine {
         }
         // Nicht mehr sichtbare Nest-Clips vergessen (Neurender beim Wiederkehren).
         self.nest_sig.retain(|id, _| alive.contains(id));
+    }
+
+    /// Programmbild CPU-komponieren, wenn am Playhead ein Adjustment Layer
+    /// aktiv ist (Korrektur-Pass auf das Gesamtbild — von der GPU-Per-Layer-
+    /// Pipeline nicht abbildbar). Nutzt den geteilten Compositing-Kern
+    /// (`composite_sequence_frame`, formelgleich zum Export); das Ergebnis liegt
+    /// unter `PROGRAM_COMPOSITE_KEY`, signaturgecacht (kein Neukomponieren bei
+    /// stehendem Playhead). Setzt `state.monitor.program_adjustment` für den
+    /// Monitor (zeichnet dann diese eine Vollbild-Textur).
+    fn render_adjustment_preview(
+        &mut self,
+        rl: &mut RaylibHandle,
+        thread: &RaylibThread,
+        state: &mut AppState,
+        textures: &mut TextureCache,
+    ) {
+        use std::hash::{Hash, Hasher};
+        let t = state.timeline.playhead_sec;
+        let layers = compose::visible_program_layers(&state.timeline, t);
+        let active = layers
+            .iter()
+            .any(|l| matches!(l, compose::ProgramLayer::Adjustment { .. }));
+        state.monitor.program_adjustment = active;
+        if !active {
+            if self.program_composite_sig.is_some() {
+                self.program_composite_sig = None;
+                textures.remove(PROGRAM_COMPOSITE_KEY);
+            }
+            return;
+        }
+        // Inhalts-Hash der sichtbaren Clips: Grade/fx/Effekte/Blend — fängt
+        // Live-Gesten (Slider/Gizmo) ab, die `revision` NICHT bumpen, sodass die
+        // Vorschau beim Ziehen live aktualisiert (wie der GPU-Pfad).
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for layer in &layers {
+            let clip = match layer {
+                compose::ProgramLayer::Clip { clip, .. } => *clip,
+                compose::ProgramLayer::Adjustment { clip } => *clip,
+                compose::ProgramLayer::Solid { .. } => continue,
+            };
+            if let Ok(s) = serde_json::to_string(&(
+                &clip.grade,
+                &clip.fx,
+                &clip.effects,
+                clip.blend_mode,
+                clip.enabled,
+            )) {
+                s.hash(&mut hasher);
+            }
+        }
+        let content_hash = hasher.finish();
+        drop(layers);
+        let seq_fps = state.timeline.settings.rate.fps().max(1.0);
+        let (sw, sh) = (
+            state.timeline.settings.width.max(2),
+            state.timeline.settings.height.max(2),
+        );
+        // Vorschau-Auflösung deckeln (Tempo des synchronen Blatt-Decodes),
+        // Seitenverhältnis der Sequenz wahren.
+        let s = (1280.0f32 / sw as f32).min(1.0);
+        let w = ((sw as f32 * s).round() as usize).max(2);
+        let h = ((sh as f32 * s).round() as usize).max(2);
+        let frame_idx = (t * seq_fps).round() as i64;
+        let sig = (
+            state.timeline.revision,
+            state.media.revision,
+            frame_idx,
+            content_hash,
+            w as u32,
+            h as u32,
+        );
+        if self.program_composite_sig == Some(sig) {
+            return;
+        }
+        if let Some(data) = compose_program_preview(state, t, w, h) {
+            upload_frame(
+                rl,
+                thread,
+                textures,
+                PROGRAM_COMPOSITE_KEY,
+                w as i32,
+                h as i32,
+                &data,
+                None,
+            );
+            self.program_composite_sig = Some(sig);
+        }
     }
 
     /// Pro Frame im Mainloop (vor dem Zeichnen) aufrufen.
@@ -1600,6 +1714,15 @@ impl PlayerEngine {
         // Cache-Wiedergabe). Identischer Compositing-Kern wie der Export.
         if !from_cache {
             self.render_nest_previews(rl, thread, state, textures);
+            self.render_adjustment_preview(rl, thread, state, textures);
+        } else {
+            // Cache-Wiedergabe: das gecachte Programmbild enthält den Adjustment-
+            // Pass bereits (Export-Pfad) — Live-CPU-Composite abräumen.
+            state.monitor.program_adjustment = false;
+            if self.program_composite_sig.is_some() {
+                self.program_composite_sig = None;
+                textures.remove(PROGRAM_COMPOSITE_KEY);
+            }
         }
 
         // Programmbild aus dem Render-Cache (oder Cache-Decoder freigeben).
@@ -2064,6 +2187,14 @@ impl PlayerEngine {
             return;
         }
 
+        // Manueller Lautheits-Reset (Knopf im Mixer): Integrated + True-Peak-
+        // Max-Hold neu beginnen.
+        if state.audio.loudness_reset {
+            self.loudness.reset();
+            self.loudness_last_pos = f64::NAN;
+            state.audio.loudness_reset = false;
+        }
+
         let rate_f = AUDIO_RATE as f64;
         // Proxy-Modus: Audio-Vorschau ebenfalls aus dem Proxy (durchgereichtes
         // PCM); der Export nutzt unverändert die Originale.
@@ -2101,6 +2232,21 @@ impl PlayerEngine {
                 }
             };
             if reanchor {
+                // Bei echtem Positionssprung (Seek) die Integrated-Messung neu
+                // beginnen; ein Fortsetzen nach Pause (neue Anker-Position ≈
+                // zuletzt gemessen) behält sie.
+                let seek = match self.prog_clock {
+                    Some(c) => {
+                        (playhead - c.heard_pos(self.master_out)).abs() > AUDIO_RESYNC_TOLERANCE
+                    }
+                    None => {
+                        !self.loudness_last_pos.is_finite()
+                            || (playhead - self.loudness_last_pos).abs() > LOUDNESS_RESET_TOLERANCE
+                    }
+                };
+                if seek {
+                    self.loudness.reset();
+                }
                 self.prog_clock = Some(TargetClock {
                     anchor_out: self.master_out,
                     anchor_pos: playhead,
@@ -2157,6 +2303,12 @@ impl PlayerEngine {
                     let ms = clip.media_step();
                     if ms == 0.0 {
                         continue; // Standbild stumm (beide Richtungen)
+                    }
+                    // Time-Remap (variables Tempo) ist stumm — Parität zum
+                    // Export-Plan, der animierte Clips überspringt (eine
+                    // konstante atempo-Kette bildet die Kurve nicht ab).
+                    if clip.is_time_remapped() {
+                        continue;
                     }
                     // Parität zum Export (mix_clips_into_wav schweigt für
                     // Reverse-Clips): bei VORWÄRTS-Wiedergabe sind als reverse
@@ -2358,6 +2510,10 @@ impl PlayerEngine {
             self.src_clock = None;
             state.audio.track_levels.clear();
             state.audio.master_level = [0.0, 0.0];
+            // Momentary/Short-Term auf Stille fallen lassen, Integrated +
+            // True-Peak als Messergebnis halten.
+            self.loudness.pause();
+            state.audio.loudness = self.loudness.snapshot();
             return;
         }
 
@@ -2369,46 +2525,110 @@ impl PlayerEngine {
         let mut tick_tracks: std::collections::HashMap<String, [f32; 2]> =
             std::collections::HashMap::new();
         let mut tick_master = [0f32; 2];
+        // Braucht eine Spur-Bus-Kette einen Sidechain-Key (Auto-Ducking)? Dann
+        // müssen ALLE Spuren des Blocks zuerst roh vorliegen, um den Key (Summe
+        // der ANDEREN Spuren) zu bilden — sonst läuft der billige Einzelpass.
+        let any_ducking = self.track_fx.values().any(|c| c.needs_sidechain());
         while master.is_processed() {
             let block_out = self.master_out as i64;
             self.mix_buf.clear();
             self.mix_buf.resize(AUDIO_CHUNK_FRAMES * AUDIO_CHANNELS, 0.0);
             let mut any_frames = false;
 
-            // Programm: Clips je Spur sammeln → Bus-FX → Spur-Gain/Pan → Master.
-            for (track_id, target) in &track_targets {
-                self.track_buf.clear();
-                self.track_buf.resize(AUDIO_CHUNK_FRAMES * AUDIO_CHANNELS, 0.0);
-                let mut track_any = false;
-                for clip in self.audio_clips.iter_mut() {
-                    if clip.track_id.as_deref() != Some(track_id.as_str()) {
+            if any_ducking {
+                // ---- Sidechain-Pfad: Roh-Puffer je Spur, dann Bus-FX(+Key) ----
+                let nsamp = AUDIO_CHUNK_FRAMES * AUDIO_CHANNELS;
+                // Pass 1: Clips je Spur summieren (vor Bus-FX/Gain) + Gesamtsumme.
+                let mut raws: Vec<(bool, Vec<f32>)> = Vec::with_capacity(track_targets.len());
+                let mut total = vec![0f32; nsamp];
+                for (track_id, _target) in &track_targets {
+                    let mut buf = vec![0f32; nsamp];
+                    let mut track_any = false;
+                    for clip in self.audio_clips.iter_mut() {
+                        if clip.track_id.as_deref() != Some(track_id.as_str()) {
+                            continue;
+                        }
+                        let (frames, _, _) = clip.mix_block(&mut buf, block_out);
+                        if frames > 0 {
+                            track_any = true;
+                        }
+                    }
+                    if track_any {
+                        for (t, s) in total.iter_mut().zip(&buf) {
+                            *t += *s;
+                        }
+                    }
+                    raws.push((track_any, buf));
+                }
+                // Pass 2: Bus-FX (Key = Gesamtsumme − eigene Spur) → Gain → Master.
+                let mut key = vec![0f32; nsamp];
+                for (ti, (track_id, target)) in track_targets.iter().enumerate() {
+                    let (track_any, buf) = &mut raws[ti];
+                    if !*track_any {
                         continue;
                     }
-                    let (frames, _, _) = clip.mix_block(&mut self.track_buf, block_out);
-                    if frames > 0 {
-                        track_any = true;
+                    any_frames = true;
+                    prog_any_tick = true;
+                    if let Some(chain) = self.track_fx.get_mut(track_id) {
+                        if chain.needs_sidechain() {
+                            for ((k, t), s) in key.iter_mut().zip(&total).zip(buf.iter()) {
+                                *k = *t - *s;
+                            }
+                            chain.process_with_sidechain(buf, Some(&key));
+                        } else {
+                            chain.process(buf);
+                        }
+                    }
+                    let prev = self
+                        .track_gain_smooth
+                        .get(track_id)
+                        .copied()
+                        .unwrap_or(*target);
+                    let (peak_l, peak_r) = apply_stereo_ramp(buf, prev, *target);
+                    self.track_gain_smooth.insert(track_id.clone(), *target);
+                    let entry = tick_tracks.entry(track_id.clone()).or_insert([0.0, 0.0]);
+                    entry[0] = entry[0].max(peak_l);
+                    entry[1] = entry[1].max(peak_r);
+                    for (m, s) in self.mix_buf.iter_mut().zip(buf.iter()) {
+                        *m += *s;
                     }
                 }
-                if !track_any {
-                    continue;
-                }
-                any_frames = true;
-                prog_any_tick = true;
-                if let Some(chain) = self.track_fx.get_mut(track_id) {
-                    chain.process(&mut self.track_buf);
-                }
-                let prev = self
-                    .track_gain_smooth
-                    .get(track_id)
-                    .copied()
-                    .unwrap_or(*target);
-                let (peak_l, peak_r) = apply_stereo_ramp(&mut self.track_buf, prev, *target);
-                self.track_gain_smooth.insert(track_id.clone(), *target);
-                let entry = tick_tracks.entry(track_id.clone()).or_insert([0.0, 0.0]);
-                entry[0] = entry[0].max(peak_l);
-                entry[1] = entry[1].max(peak_r);
-                for i in 0..self.mix_buf.len() {
-                    self.mix_buf[i] += self.track_buf[i];
+            } else {
+                // Programm: Clips je Spur sammeln → Bus-FX → Spur-Gain/Pan → Master.
+                for (track_id, target) in &track_targets {
+                    self.track_buf.clear();
+                    self.track_buf.resize(AUDIO_CHUNK_FRAMES * AUDIO_CHANNELS, 0.0);
+                    let mut track_any = false;
+                    for clip in self.audio_clips.iter_mut() {
+                        if clip.track_id.as_deref() != Some(track_id.as_str()) {
+                            continue;
+                        }
+                        let (frames, _, _) = clip.mix_block(&mut self.track_buf, block_out);
+                        if frames > 0 {
+                            track_any = true;
+                        }
+                    }
+                    if !track_any {
+                        continue;
+                    }
+                    any_frames = true;
+                    prog_any_tick = true;
+                    if let Some(chain) = self.track_fx.get_mut(track_id) {
+                        chain.process(&mut self.track_buf);
+                    }
+                    let prev = self
+                        .track_gain_smooth
+                        .get(track_id)
+                        .copied()
+                        .unwrap_or(*target);
+                    let (peak_l, peak_r) = apply_stereo_ramp(&mut self.track_buf, prev, *target);
+                    self.track_gain_smooth.insert(track_id.clone(), *target);
+                    let entry = tick_tracks.entry(track_id.clone()).or_insert([0.0, 0.0]);
+                    entry[0] = entry[0].max(peak_l);
+                    entry[1] = entry[1].max(peak_r);
+                    for i in 0..self.mix_buf.len() {
+                        self.mix_buf[i] += self.track_buf[i];
+                    }
                 }
             }
 
@@ -2442,6 +2662,13 @@ impl PlayerEngine {
             for pair in self.mix_buf.chunks_exact(AUDIO_CHANNELS) {
                 tick_master[0] = tick_master[0].max(pair[0].abs());
                 tick_master[1] = tick_master[1].max(pair[1].abs());
+            }
+            // BS.1770-Lautheit aus dem Master-Mixblock messen — vor dem
+            // Hard-Clip (echte Pegel/Inter-Sample-Peaks) und nur während
+            // laufender Programmwiedergabe (das, was der Export liefert; reine
+            // Quell-/Scrub-Vorschau soll die Messung nicht verfälschen).
+            if self.prog_clock.is_some() {
+                self.loudness.feed(&self.mix_buf);
             }
             for s in self.mix_buf.iter_mut() {
                 *s = s.clamp(-1.0, 1.0);
@@ -2506,6 +2733,19 @@ impl PlayerEngine {
             }
             state.audio.fx_gain_reduction = fx_gr;
         }
+
+        // ---- Lautheits-Snapshot für den Mixer ----------------------------
+        // Bei reiner Quell-/Scrub-Wiedergabe (kein Programm) die gleitenden
+        // Fenster verwerfen, damit Momentary/Short-Term nicht eingefroren
+        // stehen bleiben; sonst die zuletzt gemessene Position merken.
+        if self.prog_clock.is_some() {
+            if wrote_any && prog_any_tick {
+                self.loudness_last_pos = state.timeline.playhead_sec;
+            }
+        } else {
+            self.loudness.pause();
+        }
+        state.audio.loudness = self.loudness.snapshot();
 
         self.debug_ticks += 1;
         if self.debug && now - self.debug_last >= 1.0 {
@@ -2648,6 +2888,12 @@ fn program_video_targets(state: &AppState) -> Vec<(String, VideoTarget)> {
             asset,
             clip.id.clone(),
             media_time,
+            // Konstante Decoder-Rate (bei Time-Remap das mittlere Tempo): eine
+            // durchlaufende Session statt eines Neustarts pro Frame (der bei
+            // variabler Rate die Wiedergabe einfrieren ließe). Das GEPARKTE Bild
+            // bleibt trotzdem frame-genau — `media_time` ist exakt das Integral
+            // der Kurve, und der Cache-/Seek-Pfad zieht beim Scrubbing genau
+            // diesen Frame.
             clip.media_step(),
             state.monitor.program_scale,
         )
@@ -2682,7 +2928,7 @@ fn program_video_targets(state: &AppState) -> Vec<(String, VideoTarget)> {
                     make_target(clip, compose::clip_media_time(clip, t).max(0.0))
                 }
             }
-            compose::ProgramLayer::Solid { .. } => None,
+            compose::ProgramLayer::Solid { .. } | compose::ProgramLayer::Adjustment { .. } => None,
         })
         .collect();
 
@@ -2745,6 +2991,71 @@ fn program_video_targets(state: &AppState) -> Vec<(String, VideoTarget)> {
         }
     }
     targets
+}
+
+/// Das gesamte Programmbild der AKTIVEN Sequenz CPU-komponieren (w×h), inkl.
+/// der Adjustment-Layer-Korrektur-Pässe — über denselben Compositing-Kern wie
+/// der Export (`composite_sequence_frame`), damit Vorschau und Export
+/// formelgleich sind. Blatt-Frames kommen per Einzelbild-Extraktion (Proxy-
+/// bewusst). Synchron/blockierend; nur aufgerufen, wenn ein Adjustment Layer
+/// am Playhead liegt (signaturgecacht im Player).
+fn compose_program_preview(state: &AppState, t: f64, w: usize, h: usize) -> Option<Vec<u8>> {
+    let use_proxy = state.media.use_proxies;
+    let media = &state.media;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
+    // LUT-Cache über die ganze Komposition (lädt jede .cube nur einmal).
+    let mut lut_cache = crate::core::lut::LutCache::default();
+    let mut fetch = |clip: &crate::core::timeline::TimelineClip,
+                     media_t: f64,
+                     lw: usize,
+                     lh: usize|
+     -> Option<Vec<f32>> {
+        if clip.is_generator() {
+            return None;
+        }
+        let asset = media.asset(&clip.asset_id)?;
+        if !asset.preview_playable(use_proxy)
+            || asset.kind == crate::core::types::MediaKind::Audio
+        {
+            return None;
+        }
+        let image = asset.kind == crate::core::types::MediaKind::Image;
+        let raw = extract_leaf_frame_sync(asset.decode_path(use_proxy), media_t, image, lw, lh)?;
+        let mut frame = crate::core::pixbuf::rgba8_to_f32(&raw);
+        // Sichtbarer Inhalt im transparent gepolsterten Puffer (contain-fit der
+        // Quelle, zentriert) — Bezugsrahmen für Effekte/Vignette, exakt wie der
+        // Export-Pfad (`render_segment_composited`).
+        let content = match asset.info.video.first() {
+            Some(v) if v.width > 0 && v.height > 0 => {
+                let (nw, nh) = (v.width as f64, v.height as f64);
+                let fit = (lw as f64 / nw).min(lh as f64 / nh);
+                let cw = ((nw * fit).round() as usize).clamp(1, lw);
+                let ch = ((nh * fit).round() as usize).clamp(1, lh);
+                ((lw - cw) / 2, (lh - ch) / 2, cw, ch)
+            }
+            _ => (0, 0, lw, lh),
+        };
+        // DIE Blatt-Verarbeitung der darunterliegenden Clips (Effekte → Grade),
+        // damit ihre Einzel-Korrekturen unter dem Adjustment-Pass erhalten
+        // bleiben — formelgleich zum Export und zur GPU-Vorschau.
+        let resolved = crate::core::effects::resolve_video_effects(&clip.effects, media_t);
+        if !resolved.is_empty() {
+            crate::core::effects::apply_effects_buffer(&mut frame, lw, lh, content, &resolved, threads);
+        }
+        let gp = crate::core::grade::precompute(&clip.grade);
+        let luts = crate::core::grade::resolve_luts(&clip.grade, &mut lut_cache);
+        if !gp.is_identity() || luts.is_active() {
+            crate::core::grade::grade_buffer(&mut frame, lw, lh, content, &gp, &luts.borrow(), threads);
+        }
+        Some(frame)
+    };
+    // Aktive Timeline (Deref) als Compositing-Wurzel; Resolver = SequenceStore.
+    let active: &crate::core::timeline::TimelineStore = &state.timeline;
+    let f = compose::composite_sequence_frame(active, &state.timeline, t, w, h, threads, &mut fetch, 0);
+    Some(crate::core::pixbuf::f32_to_rgba8_dithered(&f, w, h))
 }
 
 /// Ein Vorschau-Frame einer verschachtelten Sequenz rekursiv komponieren

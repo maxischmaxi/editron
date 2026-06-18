@@ -1,5 +1,6 @@
 pub mod autosave_dialog;
 pub mod command_palette;
+pub mod consolidate_dialog;
 pub mod context_menu;
 pub mod export_dialog;
 pub mod interop_report;

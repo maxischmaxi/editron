@@ -1,7 +1,8 @@
 //! Sequenz-Modell + Store: Tracks/Clips mit verknüpften A/V-Paaren,
 //! Snapshot-History (Undo/Redo) und allen Editier-Operationen.
 
-use crate::core::animation::{AnimatedParam, ClipFx, Interp, Keyframe, ParamId, ParamRef};
+use crate::core::adjustment::AdjustmentSpec;
+use crate::core::animation::{AnimatedParam, ClipFx, Interp, Keyframe, ParamId, ParamRef, KF_TIME_EPS};
 use crate::core::compose::BlendMode;
 use crate::core::effects::{EffectInstance, EffectKind};
 use crate::core::grade::ColorGrade;
@@ -42,6 +43,15 @@ const EPS: f64 = 1e-6;
 /// Zulässiger Geschwindigkeitsbereich (10 % – 1000 %, Premiere-üblich).
 pub const MIN_CLIP_SPEED: f64 = 0.1;
 pub const MAX_CLIP_SPEED: f64 = 10.0;
+
+/// Geschwindigkeit auf den gültigen Bereich klemmen (NaN/Inf → 1,0).
+pub fn clamp_speed(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(MIN_CLIP_SPEED, MAX_CLIP_SPEED)
+    } else {
+        1.0
+    }
+}
 
 /// Grenzen der manuell verstellten Spurhöhe (logische Pixel, Sash-Drag am
 /// Spurkopf). Die Untergrenze lässt Label + Toggles der kompaktesten Spurart
@@ -248,10 +258,25 @@ pub struct TimelineClip {
     /// die Optik kommt aus dem Spurstil (Formatversion 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<SubtitleSpec>,
-    /// Geschwindigkeitsfaktor (1,0 = normal). Beziehung überall:
-    /// belegte Medienspanne = duration × speed (Formatversion 5).
-    #[serde(default = "default_speed", skip_serializing_if = "is_default_speed")]
-    pub speed: f64,
+    /// Adjustment Layer (Einstellungsebene): Clip ohne Mediendatei, dessen
+    /// `grade`/`effects` als Korrektur-Pass auf das zusammengesetzte Bild ALLER
+    /// darunterliegenden Spuren wirken statt auf eigenes Material. `asset_id`
+    /// leer; `fx.opacity` regelt die Wirkstärke (Formatversion 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjustment: Option<AdjustmentSpec>,
+    /// Geschwindigkeit als animierbare Kurve (Time-Remap). Keyframe-Zeiten
+    /// sind CLIP-LOKALE Timeline-Sekunden (0 am Clipanfang), der Wert ist der
+    /// Faktor (1,0 = normal). Beziehung überall: belegte Medienspanne =
+    /// ∫₀ᵈᵘʳᵃᵗⁱᵒⁿ speed dt (für konstante Speed identisch zu duration × speed).
+    /// Statisch (keine Keyframes) wird als blanke Zahl serialisiert — alte
+    /// Projekte (`"speed": 0.37`) laden unverändert; animiert als Objekt
+    /// `{value, keyframes}` (Formatversion 5 → 18).
+    #[serde(
+        default = "default_speed_param",
+        skip_serializing_if = "is_default_speed_param",
+        with = "speed_serde"
+    )]
+    pub speed: AnimatedParam,
     /// Rückwärts: die Medienspanne [src_in, src_in + duration·speed) läuft
     /// in der Timeline von hinten nach vorn (src_in bleibt der tiefste Punkt).
     #[serde(default, skip_serializing_if = "is_false")]
@@ -298,12 +323,42 @@ fn default_enabled() -> bool {
     true
 }
 
-fn default_speed() -> f64 {
-    1.0
+fn default_speed_param() -> AnimatedParam {
+    AnimatedParam::fixed(1.0)
 }
 
-fn is_default_speed(v: &f64) -> bool {
-    (*v - 1.0).abs() < EPS
+fn is_default_speed_param(v: &AnimatedParam) -> bool {
+    !v.is_animated() && (v.value - 1.0).abs() < EPS
+}
+
+/// Serde für `TimelineClip::speed`: statisch ⇒ blanke Zahl (rückwärts-
+/// kompatibel zu Formatversion 5, alte/fremde Builds lesen sie weiter),
+/// animiert ⇒ AnimatedParam-Objekt `{value, keyframes}`.
+mod speed_serde {
+    use crate::core::animation::AnimatedParam;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &AnimatedParam, s: S) -> Result<S::Ok, S::Error> {
+        if v.is_animated() {
+            v.serialize(s)
+        } else {
+            s.serialize_f64(v.value)
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Scalar(f64),
+        Param(AnimatedParam),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<AnimatedParam, D::Error> {
+        Ok(match Repr::deserialize(d)? {
+            Repr::Scalar(v) => AnimatedParam::fixed(v),
+            Repr::Param(p) => p,
+        })
+    }
 }
 
 fn is_false(v: &bool) -> bool {
@@ -339,21 +394,50 @@ impl TimelineClip {
     // (via `compose::clip_media_time`) — Vorschau und Export laufen damit
     // garantiert über dieselbe Abbildung.
 
-    /// Effektiver, geklemmter Geschwindigkeitsfaktor.
+    /// Time-Remap aktiv? (Speed-Kurve mit Keyframes, kein Standbild.)
+    pub fn is_time_remapped(&self) -> bool {
+        self.speed.is_animated() && !self.freeze
+    }
+
+    /// Speed-Kurve mit auf [MIN, MAX] geklemmten Werten — hält die Medienzeit
+    /// streng monoton (Geschwindigkeit > 0), auch bei korrupten Eingaben.
+    /// (Öffentlich für den Export-Renderplan, der pro Frame exakt samplet.)
+    pub fn clamped_speed(&self) -> AnimatedParam {
+        let mut p = self.speed.clone();
+        p.value = clamp_speed(p.value);
+        for k in &mut p.keyframes {
+            k.value = clamp_speed(k.value);
+        }
+        p
+    }
+
+    /// Repräsentativer, geklemmter Geschwindigkeitsfaktor: konstante Speed
+    /// direkt, animiert das mittlere Tempo (Spanne ÷ Dauer) — für Badges,
+    /// Trim-Schranken und den Decoder-Fallback.
     pub fn eff_speed(&self) -> f64 {
-        if self.speed.is_finite() {
-            self.speed.clamp(MIN_CLIP_SPEED, MAX_CLIP_SPEED)
+        if self.is_time_remapped() && self.duration > EPS {
+            clamp_speed(self.media_span() / self.duration)
         } else {
-            1.0
+            clamp_speed(self.speed.value)
         }
     }
 
-    /// Vom Clip belegte Medienspanne in Quell-Sekunden (0 bei Standbild).
+    /// ∫ Geschwindigkeit dt über clip-lokale Timeline-Sekunden [`lo`, `hi`]
+    /// (zurückgelegte Medienzeit). Für konstante Speed = eff_speed·(hi−lo).
+    pub fn speed_integral(&self, lo: f64, hi: f64) -> f64 {
+        if !self.speed.is_animated() {
+            return self.eff_speed() * (hi - lo);
+        }
+        self.clamped_speed().integral(lo, hi)
+    }
+
+    /// Vom Clip belegte Medienspanne in Quell-Sekunden (0 bei Standbild) —
+    /// Integral der Speed-Kurve über die ganze Clipdauer.
     pub fn media_span(&self) -> f64 {
         if self.freeze {
             0.0
         } else {
-            self.duration * self.eff_speed()
+            self.speed_integral(0.0, self.duration)
         }
     }
 
@@ -367,7 +451,9 @@ impl TimelineClip {
         self.src_in + self.media_span()
     }
 
-    /// Medienfortschritt pro Timeline-Sekunde (signiert; 0 = Standbild).
+    /// Repräsentativer (konstanter) Medienfortschritt pro Timeline-Sekunde
+    /// (signiert; 0 = Standbild). Bei Time-Remap das mittlere Tempo — der
+    /// Decoder seekt pro Frame über `media_time_at` exakt nach.
     pub fn media_step(&self) -> f64 {
         if self.freeze {
             0.0
@@ -378,13 +464,14 @@ impl TimelineClip {
         }
     }
 
-    /// Medienzeit zur Sequenzzeit `t_seq` — lineare Abbildung, auch
-    /// außerhalb von [start, end) gültig (Übergangs-Handles extrapolieren).
+    /// Medienzeit zur Sequenzzeit `t_seq` — integriert die Speed-Kurve (bei
+    /// konstanter Speed lineare Abbildung), auch außerhalb von [start, end)
+    /// gültig (Übergangs-Handles extrapolieren mit der Randgeschwindigkeit).
     pub fn media_time_at(&self, t_seq: f64) -> f64 {
         if self.freeze {
             return self.src_in;
         }
-        let off = (t_seq - self.start) * self.eff_speed();
+        let off = self.speed_integral(0.0, t_seq - self.start);
         if self.reverse {
             self.media_out() - off
         } else {
@@ -392,7 +479,8 @@ impl TimelineClip {
         }
     }
 
-    /// Umkehrung von `media_time_at` (Standbild: Clipanfang).
+    /// Umkehrung von `media_time_at` (Standbild: Clipanfang). Konstante Speed
+    /// in geschlossener Form; Time-Remap per Bisektion der monotonen Kurve.
     pub fn seq_time_of_media(&self, media_t: f64) -> f64 {
         if self.freeze {
             return self.start;
@@ -402,19 +490,90 @@ impl TimelineClip {
         } else {
             media_t - self.src_in
         };
-        self.start + off / self.eff_speed()
+        self.start + self.tc_for_media_offset(off)
+    }
+
+    /// Löst ∫₀ᵗᶜ speed dt = `off` nach der clip-lokalen Zeit tc (monoton, da
+    /// Speed > 0). Außerhalb [0, span] mit der Randgeschwindigkeit extrapoliert.
+    fn tc_for_media_offset(&self, off: f64) -> f64 {
+        if !self.speed.is_animated() {
+            return off / self.eff_speed();
+        }
+        let clamped = self.clamped_speed();
+        let total = clamped.integral(0.0, self.duration);
+        if off <= 0.0 {
+            return off / clamp_speed(clamped.eval(0.0));
+        }
+        if off >= total {
+            return self.duration + (off - total) / clamp_speed(clamped.eval(self.duration));
+        }
+        let (mut lo, mut hi) = (0.0_f64, self.duration);
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if clamped.integral(0.0, mid) < off {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// Speed-Kurve über den clip-lokalen Bereich [`lo`, `hi`], neu verankert
+    /// (lo → 0) — beim Teilen/Trimmen für jede Hälfte. Statisch unverändert.
+    /// Randwerte werden als Keyframes gesetzt, damit die Medienzeit an der
+    /// Schnittkante stetig bleibt.
+    pub fn sliced_speed(&self, lo: f64, hi: f64) -> AnimatedParam {
+        if !self.speed.is_animated() || hi <= lo {
+            return self.speed.clone();
+        }
+        let interp_at = |t: f64| {
+            self.speed
+                .keyframes
+                .iter()
+                .rev()
+                .find(|k| k.t <= t + KF_TIME_EPS)
+                .map(|k| k.interp)
+                .unwrap_or_default()
+        };
+        let mut keys = vec![Keyframe {
+            t: 0.0,
+            value: self.speed.eval(lo),
+            interp: interp_at(lo),
+        }];
+        for k in &self.speed.keyframes {
+            if k.t > lo + KF_TIME_EPS && k.t < hi - KF_TIME_EPS {
+                keys.push(Keyframe {
+                    t: k.t - lo,
+                    value: k.value,
+                    interp: k.interp,
+                });
+            }
+        }
+        keys.push(Keyframe {
+            t: hi - lo,
+            value: self.speed.eval(hi),
+            interp: Interp::Linear,
+        });
+        let mut p = AnimatedParam {
+            value: keys[0].value,
+            keyframes: Vec::new(),
+        };
+        p.replace_keys(keys);
+        p
     }
 
     /// src_in der linken/rechten Hälfte beim Teilen `left_len` Timeline-
     /// Sekunden nach Clipanfang (Razor, Overwrite) — Medienspanne bleibt
-    /// in Summe exakt erhalten, auch rückwärts.
+    /// in Summe erhalten, auch rückwärts und bei Time-Remap. Die jeweiligen
+    /// Speed-Kurven liefert `sliced_speed`.
     pub fn split_src_ins(&self, left_len: f64) -> (f64, f64) {
         if self.freeze {
             return (self.src_in, self.src_in);
         }
-        let left_span = left_len * self.eff_speed();
+        let left_span = self.speed_integral(0.0, left_len);
         if self.reverse {
-            (self.src_in + (self.media_span() - left_span), self.src_in)
+            (self.media_out() - left_span, self.src_in)
         } else {
             (self.src_in, self.src_in + left_span)
         }
@@ -426,7 +585,8 @@ impl TimelineClip {
         if self.freeze {
             return Some("Standbild".to_string());
         }
-        if !self.reverse && is_default_speed(&self.speed) {
+        let animated = self.speed.is_animated();
+        if !self.reverse && !animated && is_default_speed_param(&self.speed) {
             return None;
         }
         let pct = self.eff_speed() * 100.0;
@@ -435,10 +595,12 @@ impl TimelineClip {
         } else {
             format!("{pct:.1}").replace('.', ",")
         };
+        // Bei Time-Remap markiert „~" das (mittlere) variable Tempo.
+        let tilde = if animated { "~" } else { "" };
         Some(if self.reverse {
-            format!("−{num} %")
+            format!("−{tilde}{num} %")
         } else {
-            format!("{num} %")
+            format!("{tilde}{num} %")
         })
     }
 
@@ -452,10 +614,16 @@ impl TimelineClip {
         self.subtitle.is_some()
     }
 
-    /// Generator-Clip ohne Mediendatei (Titel oder Untertitel) — von der
-    /// Verwaisten-Bereinigung und dem Player ausgenommen.
+    /// Adjustment Layer (Einstellungsebene, ohne Mediendatei)? Wirkt als
+    /// Korrektur-Pass auf das zusammengesetzte Bild der Spuren darunter.
+    pub fn is_adjustment(&self) -> bool {
+        self.adjustment.is_some()
+    }
+
+    /// Generator-Clip ohne Mediendatei (Titel, Untertitel oder Adjustment
+    /// Layer) — von der Verwaisten-Bereinigung und dem Player ausgenommen.
     pub fn is_generator(&self) -> bool {
-        self.is_title() || self.is_subtitle()
+        self.is_title() || self.is_subtitle() || self.is_adjustment()
     }
 
     /// Nest-Clip: bildet eine andere Sequenz ab (ohne eigene Mediendatei).
@@ -526,7 +694,8 @@ pub fn new_media_clip(
         effects: Vec::new(),
         title: None,
         subtitle: None,
-        speed: 1.0,
+        adjustment: None,
+        speed: crate::core::animation::AnimatedParam::fixed(1.0),
         reverse: false,
         freeze: false,
         markers: Vec::new(),
@@ -580,7 +749,8 @@ pub fn test_clip(track_id: &str) -> TimelineClip {
         effects: Vec::new(),
         title: None,
         subtitle: None,
-        speed: 1.0,
+        adjustment: None,
+        speed: crate::core::animation::AnimatedParam::fixed(1.0),
         reverse: false,
         freeze: false,
         markers: Vec::new(),
@@ -798,6 +968,7 @@ fn overwrite_range(clips: Vec<TimelineClip>, track_id: &str, start: f64, end: f6
             let mut left = clip.clone();
             left.src_in = clip.split_src_ins(left_len).0;
             left.duration = left_len;
+            left.speed = clip.sliced_speed(0.0, left_len);
             out.push(left);
         }
         if right_len >= MIN_CLIP_DURATION - EPS {
@@ -805,9 +976,11 @@ fn overwrite_range(clips: Vec<TimelineClip>, track_id: &str, start: f64, end: f6
             if keep_left {
                 right.id = new_id();
             }
-            right.src_in = clip.split_src_ins(end - clip.start).1;
+            let right_lo = end - clip.start;
+            right.src_in = clip.split_src_ins(right_lo).1;
             right.start = end;
             right.duration = right_len;
+            right.speed = clip.sliced_speed(right_lo, clip_end - clip.start);
             out.push(right);
         }
     }
@@ -943,6 +1116,35 @@ pub fn trim_range(
 /// Kopf-Trim der Medien-In, rückwärts beim End-Trim (Spiegelung).
 pub fn apply_trim(clip: &TimelineClip, edge: TrimEdge, delta: f64) -> TimelineClip {
     let mut c = clip.clone();
+    // Time-Remap: die Speed-Kurve auf den sichtbaren Bereich neu verankern und
+    // src_in über das Integral verschieben (Medienzeit an der ruhenden Kante
+    // bleibt stehen). Standbild bleibt unten beim Linearfall.
+    if clip.is_time_remapped() {
+        let dur0 = clip.duration;
+        match edge {
+            TrimEdge::Start => {
+                let consumed = clip.speed_integral(0.0, delta);
+                c.start += delta;
+                c.duration -= delta;
+                if !c.reverse {
+                    // Beim Kopf-Verlängern (delta < 0) sinkt src_in; die
+                    // avg-basierte Trim-Schranke kann lokal überschießen, wenn
+                    // das Kopf-Tempo über dem Mittel liegt — vor 0 klemmen.
+                    c.src_in = (c.src_in + consumed).max(0.0);
+                }
+                c.speed = clip.sliced_speed(delta, dur0);
+            }
+            TrimEdge::End => {
+                c.duration += delta;
+                if c.reverse {
+                    let consumed = clip.speed_integral(dur0, dur0 + delta);
+                    c.src_in = (c.src_in - consumed).max(0.0);
+                }
+                c.speed = clip.sliced_speed(0.0, dur0 + delta);
+            }
+        }
+        return c;
+    }
     match edge {
         TrimEdge::Start => {
             c.start += delta;

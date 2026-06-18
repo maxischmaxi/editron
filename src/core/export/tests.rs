@@ -54,7 +54,8 @@
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),
@@ -480,6 +481,45 @@
     }
 
     #[test]
+    fn plan_ducking_forces_all_tracks_to_bus_path() {
+        use crate::core::effects::{EffectInstance, EffectKind};
+        // Musikspur mit Ducking-Effekt; Key-Spur OHNE FX, aber mit Spur-Gain.
+        let mut music = track("a1", TrackKind::Audio);
+        music.effects.push(EffectInstance::new(EffectKind::Ducking));
+        let mut key = track("a2", TrackKind::Audio);
+        key.gain_db = -6.0; // würde im Schnellpfad in die Clip-Gains eingebacken
+        let (tl, media) = state_with(
+            vec![music, key],
+            vec![
+                clip("c1", "a1", TrackKind::Audio, "A", 0.0, 4.0),
+                clip("c2", "a2", TrackKind::Audio, "A", 0.0, 4.0),
+            ],
+            vec![video_asset("A", "/a.mp4")],
+        );
+        let plan = build_render_plan(&tl, &media, &test_settings(), &NoNests);
+        // Sobald geduckt wird, MUSS jede Spur über die Bus-Verarbeitung laufen
+        // (kein Schnellpfad), damit der Sidechain-Key auf Clip-Gain-Ebene liegt
+        // — formelgleich zum Player (Key = Summe der rohen anderen Spuren).
+        assert!(
+            plan.audio.is_empty(),
+            "Ducking ⇒ kein Schnellpfad-Master (Key bliebe sonst auf Fader-Ebene)"
+        );
+        assert_eq!(plan.audio_tracks.len(), 2, "beide Spuren als Bus-Spuren");
+        // Die Key-Spur trägt ihren Spur-Gain als Bus-Wert, NICHT eingebacken.
+        let key_track = plan
+            .audio_tracks
+            .iter()
+            .find(|t| t.gain_db != 0.0)
+            .expect("Key-Spur");
+        assert_eq!(key_track.gain_db, -6.0);
+        let g = db_to_linear(0.0);
+        assert!(
+            (key_track.clips[0].gain_l - g).abs() < 1e-6,
+            "Key-Clip-Gain roh (Spur-Fader NICHT eingebacken)"
+        );
+    }
+
+    #[test]
     fn processed_track_gain_matches_player_semantics() {
         // AudioTrackPlan (Export) und TimelineTrack (Player) werten Spur-Gain/
         // Pan inkl. Automation identisch aus — gemeinsame Mathematik, damit
@@ -890,7 +930,7 @@
     fn plan_maps_constant_speed_frame_accurate() {
         // 37 % auf einem 4-s-Clip ⇒ Dauer 4 s, Medienspanne 1,48 s.
         let mut c = clip("a", "v1", TrackKind::Video, "A", 0.0, 4.0);
-        c.speed = 0.37;
+        c.speed = AnimatedParam::fixed(0.37);
         let (tl, media) = state_with(
             vec![track("v1", TrackKind::Video)],
             vec![c],
@@ -906,6 +946,60 @@
         // Medienzeit von Frame f = src_in + f/fps · media_step.
         let sum: u64 = plan.segments.iter().map(|s| s.frames).sum();
         assert_eq!(sum, plan.total_frames);
+    }
+
+    #[test]
+    fn plan_time_remap_emits_per_frame_segments_with_integrated_media_time() {
+        // Speed-Rampe 1× → 3× linear über 4 s (clip-lokale Zeit).
+        // Medienzeit = ∫₀ᵗᶜ (1 + 0,5·t) dt = tc + 0,25·tc² (src_in 0).
+        let mut c = clip("a", "v1", TrackKind::Video, "A", 0.0, 4.0);
+        let mut sp = AnimatedParam::fixed(1.0);
+        sp.upsert_key(0.0, 1.0);
+        sp.upsert_key(4.0, 3.0);
+        c.speed = sp;
+        let (tl, media) = state_with(
+            vec![track("v1", TrackKind::Video)],
+            vec![c],
+            vec![video_asset("A", "/a.mp4")],
+        );
+        let plan = build_render_plan(&tl, &media, &test_settings(), &NoNests);
+        assert_eq!(plan.total_frames, 100); // 4 s × 25 fps
+        let sum: u64 = plan.segments.iter().map(|s| s.frames).sum();
+        assert_eq!(sum, 100);
+        // Variable Rate ⇒ keine Koaleszenz: jedes Segment ist ein Frame.
+        assert!(plan.segments.iter().all(|s| s.frames == 1), "Pro-Frame-Segmente");
+        // src_in jedes Frames folgt dem Integral der Speed-Kurve.
+        let fps = 25.0;
+        let media_at = |tc: f64| tc + 0.25 * tc * tc;
+        let mut f = 0u64;
+        for seg in &plan.segments {
+            let seq_t = f as f64 / fps;
+            let expected = media_at(seq_t);
+            assert!(
+                (seg.layers[0].src_in - expected).abs() < 1e-6,
+                "f={f}: {} vs {expected}",
+                seg.layers[0].src_in
+            );
+            f += seg.frames;
+        }
+    }
+
+    #[test]
+    fn plan_time_remap_mutes_audio() {
+        // Time-Remap-Audio ist stumm (Parität Player ↔ Export): eine konstante
+        // atempo-Kette kann die variable Kurve nicht abbilden.
+        let mut c = clip("a", "a1", TrackKind::Audio, "A", 0.0, 4.0);
+        let mut sp = AnimatedParam::fixed(1.0);
+        sp.upsert_key(0.0, 0.5);
+        sp.upsert_key(4.0, 2.0);
+        c.speed = sp;
+        let (tl, media) = state_with(
+            vec![track("a1", TrackKind::Audio)],
+            vec![c],
+            vec![video_asset("A", "/a.mp4")],
+        );
+        let plan = build_render_plan(&tl, &media, &test_settings(), &NoNests);
+        assert!(plan.audio.is_empty(), "Time-Remap-Audio stumm");
     }
 
     #[test]
@@ -950,7 +1044,7 @@
     fn plan_audio_doubles_source_span_for_speed() {
         // 2× Tempo: 2-s-Clip zieht 4 s Quelle, pitch-korrigiert.
         let mut c = clip("a", "a1", TrackKind::Audio, "A", 0.0, 2.0);
-        c.speed = 2.0;
+        c.speed = AnimatedParam::fixed(2.0);
         let (tl, media) = state_with(
             vec![track("a1", TrackKind::Audio)],
             vec![c],
@@ -1470,6 +1564,137 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Mittlerer Pegel (mean_volume, dBFS) eines Zeitfensters eines Streams —
+    /// via ffmpeg `atrim`+`volumedetect`. Für die fenster-genaue Ducking-
+    /// Verifikation (Pegel vor vs. während des Key-Signals).
+    fn segment_mean_db(path: &std::path::Path, stream: usize, start: f64, end: f64) -> f64 {
+        let out = Command::new(crate::services::ffmpeg_bin())
+            .args(["-hide_banner", "-nostats", "-v", "info"])
+            .args(["-i", &path.to_string_lossy()])
+            .args(["-map", &format!("0:a:{stream}")])
+            .args([
+                "-af",
+                &format!("atrim=start={start}:end={end},volumedetect"),
+            ])
+            .args(["-f", "null", "-"])
+            .output()
+            .expect("ffmpeg-Messung startbar");
+        let log = String::from_utf8_lossy(&out.stderr);
+        for line in log.lines() {
+            if let Some(i) = line.find("mean_volume:") {
+                let rest = line[i + "mean_volume:".len()..].trim();
+                if let Some(num) = rest.split_whitespace().next() {
+                    if let Ok(v) = num.parse::<f64>() {
+                        return v;
+                    }
+                }
+            }
+        }
+        panic!("mean_volume nicht gefunden für Stream {stream} [{start}..{end}]: {log}");
+    }
+
+    /// End-to-End: Auto-Ducking im EXPORT-Pfad. Die Musikspur (a1) trägt einen
+    /// Ducking-Bus-Effekt, dessen Sidechain-Key die andere Spur (a2, „Sprache")
+    /// ist. Solange a2 still ist, bleibt die Musik laut; sobald a2 ab Sekunde 2
+    /// einsetzt, muss der gerenderte Musik-Stem deutlich abgesenkt sein —
+    /// formelgleich zum Player (gleiche `AudioFxChain`, Key = Summe der anderen
+    /// Spuren). Stems-Export, damit die Musikspur isoliert messbar ist.
+    #[test]
+    fn end_to_end_ducking_lowers_music_under_speech_key() {
+        let dir = std::env::temp_dir().join(format!("editron-export-duck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_music = dir.join("music.wav");
+        let src_key = dir.join("key.wav");
+        let out = dir.join("duck.mov");
+
+        // Musik: 200-Hz-Sinus, 4 s, Vollpegel. Key/„Sprache": 1-kHz-Sinus, 2 s
+        // (wird ab Sekunde 2 platziert).
+        for (path, freq, dur) in [(&src_music, 200, 4), (&src_key, 1000, 2)] {
+            let gen = Command::new(crate::services::ffmpeg_bin())
+                .args(["-y", "-v", "error"])
+                .args([
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("sine=frequency={freq}:duration={dur}:sample_rate=48000"),
+                ])
+                .args(["-c:a", "pcm_s16le"])
+                .arg(path)
+                .status()
+                .expect("ffmpeg nicht startbar — Tests brauchen ffmpeg im PATH");
+            assert!(gen.success(), "Testton nicht erzeugt");
+        }
+
+        let audio_asset = |id: &str, path: &std::path::Path| {
+            let mut a = video_asset(id, &path.to_string_lossy());
+            a.kind = MediaKind::Audio;
+            a.info.video.clear();
+            a
+        };
+
+        // Musikspur a1 mit Ducking-Bus-Effekt (niedrige Schwelle, schneller
+        // Attack ⇒ der Vollpegel-Key drückt die Musik kräftig herunter).
+        let mut duck = crate::core::effects::EffectInstance::new(
+            crate::core::effects::EffectKind::Ducking,
+        );
+        duck.params[0] = AnimatedParam::fixed(-45.0); // Threshold
+        duck.params[1] = AnimatedParam::fixed(12.0); // Ratio
+        duck.params[2] = AnimatedParam::fixed(5.0); // Attack ms
+        duck.params[3] = AnimatedParam::fixed(80.0); // Release ms
+        let mut t1 = track("a1", TrackKind::Audio);
+        t1.effects.push(duck);
+        let (tl, media) = state_with(
+            vec![t1, track("a2", TrackKind::Audio)],
+            vec![
+                clip("c1", "a1", TrackKind::Audio, "MUSIC", 0.0, 4.0),
+                // Key setzt erst ab Sekunde 2 ein.
+                clip("c2", "a2", TrackKind::Audio, "KEY", 2.0, 2.0),
+            ],
+            vec![
+                audio_asset("MUSIC", &src_music),
+                audio_asset("KEY", &src_key),
+            ],
+        );
+
+        let mut settings = test_settings();
+        settings.container = container("mov");
+        settings.video = None;
+        settings.audio = Some(default_audio("pcm24", None));
+        settings.audio_stems = true;
+        settings.output = out.to_string_lossy().into_owned();
+
+        let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+        assert_eq!(plan.audio_tracks.len(), 2, "zwei Stem-Tracks (Musik + Key)");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let children = Arc::new(Mutex::new(Vec::new()));
+        run_export_worker("duck-job".into(), plan, settings, tx, cancel, children);
+
+        let mut done: Option<(bool, Option<String>)> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServiceEvent::SequenceExportDone { ok, error, .. } = ev {
+                done = Some((ok, error));
+            }
+        }
+        let (ok, error) = done.expect("Done-Event fehlt");
+        assert!(ok, "Ducking-Export fehlgeschlagen: {error:?}");
+        assert!(out.exists(), "Zieldatei fehlt");
+
+        // Musik-Stem (Stream 0): vor dem Key laut, während des Keys abgesenkt.
+        let open = segment_mean_db(&out, 0, 0.3, 1.5);
+        let ducked = segment_mean_db(&out, 0, 2.6, 3.8);
+        assert!(open > -40.0, "Musik vor dem Key hörbar: {open} dBFS");
+        assert!(
+            open - ducked > 15.0,
+            "Key senkt die Musik deutlich ab: vorher {open} dBFS, geduckt {ducked} dBFS (Δ {})",
+            open - ducked
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn loudnorm_json_parses_measured_values() {
         // Realistischer loudnorm-Log: Text-Präfix + angehängter JSON-Block.
@@ -1845,7 +2070,7 @@
             let mut v = clip("v", "v1", TrackKind::Video, "VID", 0.0, 2.0);
             v.src_in = 2.0;
             v.src_duration = 8.0;
-            v.speed = speed;
+            v.speed = crate::core::animation::AnimatedParam::fixed(speed);
             v.reverse = reverse;
             v.freeze = freeze;
             let (tl, media) = state_with(

@@ -80,6 +80,8 @@ pub enum DialogId {
     /// Ergebnis eines Interop-Import/-Exports (Kennzahlen + Auslassungen).
     /// Inhalt in `AppStore::interop_report`.
     InteropReport,
+    /// „Projekt konsolidieren …“: Medien einsammeln + portabel speichern.
+    Consolidate,
 }
 
 /// Ziel des Marker-Bearbeiten-Dialogs: welche Sammlung + welcher Marker.
@@ -986,6 +988,12 @@ pub struct AudioStore {
     /// laufenden Clip-/Spur-Ketten — Quelle der GR-Meter im Panel
     /// Effekteinstellungen. fx-IDs sind global eindeutig.
     pub fx_gain_reduction: std::collections::HashMap<String, f32>,
+    /// BS.1770-Lautheit des Master-Mixblocks (Momentary/Short-Term/Integrated)
+    /// + True-Peak — gespeist vom Player, gelesen vom Audio-Mixer.
+    pub loudness: crate::core::loudness::LoudnessSnapshot,
+    /// Vom Mixer gesetzt, vom Player konsumiert: Integrated/True-Peak-Messung
+    /// auf Wunsch neu starten (manueller Reset-Knopf).
+    pub loudness_reset: bool,
 }
 
 /// Wiedergabeauflösung: 1 = voll, darunter kleinerer Offscreen-Render.
@@ -1023,6 +1031,10 @@ pub struct MonitorStore {
     /// Der Programmmonitor zeigt in diesem Frame den Sequenz-Render-Cache
     /// (ein Decoder statt Live-Compositing) — vom Player je Frame gesetzt.
     pub program_from_cache: bool,
+    /// Am Playhead ist ein Adjustment Layer aktiv: das Programmbild wird CPU-
+    /// komponiert (PROGRAM_COMPOSITE_KEY) statt per GPU-Layer gezeichnet —
+    /// vom Player je Frame gesetzt.
+    pub program_adjustment: bool,
     pub blend_request: Option<crate::ui::blend_shader::BlendCompositingRequest>,
 }
 
@@ -1083,6 +1095,7 @@ impl Default for MonitorStore {
             show_perf_overlay: false,
             perf: PerfStats::default(),
             program_from_cache: false,
+            program_adjustment: false,
             blend_request: None,
         }
     }

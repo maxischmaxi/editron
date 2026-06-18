@@ -69,11 +69,11 @@ impl TimelineStore {
             // allein lässt z. B. start=-5 oder src_in=-1 durch).
             c.start = c.start.max(0.0);
             c.src_in = c.src_in.max(0.0);
-            // Geschwindigkeit defensiv klemmen (fremde/kaputte Dateien).
-            if !c.speed.is_finite() || c.speed <= 0.0 {
-                c.speed = 1.0;
-            } else {
-                c.speed = c.speed.clamp(MIN_CLIP_SPEED, MAX_CLIP_SPEED);
+            // Geschwindigkeit defensiv klemmen (fremde/kaputte Dateien) — Basis
+            // wie auch jeder Keyframe der Time-Remap-Kurve.
+            c.speed.value = crate::core::timeline::clamp_speed(c.speed.value);
+            for k in &mut c.speed.keyframes {
+                k.value = crate::core::timeline::clamp_speed(k.value);
             }
             if c.freeze {
                 c.reverse = false;

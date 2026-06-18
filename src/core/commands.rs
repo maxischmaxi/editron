@@ -980,6 +980,18 @@ pub fn build_registry() -> CommandRegistry {
         "Projekt",
         |ctx, _| ctx.state.app.open_dialog = Some(DialogId::Relink),
     ));
+    commands.push(cmd(
+        "project.consolidate",
+        "Projekt konsolidieren…",
+        "Projekt",
+        |ctx, _| {
+            // Wiedergabe anhalten — die Konsolidierung kopiert/transkodiert
+            // Medien und braucht keine Decode-Konkurrenz.
+            ctx.state.playback.program_playing = false;
+            ctx.state.playback.source.playing = false;
+            ctx.state.app.open_dialog = Some(DialogId::Consolidate);
+        },
+    ));
 
     // ----------------------------------------------------------- Bearbeiten
     // Rückgängig/Wiederholen koordinieren Timeline- und Medien-History: beide
@@ -2135,6 +2147,37 @@ pub fn build_registry() -> CommandRegistry {
         ),
         "timelineInOutSet",
     ));
+    // Replace (Premiere „Replace Edit", Resolve F11): den Clip unter dem
+    // Playhead bzw. den ausgewählten Clip durch das Quellmaterial ersetzen —
+    // Dauer/Position bleiben, Sync via Match Frame. Tastaturgetrieben.
+    commands.push(with_when(
+        cmd(
+            "timeline.replace",
+            "Mit Quellmaterial ersetzen (Replace)",
+            "Timeline",
+            |ctx, _| {
+                if let Some(msg) = crate::core::edit::perform_replace(ctx.state) {
+                    status(ctx, &msg);
+                }
+            },
+        ),
+        "timelineHasClips",
+    ));
+    // Fit-to-Fill (Resolve Shift+F11): Vier-Punkt-Schnitt — die Clip-
+    // Geschwindigkeit füllt die Quell-Range in die Sequenz-In/Out-Range.
+    commands.push(with_when(
+        cmd(
+            "timeline.fitToFill",
+            "Einpassen (Fit to Fill)",
+            "Timeline",
+            |ctx, _| {
+                if let Some(msg) = crate::core::edit::perform_fit_to_fill(ctx.state) {
+                    status(ctx, &msg);
+                }
+            },
+        ),
+        "timelineInOutSet",
+    ));
     commands.push(with_when(
         cmd(
             "timeline.matchFrame",
@@ -2665,6 +2708,34 @@ pub fn build_registry() -> CommandRegistry {
         c.bound_arg = Some(serde_json::json!({ "template": template.key() }));
         commands.push(c);
     }
+    fn add_adjustment_layer(ctx: &mut CommandCtx, _args: Option<&Value>) {
+        // Standard-Spanne: In/Out-Bereich, sonst Playhead bis Sequenzende
+        // (alles ab dem Playhead grading-fähig), sonst eine Default-Dauer.
+        use crate::core::timeline::{IMAGE_DEFAULT_DURATION, MIN_CLIP_DURATION};
+        let tl = &ctx.state.timeline;
+        let (at, duration) = match (tl.in_point, tl.out_point) {
+            (Some(i), Some(o)) if o - i > MIN_CLIP_DURATION => (i.max(0.0), o - i.max(0.0)),
+            _ => {
+                let at = tl.playhead_sec.max(0.0);
+                let end = sequence_end(&tl.clips);
+                let dur = if end - at > MIN_CLIP_DURATION {
+                    end - at
+                } else {
+                    IMAGE_DEFAULT_DURATION
+                };
+                (at, dur)
+            }
+        };
+        ctx.state.timeline.add_adjustment_clip(at, duration);
+        ctx.state.dock.open_panel("color");
+        status(ctx, "Einstellungsebene eingefügt");
+    }
+    commands.push(cmd(
+        "timeline.addAdjustmentLayer",
+        "Einstellungsebene hinzufügen",
+        "Grafik",
+        add_adjustment_layer,
+    ));
     commands.push(cmd(
         "monitor.toggleSafeMargins",
         "Sichere Ränder im Programmmonitor",
@@ -3053,7 +3124,8 @@ mod tests {
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),
@@ -3103,7 +3175,8 @@ mod tests {
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),

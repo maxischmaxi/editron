@@ -131,7 +131,8 @@ fn clip_is_complex(c: &TimelineClip) -> bool {
     !c.effects.is_empty()
         || !c.grade.is_default()
         || !c.fx.is_default()
-        || (c.speed - 1.0).abs() > 1e-6
+        || c.is_time_remapped()
+        || (c.eff_speed() - 1.0).abs() > 1e-6
         || c.reverse
         || c.freeze
         || c.title.is_some()
@@ -356,7 +357,8 @@ mod tests {
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),

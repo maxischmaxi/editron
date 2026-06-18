@@ -38,7 +38,12 @@ impl TimelineStore {
             return;
         }
         let unchanged = targets.iter().all(|c| {
-            (c.eff_speed() - speed).abs() < EPS && c.reverse == reverse && c.freeze == freeze
+            // Animierte Clips immer flachklopfen (eine Time-Remap-Kurve mit dem
+            // mittleren Tempo == eingestelltem Wert gilt nicht als unverändert).
+            !c.speed.is_animated()
+                && (c.eff_speed() - speed).abs() < EPS
+                && c.reverse == reverse
+                && c.freeze == freeze
         });
         if unchanged {
             return;
@@ -131,7 +136,9 @@ impl TimelineStore {
                 dur = dur.min(*cap);
             }
             c.duration = dur;
-            c.speed = speed;
+            // Konstantes Tempo aus dem Dialog ersetzt eine etwaige Time-Remap-
+            // Kurve durch einen festen Wert.
+            c.speed = AnimatedParam::fixed(speed);
             c.reverse = reverse && !freeze;
             c.freeze = freeze;
         }
@@ -262,7 +269,86 @@ impl TimelineStore {
             effects: Vec::new(),
             title: Some(spec),
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
+            reverse: false,
+            freeze: false,
+            markers: Vec::new(),
+            nest_seq: None,
+            multicam: None,
+            blend_mode: crate::core::compose::BlendMode::default(),
+        };
+        let id = clip.id.clone();
+        self.selected_clip_ids = vec![id.clone()];
+        self.selected_transition_ids.clear();
+        self.clips.push(clip);
+        id
+    }
+
+    // -------------------------------------------------- Adjustment Layer
+
+    /// Adjustment Layer (Einstellungsebene) bei `at` über der Dauer `duration`
+    /// anlegen — auf der nächsten freien Videospur ÜBER dem obersten belegten
+    /// Material (wie Titel), damit sein Korrektur-Pass auf alles Darunterliegende
+    /// wirkt. Trägt anfangs ein neutrales Grade/keine Effekte (der Nutzer
+    /// gradet ihn anschließend im Farbe-/Effekte-Panel). Liefert die Clip-ID.
+    pub fn add_adjustment_clip(&mut self, at: f64, duration: f64) -> String {
+        let at = at.max(0.0);
+        let duration = duration.max(MIN_CLIP_DURATION);
+        let end = at + duration;
+        self.push_history();
+
+        let locked = locked_track_ids(&self.tracks);
+        let occupied = |track_id: &str| -> bool {
+            self.clips
+                .iter()
+                .any(|c| c.track_id == track_id && c.start < end - EPS && c.end() > at + EPS)
+        };
+        let video: Vec<(usize, String)> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == TrackKind::Video)
+            .map(|(i, t)| (i, t.id.clone()))
+            .collect();
+        let top_occupied = video.iter().position(|(_, id)| occupied(id));
+        let candidates: Vec<&(usize, String)> = match top_occupied {
+            Some(limit) => video.iter().take(limit).rev().collect(),
+            None => video.iter().rev().collect(),
+        };
+        let track_id = candidates
+            .into_iter()
+            .find(|(_, id)| !locked.contains(id) && !occupied(id))
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| {
+                let track = make_track(TrackKind::Video);
+                let id = track.id.clone();
+                let at = self.video_block_start();
+                self.tracks.insert(at, track);
+                id
+            });
+
+        let clip = TimelineClip {
+            extra: Default::default(),
+            id: new_id(),
+            track_id,
+            asset_id: String::new(),
+            name: crate::core::adjustment::AdjustmentSpec::display_name(),
+            kind: TrackKind::Video,
+            start: at,
+            duration,
+            src_in: 0.0,
+            src_duration: f64::INFINITY,
+            link_id: None,
+            enabled: true,
+            gain_db: 0.0,
+            fx: ClipFx::default(),
+            grade: ColorGrade::default(),
+            effects: Vec::new(),
+            title: None,
+            subtitle: None,
+            adjustment: Some(AdjustmentSpec::new()),
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),
@@ -420,7 +506,8 @@ impl TimelineStore {
             effects: Vec::new(),
             title: None,
             subtitle: Some(spec),
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),

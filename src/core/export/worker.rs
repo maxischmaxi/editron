@@ -139,6 +139,15 @@ impl FrameProgress for Progress<'_> {
     }
 }
 
+/// Fortschritts-Senke, die nichts meldet — für interne Zwischen-Renderings
+/// (z. B. die Sidechain-Key-WAV beim Auto-Ducking), die nicht im Export-
+/// Fortschritt auftauchen sollen.
+struct NullProgress;
+
+impl FrameProgress for NullProgress {
+    fn advance(&mut self, _units: u64) {}
+}
+
 /// Schlanke Fortschritts-Senke für den Render-Cache: zählt Frames und ruft
 /// gedrosselt (≤ 10/s) einen Callback `(done, total)`.
 struct CountProgress<'a> {
@@ -582,8 +591,8 @@ pub(crate) fn mix_audio_to_wav(
     // (Bus-FX wirken auf die Spur-Summe — exakt wie der Player-Mixdown).
     for (idx, track) in plan.audio_tracks.iter().enumerate() {
         process_audio_track(
-            &mut file, data_off, total_frames, rate, ch, wav, idx, track, cancel, children,
-            progress,
+            &mut file, data_off, total_frames, rate, ch, wav, idx, track, &plan.audio_tracks,
+            &plan.audio, cancel, children, progress,
         )?;
     }
 
@@ -617,8 +626,8 @@ pub(crate) fn mix_audio_stems(
         // stille) Spur hinein ⇒ exakt das Spur-Signal im Stem.
         let (mut file, data_off) = create_silent_wav(stem, rate, ch, data_bytes)?;
         process_audio_track(
-            &mut file, data_off, total_frames, rate, ch, stem, idx, track, cancel, children,
-            progress,
+            &mut file, data_off, total_frames, rate, ch, stem, idx, track, &plan.audio_tracks,
+            &plan.audio, cancel, children, progress,
         )?;
         file.sync_all().ok();
     }
@@ -660,7 +669,7 @@ fn mix_clips_into_wav(
     clips: &[AudioClipPlan],
     cancel: &AtomicBool,
     children: &mut ChildRegistry,
-    progress: &mut Progress,
+    progress: &mut dyn FrameProgress,
 ) -> Result<(), String> {
     for clip in clips {
         if cancel.load(Ordering::Relaxed) {
@@ -818,12 +827,18 @@ fn process_audio_track(
     base_wav: &Path,
     idx: usize,
     track: &AudioTrackPlan,
+    all_tracks: &[AudioTrackPlan],
+    fast_clips: &[AudioClipPlan],
     cancel: &AtomicBool,
     children: &mut ChildRegistry,
     progress: &mut Progress,
 ) -> Result<(), String> {
     let data_bytes = total_frames * ch as u64 * 4;
     let tmp = base_wav.with_extension(format!("track{idx}.wav"));
+    // Sidechain-Key (Auto-Ducking): Summe ALLER anderen Audioclips. Wird nur
+    // gerendert, wenn die Bus-Kette einen Key verlangt. Räumt sich nach `run`
+    // wieder auf (wie die Spur-Temp-WAV).
+    let key_tmp = base_wav.with_extension(format!("trackkey{idx}.wav"));
     let mut run = || -> Result<(), String> {
         // 1. Clips der Spur in die Temp-WAV (nur Clip-Gain).
         let (mut tfile, toff) = create_silent_wav(&tmp, rate, ch, data_bytes)?;
@@ -836,11 +851,33 @@ fn process_audio_track(
         let fx_refs: Vec<&EffectInstance> = track.effects.iter().collect();
         let mut fx_chain = AudioFxChain::build(&fx_refs, rate, ch, track.seq_start);
         let fx_animated = track.effects.iter().any(|e| e.any_animated());
+        let needs_sc = fx_chain.as_ref().is_some_and(|c| c.needs_sidechain());
+        // Sidechain-Key rendern: Schnellpfad-Clips + alle ANDEREN Bus-Spuren —
+        // formelgleich zum Player (dort Summe der anderen Roh-Spuren). Eigener
+        // No-Op-Fortschritt, damit der Export-Balken unverfälscht bleibt.
+        let key_src: Option<(std::fs::File, u64)> = if needs_sc {
+            let mut key_clips: Vec<AudioClipPlan> = fast_clips.to_vec();
+            for (j, t) in all_tracks.iter().enumerate() {
+                if j != idx {
+                    key_clips.extend(t.clips.iter().cloned());
+                }
+            }
+            let (mut kfile, koff) = create_silent_wav(&key_tmp, rate, ch, data_bytes)?;
+            let mut null = NullProgress;
+            mix_clips_into_wav(
+                &mut kfile, koff, total_frames, rate, ch, &key_clips, cancel, children, &mut null,
+            )?;
+            Some((kfile, koff))
+        } else {
+            None
+        };
         const ENV_BLOCK: usize = 256;
         const CHUNK_FRAMES: usize = 32768;
         let mut tbuf = vec![0u8; CHUNK_FRAMES * ch * 4];
         let mut mbuf = vec![0u8; CHUNK_FRAMES * ch * 4];
+        let mut kbuf = vec![0u8; CHUNK_FRAMES * ch * 4];
         let mut fresh = vec![0f32; CHUNK_FRAMES * ch];
+        let mut kfresh = vec![0f32; CHUNK_FRAMES * ch];
         let mut frames_done: u64 = 0;
         while frames_done < total_frames {
             if cancel.load(Ordering::Relaxed) {
@@ -858,6 +895,19 @@ fn process_audio_track(
                 fresh[i] =
                     f32::from_le_bytes([tbuf[off], tbuf[off + 1], tbuf[off + 2], tbuf[off + 3]]);
             }
+            // Key-Block lesen (gleiches Frame-Raster wie der Spur-Block).
+            if let Some((kfile, koff)) = key_src.as_ref() {
+                let kpos = koff + frames_done * ch as u64 * 4;
+                let mut kf = kfile;
+                kf.seek(SeekFrom::Start(kpos)).map_err(|e| e.to_string())?;
+                kf.read_exact(&mut kbuf[..bytes])
+                    .map_err(|e| format!("Key-Lesen: {e}"))?;
+                for i in 0..now * ch {
+                    let off = i * 4;
+                    kfresh[i] =
+                        f32::from_le_bytes([kbuf[off], kbuf[off + 1], kbuf[off + 2], kbuf[off + 3]]);
+                }
+            }
             let mpos = data_off + frames_done * ch as u64 * 4;
             master.seek(SeekFrom::Start(mpos)).map_err(|e| e.to_string())?;
             master
@@ -871,7 +921,10 @@ fn process_audio_track(
                     if fx_animated {
                         chain.retune(&fx_refs, track.seq_start + mix_t);
                     }
-                    chain.process(&mut fresh[fi * ch..(fi + n) * ch]);
+                    let key_slice = key_src
+                        .as_ref()
+                        .map(|_| &kfresh[fi * ch..(fi + n) * ch]);
+                    chain.process_with_sidechain(&mut fresh[fi * ch..(fi + n) * ch], key_slice);
                 }
                 // Spur-Gain/Pan inkl. Automation (Sequenzzeit) × Master.
                 let g = db_to_linear(track.gain_db_at(mix_t));
@@ -907,6 +960,7 @@ fn process_audio_track(
     };
     let result = run();
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&key_tmp);
     result
 }
 
@@ -1976,6 +2030,22 @@ enum SegLayer {
     Title(TitleLayer),
     /// Verschachtelte Sequenz, rekursiv komponiert.
     Nest(NestLayer),
+    /// Adjustment Layer (Einstellungsebene): kein eigenes Bild, sondern ein
+    /// Korrektur-Pass auf das bis hierhin komponierte Canvas der Spuren darunter.
+    Adjustment(AdjustmentLayer),
+}
+
+/// Adjustment-Layer-Stufe im Compositing-Pfad: hält die vorberechnete
+/// Farbkorrektur + den (animierbaren) Effekt-Stapel; pro Frame wird der Pass
+/// (Effekte → Grade, nach Deckkraft überblendet) auf das Canvas angewendet —
+/// formelgleich zur Vorschau (`compose::adjustment_pass_buffer`).
+struct AdjustmentLayer {
+    grade: grade::GradeParams,
+    effects: Vec<EffectInstance>,
+    fx: ClipFx,
+    src_in: f64,
+    media_step: f64,
+    transitions: Vec<PlanTransition>,
 }
 
 /// Titel-Layer: einmal gerastert (gemeinsamer Rasterizer mit dem
@@ -2302,6 +2372,19 @@ fn render_segment_composited(
     };
 
     for plan_layer in &segment.layers {
+        // Adjustment Layer: kein Decoder — der Korrektur-Pass wirkt im
+        // Compositing-Loop auf das Canvas darunter.
+        if plan_layer.adjustment {
+            layers.push(SegLayer::Adjustment(AdjustmentLayer {
+                grade: grade::precompute(&plan_layer.grade),
+                effects: plan_layer.effects.clone(),
+                fx: plan_layer.fx.clone(),
+                src_in: plan_layer.src_in,
+                media_step: plan_layer.media_step,
+                transitions: plan_layer.transitions.clone(),
+            }));
+            continue;
+        }
         // Titel: CPU-Raster statt Decoder — Auflösung wächst mit der
         // maximalen Skalierung im Segment (Schärfe bei Zoom, wie Streams).
         if let Some(spec) = &plan_layer.title {
@@ -2529,7 +2612,8 @@ fn render_segment_composited(
                 SegLayer::Stream(s) => s.advance(threads, f as f64 / fps, children),
                 SegLayer::Title(t) => t.advance(threads, f as f64 / fps),
                 SegLayer::Nest(n) => n.advance(threads, f as f64 / fps, nests, children),
-                SegLayer::Solid { .. } => {}
+                // Farbflächen + Adjustment Layer haben keinen Decoder.
+                SegLayer::Solid { .. } | SegLayer::Adjustment(_) => {}
             }
         }
         // Canvas opak schwarz zurücksetzen (f32).
@@ -2542,22 +2626,46 @@ fn render_segment_composited(
         let t_off = f as f64 / fps;
         // Exportzeit des Frames — Bezugssystem der Übergangs-Fenster.
         let seq_t = (seg_start_frame + f) as f64 / fps;
-        let frames: Vec<compose::CpuLayerFrame> = layers
-            .iter()
-            .filter_map(|layer| match layer {
+        // Stapelweise komponieren (unten → oben). Ein Adjustment Layer
+        // unterbricht den Stapel: erst alles Darunterliegende auf das Canvas
+        // mischen, dann den Korrektur-Pass darauf anwenden, dann weiter —
+        // formelgleich zum Player-CPU-Composite.
+        let mut batch: Vec<compose::CpuLayerFrame> = Vec::new();
+        for layer in &layers {
+            match layer {
+                SegLayer::Adjustment(a) => {
+                    if !batch.is_empty() {
+                        compose::composite_frame(&mut canvas, tw, th, &batch, threads);
+                        batch.clear();
+                    }
+                    let media_t = a.src_in + t_off * a.media_step;
+                    let fx = compose::eval_fx(&a.fx, media_t);
+                    let t_fx = eval_plan_transitions(&a.transitions, seq_t);
+                    let opacity = (fx.opacity * t_fx.opacity) as f32;
+                    let resolved = effects::resolve_video_effects(&a.effects, media_t);
+                    compose::adjustment_pass_buffer(
+                        &mut canvas,
+                        tw,
+                        th,
+                        &resolved,
+                        &a.grade,
+                        opacity,
+                        threads,
+                    );
+                }
                 SegLayer::Stream(l) => {
                     let fx = compose::eval_fx(&l.fx, l.src_in + t_off * l.media_step);
                     let t_fx = eval_plan_transitions(&l.transitions, seq_t);
                     let opacity = fx.opacity * t_fx.opacity;
                     if opacity <= 0.0 {
-                        return None;
+                        continue;
                     }
                     // Der Layer-Puffer repräsentiert das volle Frame →
                     // natürliche Größe = Framegröße (Fit-Faktor 1).
                     let mut quad =
                         compose::layer_quad(tw as f64, th as f64, tw as f64, th as f64, &fx);
                     compose::apply_transition_to_quad(&mut quad, &t_fx, tw as f64, th as f64);
-                    Some(compose::CpuLayerFrame {
+                    batch.push(compose::CpuLayerFrame {
                         data: &l.frame,
                         w: l.w,
                         h: l.h,
@@ -2565,14 +2673,14 @@ fn render_segment_composited(
                         opacity,
                         mask: t_fx.mask.map(|m| compose::mask_to_pixels(&m, tw, th)),
                         blend_mode: l.blend_mode,
-                    })
+                    });
                 }
                 SegLayer::Solid { data, transitions } => {
                     let t_fx = eval_plan_transitions(transitions, seq_t);
                     if t_fx.opacity <= 0.0 {
-                        return None;
+                        continue;
                     }
-                    Some(compose::CpuLayerFrame {
+                    batch.push(compose::CpuLayerFrame {
                         data,
                         w: 2,
                         h: 2,
@@ -2586,7 +2694,7 @@ fn render_segment_composited(
                         opacity: t_fx.opacity,
                         mask: None,
                         blend_mode: compose::BlendMode::Normal,
-                    })
+                    });
                 }
                 // Identische Quad-Mathematik wie Streams: der Titel-Raster
                 // repräsentiert das volle Frame (Fit-Faktor 1).
@@ -2595,14 +2703,14 @@ fn render_segment_composited(
                     let t_fx = eval_plan_transitions(&l.transitions, seq_t);
                     let opacity = fx.opacity * t_fx.opacity;
                     if opacity <= 0.0 {
-                        return None;
+                        continue;
                     }
                     let mut quad =
                         compose::layer_quad(tw as f64, th as f64, tw as f64, th as f64, &fx);
                     // Erweiterter Raster (Abspann): Quad vertikal strecken.
                     quad.h *= l.extend_k as f64;
                     compose::apply_transition_to_quad(&mut quad, &t_fx, tw as f64, th as f64);
-                    Some(compose::CpuLayerFrame {
+                    batch.push(compose::CpuLayerFrame {
                         data: l.current(),
                         w: l.w,
                         h: l.h,
@@ -2610,7 +2718,7 @@ fn render_segment_composited(
                         opacity,
                         mask: t_fx.mask.map(|m| compose::mask_to_pixels(&m, tw, th)),
                         blend_mode: l.blend_mode,
-                    })
+                    });
                 }
                 // Nest: das innere Frame (innere Auflösung) wird contain-fit
                 // ins äußere Frame gelegt — natürliche Größe = innere Auflösung.
@@ -2619,12 +2727,12 @@ fn render_segment_composited(
                     let t_fx = eval_plan_transitions(&l.transitions, seq_t);
                     let opacity = fx.opacity * t_fx.opacity;
                     if opacity <= 0.0 {
-                        return None;
+                        continue;
                     }
                     let mut quad =
                         compose::layer_quad(tw as f64, th as f64, l.nw as f64, l.nh as f64, &fx);
                     compose::apply_transition_to_quad(&mut quad, &t_fx, tw as f64, th as f64);
-                    Some(compose::CpuLayerFrame {
+                    batch.push(compose::CpuLayerFrame {
                         data: &l.frame,
                         w: l.w,
                         h: l.h,
@@ -2632,11 +2740,14 @@ fn render_segment_composited(
                         opacity,
                         mask: t_fx.mask.map(|m| compose::mask_to_pixels(&m, tw, th)),
                         blend_mode: l.blend_mode,
-                    })
+                    });
                 }
-            })
-            .collect();
-        compose::composite_frame(&mut canvas, tw, th, &frames, threads);
+            }
+        }
+        // Verbleibenden Stapel (über der letzten Korrektur-Stufe) komponieren.
+        if !batch.is_empty() {
+            compose::composite_frame(&mut canvas, tw, th, &batch, threads);
+        }
         // f32-Canvas → Pipe-Format: 16 Bit (rgba64le, verlustarm) für >8-Bit-
         // Ziele, sonst 8 Bit mit TPDF-Dithering (bricht Restbanding).
         let out_bytes = if hi_bit {

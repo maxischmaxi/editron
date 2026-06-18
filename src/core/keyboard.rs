@@ -302,6 +302,8 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::new("clip.speedDuration", "Mod+R"),
         // Titel am Playhead (Premiere: Strg+T = neue Textebene).
         Keybinding::new("title.add", "Mod+T"),
+        // Einstellungsebene (Adjustment Layer) über dem Material am Playhead.
+        Keybinding::new("timeline.addAdjustmentLayer", "Mod+Alt+A"),
         // Untertitel am Playhead (Untertitel-Workflow, alle Presets gleich).
         Keybinding::new("subtitle.addAtPlayhead", "Mod+U"),
         Keybinding::new("subtitle.importSrt", "Mod+Alt+U"),
@@ -323,6 +325,11 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::new("timeline.liftRange", ";"),
         Keybinding::new("timeline.extractRange", "'"),
         Keybinding::new("timeline.matchFrame", "F"),
+        // Replace + Fit-to-Fill wie Resolve (F = Match Frame ist belegt):
+        // Ersetzen = F11, Einpassen = Shift+F11. Tastaturgetrieben, panel-
+        // unabhängig wie die übrigen Drei-/Vier-Punkt-Edits.
+        Keybinding::new("timeline.replace", "F11"),
+        Keybinding::new("timeline.fitToFill", "Shift+F11"),
         // Extend Edit (Premiere „E"): die nächste Schnittkante auf den
         // Ziel-Spuren bis zum Playhead ziehen. Tastaturgetrieben, panel-
         // unabhängig wie die übrigen Three-Point-Edits.

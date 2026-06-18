@@ -74,7 +74,8 @@ impl TitleEngine {
                             .wrapping_add(h as u64);
                         Some((clip.id.clone(), hash, w, h))
                     }
-                    compose::ProgramLayer::Solid { .. } => None,
+                    compose::ProgramLayer::Solid { .. }
+                    | compose::ProgramLayer::Adjustment { .. } => None,
                 })
                 .collect();
 

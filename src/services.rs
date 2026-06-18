@@ -131,6 +131,19 @@ pub enum ServiceEvent {
         format: crate::core::interop::InteropFormat,
         path: Option<PathBuf>,
     },
+    /// Zielordner für „Projekt konsolidieren“ gewählt.
+    ConsolidateFolderPicked(Option<PathBuf>),
+    /// Fortschritt der Konsolidierung (Items + aktueller Dateibruchteil).
+    ConsolidateProgress {
+        done: usize,
+        total: usize,
+        pct: f64,
+        current: String,
+    },
+    /// Konsolidierung beendet (je Item ein Ergebnis).
+    ConsolidateDone {
+        results: Vec<crate::core::consolidate::ConsolidateResult>,
+    },
 }
 
 /// Fehlendes Medium als Suchauftrag für den Relink-Scan.
@@ -640,6 +653,26 @@ impl Services {
                 .save_file();
             let _ = tx.send(ServiceEvent::ProjectSaveTargetPicked(picked));
         });
+    }
+
+    // -------------------------------------------------------- Konsolidieren
+
+    /// Verzeichnis-Dialog für den Konsolidierungs-Zielordner (eigener Thread).
+    pub fn pick_consolidate_folder(&self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Zielordner für die Konsolidierung wählen")
+                .pick_folder();
+            let _ = tx.send(ServiceEvent::ConsolidateFolderPicked(picked));
+        });
+    }
+
+    /// Konsolidierung im Worker-Thread starten: Medien kopieren/trimmen,
+    /// Fortschritt melden, am Ende je Item ein Ergebnis liefern.
+    pub fn start_consolidate(&self, items: Vec<crate::core::consolidate::ConsolidateItem>) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || run_consolidate(&tx, items));
     }
 
     // ---------------------------------------------------------- Untertitel
@@ -1248,6 +1281,241 @@ fn run_proxy_transcode(
                 asset_id,
                 error: format!("ffmpeg: {}", stderr_tail(&stderr_buf)),
             });
+        }
+    }
+}
+
+// ------------------------------------------------------------ Konsolidieren
+
+/// Eine Konsolidierung abarbeiten: jedes Item kopieren oder (best-effort) neu
+/// kodiert trimmen, neu proben, Thumbnail erzeugen. Fortschritt + Endergebnis
+/// als Events. Ein einzelner Fehler bricht NICHT ab (das Item meldet `ok=false`).
+fn run_consolidate(
+    tx: &Sender<ServiceEvent>,
+    items: Vec<crate::core::consolidate::ConsolidateItem>,
+) {
+    use crate::core::consolidate::ConsolidateResult;
+    let total = items.len();
+    let mut results = Vec::with_capacity(total);
+    for (i, item) in items.into_iter().enumerate() {
+        let name = item
+            .dst
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| item.src.clone());
+        let _ = tx.send(ServiceEvent::ConsolidateProgress {
+            done: i,
+            total,
+            pct: 0.0,
+            current: name.clone(),
+        });
+
+        if let Some(dir) = item.dst.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                results.push(ConsolidateResult {
+                    asset_id: item.asset_id.clone(),
+                    ok: false,
+                    error: Some(format!("Zielordner: {e}")),
+                    info: None,
+                    thumbnail_path: None,
+                    trim_start: 0.0,
+                });
+                continue;
+            }
+        }
+
+        let progress = |pct: f64| {
+            let _ = tx.send(ServiceEvent::ConsolidateProgress {
+                done: i,
+                total,
+                pct,
+                current: name.clone(),
+            });
+        };
+
+        // Trim versuchen (neu kodiert, frame-genau); bei Fehlschlag ganze Datei
+        // kopieren, damit das Ergebnis nie zerschnitten/falsch ist.
+        let mut trim_start = 0.0;
+        let mut outcome: Result<(), String> = Err("kein Versuch".into());
+        if let Some((start, dur)) = item.trim {
+            outcome = consolidate_trim(&item.src, &item.dst, start, dur, &progress);
+            if outcome.is_ok() {
+                trim_start = start;
+            } else if let Err(e) = &outcome {
+                eprintln!("[consolidate] Trim fehlgeschlagen ({name}: {e}) — kopiere ganze Datei");
+            }
+        }
+        if outcome.is_err() {
+            trim_start = 0.0;
+            outcome = consolidate_copy(&item.src, &item.dst, &progress);
+        }
+
+        let result = match outcome {
+            Ok(()) => {
+                // Info ermitteln: getrimmte Datei neu proben (Dauer/Streams
+                // ändern sich), Kopie übernimmt die alte Info mit neuem Pfad.
+                let dst_str = item.dst.to_string_lossy().into_owned();
+                let info = if trim_start > 0.0 {
+                    probe_media(&dst_str).unwrap_or_else(|_| info_for_copy(&item, &dst_str))
+                } else {
+                    info_for_copy(&item, &dst_str)
+                };
+                let thumbnail_path = if item.kind != MediaKind::Audio {
+                    let t = if item.kind == MediaKind::Image {
+                        0.0
+                    } else {
+                        (info.duration_sec * 0.25).min(1.0)
+                    };
+                    generate_thumbnail(&dst_str, t, 320).ok()
+                } else {
+                    None
+                };
+                ConsolidateResult {
+                    asset_id: item.asset_id.clone(),
+                    ok: true,
+                    error: None,
+                    info: Some(info),
+                    thumbnail_path,
+                    trim_start,
+                }
+            }
+            Err(e) => ConsolidateResult {
+                asset_id: item.asset_id.clone(),
+                ok: false,
+                error: Some(e),
+                info: None,
+                thumbnail_path: None,
+                trim_start: 0.0,
+            },
+        };
+        results.push(result);
+        let _ = tx.send(ServiceEvent::ConsolidateProgress {
+            done: i + 1,
+            total,
+            pct: 1.0,
+            current: name,
+        });
+    }
+    let _ = tx.send(ServiceEvent::ConsolidateDone { results });
+}
+
+/// Kopier-Modus-Info: bestehende Asset-Info auf die Zieldatei umschreiben
+/// (Pfad/Dateiname/Größe), ohne erneutes Proben.
+fn info_for_copy(item: &crate::core::consolidate::ConsolidateItem, dst: &str) -> MediaInfo {
+    let mut info = item.info.clone();
+    info.path = dst.to_string();
+    info.file_name = Path::new(dst)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dst.to_string());
+    info.size_bytes = std::fs::metadata(dst).map(|m| m.len()).unwrap_or(info.size_bytes);
+    info
+}
+
+/// Datei in Blöcken in eine `.part`-Datei kopieren (Fortschritt nach Bytes),
+/// bei Erfolg atomar umbenennen.
+fn consolidate_copy(src: &str, dst: &Path, on_pct: &dyn Fn(f64)) -> Result<(), String> {
+    use std::io::Write;
+    let mut input = std::fs::File::open(src).map_err(|e| format!("Quelle öffnen: {e}"))?;
+    let total = input.metadata().map(|m| m.len()).unwrap_or(0);
+    let tmp = dst.with_extension(format!("part-{}", std::process::id()));
+    let mut out = std::fs::File::create(&tmp).map_err(|e| format!("Ziel anlegen: {e}"))?;
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB
+    let mut written: u64 = 0;
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("Lesen: {e}"));
+            }
+        };
+        if let Err(e) = out.write_all(&buf[..n]) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Schreiben: {e}"));
+        }
+        written += n as u64;
+        if total > 0 {
+            on_pct((written as f64 / total as f64).clamp(0.0, 1.0));
+        }
+    }
+    if let Err(e) = out.sync_all() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Sync: {e}"));
+    }
+    drop(out);
+    std::fs::rename(&tmp, dst).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Umbenennen: {e}")
+    })
+}
+
+/// Ein Medium frame-genau neu kodiert auf [start, start+dur] trimmen.
+/// Input-Seek (`-ss` vor `-i`) ist bei Re-Encode frame-genau und schnell; die
+/// Ausgabe-Zeitstempel beginnen bei 0 ⇒ neue Medienzeit 0 == alte `start`.
+fn consolidate_trim(
+    src: &str,
+    dst: &Path,
+    start: f64,
+    dur: f64,
+    on_pct: &dyn Fn(f64),
+) -> Result<(), String> {
+    let tmp = dst.with_extension(format!("part-{}", std::process::id()));
+    let spawn = Command::new(ffmpeg_bin())
+        .args(["-y", "-v", "error", "-nostats"])
+        .args(["-ss", &format!("{start}")])
+        .args(["-i", src])
+        .args(["-t", &format!("{dur}")])
+        // Vorhandene Spuren übernehmen (optionale Maps brechen audio-only nicht).
+        .args(["-map", "0:v?", "-map", "0:a?"])
+        // Visuell verlustarmer Intermediate; Pixelformat der Quelle behalten.
+        .args(["-c:v", "libx264", "-crf", "16", "-preset", "veryfast"])
+        .args(["-c:a", "aac", "-b:a", "320k"])
+        .args(["-progress", "pipe:1"])
+        .arg(&tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("ffmpeg-Start: {e}"));
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stderr_task = stderr.map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    if let Some(stdout) = stdout {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(v) = line.trim().strip_prefix("out_time_us=") {
+                if let Ok(us) = v.trim().parse::<f64>() {
+                    if dur > 0.0 {
+                        on_pct((us / 1e6 / dur).clamp(0.0, 1.0));
+                    }
+                }
+            }
+        }
+    }
+    let status = child.wait().ok();
+    let stderr_buf = stderr_task.map(|t| t.join().unwrap_or_default()).unwrap_or_default();
+    match status {
+        Some(s) if s.success() => std::fs::rename(&tmp, dst).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Umbenennen: {e}")
+        }),
+        _ => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("ffmpeg: {}", stderr_tail(&stderr_buf)))
         }
     }
 }
@@ -1982,6 +2250,62 @@ mod tests {
         assert!(expanded.contains(&single), "explizit gewählte Datei bleibt");
         assert_eq!(expanded.len(), 4); // 3 Medien + die explizite .txt
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Der Konsolidierungs-Worker kopiert eine ganze Datei korrekt in den
+    /// `media/`-Zielordner und meldet ein erfolgreiches Ergebnis (Kopier-Modus,
+    /// ohne ffmpeg/ffprobe — Trim wäre None).
+    #[test]
+    fn consolidate_worker_copies_whole_file() {
+        use crate::core::consolidate::ConsolidateItem;
+        use crate::core::types::{MediaInfo, MediaKind};
+        let root = std::env::temp_dir().join(format!("editron-consol-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src").join("clip.mp4");
+        write_file(&src, 4096);
+        let dst = root.join("dst").join("media").join("clip.mp4");
+
+        let info = MediaInfo {
+            path: src.to_string_lossy().into_owned(),
+            file_name: "clip.mp4".into(),
+            container: "mov,mp4".into(),
+            duration_sec: 5.0,
+            size_bytes: 4096,
+            video: Vec::new(),
+            audio: Vec::new(),
+            recorded_at: None,
+        };
+        let items = vec![ConsolidateItem {
+            asset_id: "a".into(),
+            src: src.to_string_lossy().into_owned(),
+            dst: dst.clone(),
+            kind: MediaKind::Audio, // Audio ⇒ kein Thumbnail-Versuch (kein ffmpeg)
+            trim: None,
+            info,
+        }];
+
+        let (tx, rx) = channel();
+        run_consolidate(&tx, items);
+        let mut done = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServiceEvent::ConsolidateDone { results } = ev {
+                done = Some(results);
+            }
+        }
+        let results = done.expect("Done-Event");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "Kopie erfolgreich: {:?}", results[0].error);
+        assert_eq!(results[0].trim_start, 0.0);
+        assert!(dst.exists(), "Zieldatei angelegt");
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 4096);
+        // Keine .part-Reste.
+        let leftovers: Vec<_> = std::fs::read_dir(dst.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("part-"))
+            .collect();
+        assert!(leftovers.is_empty(), "keine Temp-Reste");
         let _ = std::fs::remove_dir_all(&root);
     }
 

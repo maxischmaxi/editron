@@ -653,6 +653,11 @@ fn resolve_program_layers(
                         alpha: (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
                     });
                 }
+                // Adjustment Layer wirkt als Korrektur-Pass auf das gesamte
+                // Programmbild; die GPU-Per-Layer-Liste kann das nicht abbilden.
+                // Ist ein Adjustment aktiv, zeichnet der Monitor stattdessen das
+                // CPU-komponierte Programm (PROGRAM_COMPOSITE_KEY) als Vollbild.
+                compose::ProgramLayer::Adjustment { .. } => return None,
             };
             let media_t = compose::clip_media_time(clip, t);
             let fx = compose::eval_fx(&clip.fx, media_t);
@@ -1031,12 +1036,47 @@ impl Panel for ProgramMonitorPanel {
             Vec::new()
         };
 
+        // Adjustment Layer am Playhead: der Player komponiert das Programmbild
+        // CPU-seitig (Korrektur-Pass auf das Gesamtbild) und der Monitor zeichnet
+        // diese eine Vollbild-Textur — formelgleich zum Export.
+        let adjustment_layers: Vec<StageLayer> = if app.monitor.program_adjustment
+            && ui
+                .texture_size(crate::core::player::PROGRAM_COMPOSITE_KEY)
+                .is_some()
+        {
+            vec![StageLayer::Clip(ResolvedLayer {
+                clip_id: String::new(),
+                tex_key: crate::core::player::PROGRAM_COMPOSITE_KEY.to_string(),
+                quad: LayerQuad {
+                    cx: (canvas.x + canvas.w / 2.0) as f64,
+                    cy: (canvas.y + canvas.h / 2.0) as f64,
+                    w: canvas.w as f64,
+                    h: canvas.h as f64,
+                    rot_deg: 0.0,
+                },
+                alpha: 255,
+                grade: crate::core::grade::precompute(&crate::core::grade::ColorGrade::default()),
+                input_lut: None,
+                look_lut: None,
+                mask: None,
+                extend_k: 1.0,
+                is_title: false,
+                blend_mode: crate::core::compose::BlendMode::Normal,
+            })]
+        } else {
+            Vec::new()
+        };
+
         // ---- Blend-Compositing (Mischmodi) ----
         let has_blend = layers.iter().any(|l| match l {
             StageLayer::Clip(c) => c.blend_mode != crate::core::compose::BlendMode::Normal,
             _ => false,
         });
-        if has_blend && !app.monitor.program_from_cache {
+        // Adjustment-Composite enthält die Mischmodi bereits CPU-seitig.
+        let want_blend = has_blend
+            && !app.monitor.program_from_cache
+            && adjustment_layers.is_empty();
+        if want_blend {
             let sc = ui.scale;
             let req = crate::ui::blend_shader::BlendCompositingRequest {
                 canvas_w: ((canvas.w * sc).round() as u32).max(1),
@@ -1061,7 +1101,7 @@ impl Panel for ProgramMonitorPanel {
             app.monitor.blend_request = Some(req);
         }
         let blend_layers: Vec<StageLayer> =
-            if has_blend && ui.blend_output_size().is_some() && !app.monitor.program_from_cache {
+            if want_blend && ui.blend_output_size().is_some() {
                 vec![StageLayer::Clip(ResolvedLayer {
                     clip_id: String::new(),
                     tex_key: crate::ui::blend_shader::blend_output_key().to_string(),
@@ -1089,6 +1129,8 @@ impl Panel for ProgramMonitorPanel {
 
         let stage_layers: &[StageLayer] = if !cache_layers.is_empty() {
             &cache_layers
+        } else if !adjustment_layers.is_empty() {
+            &adjustment_layers
         } else if !blend_layers.is_empty() {
             &blend_layers
         } else {

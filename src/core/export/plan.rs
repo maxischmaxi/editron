@@ -78,6 +78,10 @@ pub struct VideoLayerPlan {
     /// Verschachtelte Sequenz statt Medien: die Ebene wird rekursiv aus
     /// `RenderPlan::nests` komponiert (ID der inneren Sequenz).
     pub nest_seq: Option<String>,
+    /// Adjustment Layer (Einstellungsebene): kein eigenes Bild, sondern ein
+    /// Korrektur-Pass (`effects` → `grade`) auf das bis hierhin zusammengesetzte
+    /// Canvas der Spuren darunter. `fx.opacity` regelt die Wirkstärke.
+    pub adjustment: bool,
     /// Ebenen-Mischmodus (Normal = Src-over).
     pub blend_mode: crate::core::compose::BlendMode,
 }
@@ -92,6 +96,8 @@ impl VideoLayerPlan {
             && self.title.is_none()
             // Nest-Ebenen werden immer rekursiv komponiert (kein Schnellpfad).
             && self.nest_seq.is_none()
+            // Adjustment Layer brauchen den Compositing-Pfad (Pass aufs Canvas).
+            && !self.adjustment
             && self.media_step >= 0.0
             && self.fx.is_visual_identity()
             && !self.grade.is_active()
@@ -425,7 +431,7 @@ fn flatten_nest_audio(
         let track_gain = db_to_linear(track.gain_db);
         let (pan_l, pan_r) = pan_gains(track.pan);
         for clip in inner.clips.iter().filter(|c| c.track_id == track.id && c.enabled) {
-            if clip.reverse || clip.freeze {
+            if clip.reverse || clip.freeze || clip.is_time_remapped() {
                 continue;
             }
             let lo = clip.start.max(win_lo);
@@ -598,6 +604,20 @@ pub fn build_render_plan(
         // damit jede Spur einzeln ausgegeben werden kann; die Summe der Stems
         // ergibt exakt den Master-Mix.
         let stems = stems_enabled(settings);
+        // Auto-Ducking braucht den Sidechain-Key (Summe der anderen Spuren) auf
+        // CLIP-GAIN-Ebene (vor Spur-Fader/Master) — exakt wie der Player. Der
+        // Schnellpfad bäckt aber Master×Spur×Pan in die Clip-Gains ein. Sobald
+        // also IRGENDEINE Spur duckt, müssen ALLE Spuren über die Bus-
+        // Verarbeitung laufen (Clip-Gain bleibt roh) ⇒ Key formelgleich.
+        let any_ducking = timeline.tracks.iter().any(|t| {
+            t.kind == TrackKind::Audio
+                && !t.muted
+                && (!solo_any || t.solo)
+                && t
+                    .effects
+                    .iter()
+                    .any(|e| e.enabled && e.kind == effects::EffectKind::Ducking)
+        });
         for track in timeline
             .tracks
             .iter()
@@ -606,9 +626,10 @@ pub fn build_render_plan(
             // Spuren mit Bus-FX oder Automation brauchen die getrennte Bus-
             // Verarbeitung (Effekte/Automation wirken auf die Spur-SUMME);
             // alle anderen laufen über den Schnellpfad mit fertig
-            // eingebackenen Gains. Im Stems-Modus geht IMMER jede Spur durch
-            // die Bus-Verarbeitung.
-            let processed = stems || track.has_audio_effects() || track.has_automation();
+            // eingebackenen Gains. Im Stems-Modus UND bei aktivem Ducking geht
+            // IMMER jede Spur durch die Bus-Verarbeitung.
+            let processed =
+                stems || any_ducking || track.has_audio_effects() || track.has_automation();
             let track_gain = db_to_linear(track.gain_db);
             let (pan_l, pan_r) = pan_gains(track.pan);
             let mut track_clips: Vec<AudioClipPlan> = Vec::new();
@@ -617,9 +638,9 @@ pub fn build_render_plan(
                 .iter()
                 .filter(|c| c.track_id == track.id && c.enabled)
             {
-                // Rückwärts-Clips sind (vorerst) stumm, Standbilder ohnehin —
-                // identisch zur Wiedergabe.
-                if clip.reverse || clip.freeze {
+                // Rückwärts-Clips sind (vorerst) stumm, Standbilder ohnehin,
+                // ebenso Time-Remap (variables Tempo) — identisch zur Wiedergabe.
+                if clip.reverse || clip.freeze || clip.is_time_remapped() {
                     continue;
                 }
                 // Verschachtelte Sequenz: das innere Audio rekursiv einflachen
@@ -812,6 +833,7 @@ pub(crate) fn plan_video_segments(
         solid: Option<[u8; 3]>,
         title: Option<crate::core::title::TitleSpec>,
         nest_seq: Option<String>,
+        adjustment: bool,
         blend_mode: crate::core::compose::BlendMode,
     }
 
@@ -885,6 +907,7 @@ pub(crate) fn plan_video_segments(
                 solid: None,
                 title: Some(spec),
                 nest_seq: None,
+                adjustment: false,
                 blend_mode: clip.blend_mode,
             });
             continue;
@@ -895,6 +918,42 @@ pub(crate) fn plan_video_segments(
         let f0 = frame_of(clip.start);
         let f1 = frame_of(clip.end());
         if f1 <= f0 {
+            continue;
+        }
+        // Adjustment Layer: kein Asset/Decoder — der Renderer wendet `effects`
+        // → `grade` als Pass auf das zusammengesetzte Canvas der Spuren darunter
+        // an (an seiner Position in der Zeichenreihenfolge).
+        if clip.is_adjustment() {
+            candidates.push(Candidate {
+                draw_order: order,
+                is_solid: false,
+                f0,
+                f1,
+                clip_id: clip.id.clone(),
+                clip_start: clip.start,
+                clip_duration: clip.duration,
+                src_in: clip.src_in,
+                media_step: clip.media_step(),
+                path: String::new(),
+                image: false,
+                fx: clip.fx.clone(),
+                grade: clip.grade.clone(),
+                effects: clip
+                    .effects
+                    .iter()
+                    .filter(|e| !e.kind.is_audio())
+                    .cloned()
+                    .collect(),
+                natural_w: 0,
+                natural_h: 0,
+                src_bit_depth: 8,
+                transitions: Vec::new(),
+                solid: None,
+                title: None,
+                nest_seq: None,
+                adjustment: true,
+                blend_mode: clip.blend_mode,
+            });
             continue;
         }
         // Titel-Generator: kein Asset/Decoder — der Renderer rastert den
@@ -927,6 +986,7 @@ pub(crate) fn plan_video_segments(
                 solid: None,
                 title: Some(spec.clone()),
                 nest_seq: None,
+                adjustment: false,
                 blend_mode: clip.blend_mode,
             });
             continue;
@@ -966,6 +1026,7 @@ pub(crate) fn plan_video_segments(
                 solid: None,
                 title: None,
                 nest_seq: Some(inner_id.clone()),
+                adjustment: false,
                 blend_mode: clip.blend_mode,
             });
             continue;
@@ -1024,6 +1085,7 @@ pub(crate) fn plan_video_segments(
                 solid: None,
                 title: None,
                 nest_seq: None,
+                adjustment: false,
                 blend_mode: clip.blend_mode,
             });
             continue;
@@ -1071,6 +1133,7 @@ pub(crate) fn plan_video_segments(
             solid: None,
             title: None,
             nest_seq: None,
+            adjustment: false,
             blend_mode: clip.blend_mode,
         });
     }
@@ -1165,16 +1228,76 @@ pub(crate) fn plan_video_segments(
                 solid: Some(color),
                 title: None,
                 nest_seq: None,
+                adjustment: false,
                 blend_mode: crate::core::compose::BlendMode::Normal,
             });
         }
     }
+
+    // Time-Remap (variable Geschwindigkeit): die Medienzeit ist NICHT linear in
+    // der Sequenzzeit, also kann kein konstanter setpts-Faktor das ganze Segment
+    // abbilden. Lösung ohne Decoder-Umbau: je betroffenem Clip an JEDER
+    // Frame-Kante eine Segmentgrenze setzen ⇒ jedes Segment ist ein Frame, dessen
+    // `src_in` exakt = `media_time_at(seq_t)` (Integral der Kurve). Der Worker
+    // seekt pro Segment auf `src_in` und decodiert einen Frame — frame-genau,
+    // wenn auch mit einem Decoder-Start je Frame (offline vertretbar).
+    struct RemapSampler {
+        speed: AnimatedParam,
+        reverse: bool,
+        duration: f64,
+    }
+    impl RemapSampler {
+        /// Exakte Medienzeit zur Sequenzzeit `seq_t` (gleiche Formel wie
+        /// `TimelineClip::media_time_at`, src_in vom Kandidaten übergeben —
+        /// trägt damit auch den Multicam-Winkel-Offset `−pos`).
+        fn media_at(&self, clip_start: f64, src_in: f64, seq_t: f64) -> f64 {
+            let off = self.speed.integral(0.0, seq_t - clip_start);
+            if self.reverse {
+                let span = self.speed.integral(0.0, self.duration);
+                src_in + span - off
+            } else {
+                src_in + off
+            }
+        }
+        /// Instantaner, signierter Medienfortschritt zur Sequenzzeit `seq_t`.
+        /// Hält die Segment-Koaleszenz korrekt: verschmilzt nur dort, wo das
+        /// Tempo lokal konstant ist (gleicher Step + lineare Erwartung trifft).
+        fn step_at(&self, clip_start: f64, seq_t: f64) -> f64 {
+            let s = crate::core::timeline::clamp_speed(self.speed.eval(seq_t - clip_start));
+            if self.reverse {
+                -s
+            } else {
+                s
+            }
+        }
+    }
+    let remap_by_clip: std::collections::HashMap<String, RemapSampler> = timeline
+        .clips
+        .iter()
+        .filter(|c| c.is_time_remapped())
+        .map(|c| {
+            (
+                c.id.clone(),
+                RemapSampler {
+                    speed: c.clamped_speed(),
+                    reverse: c.reverse,
+                    duration: c.duration,
+                },
+            )
+        })
+        .collect();
 
     // Schnittpunkte (in Frames) sammeln.
     let mut bounds: Vec<u64> = vec![0, total_frames];
     for c in &candidates {
         bounds.push(c.f0);
         bounds.push(c.f1);
+        // Time-Remap-Kandidaten: jede Frame-Kante wird Segmentgrenze.
+        if remap_by_clip.contains_key(&c.clip_id) {
+            for f in c.f0..c.f1 {
+                bounds.push(f);
+            }
+        }
     }
     bounds.extend(extra_bounds);
     bounds.sort_unstable();
@@ -1210,7 +1333,11 @@ pub(crate) fn plan_video_segments(
                 // rückwärts läuft die Spanne vom Medien-Out abwärts).
                 src_in: {
                     let seq_t = range_start + a as f64 / fps;
-                    let m = if c.media_step == 0.0 {
+                    let m = if let Some(rm) = remap_by_clip.get(&c.clip_id) {
+                        // Time-Remap: Medienzeit = Integral der Speed-Kurve
+                        // (jedes Segment ist hier ein Frame).
+                        rm.media_at(c.clip_start, c.src_in, seq_t)
+                    } else if c.media_step == 0.0 {
                         c.src_in
                     } else if c.media_step < 0.0 {
                         c.src_in + (c.clip_start + c.clip_duration - seq_t) * (-c.media_step)
@@ -1219,7 +1346,10 @@ pub(crate) fn plan_video_segments(
                     };
                     m.max(0.0)
                 },
-                media_step: c.media_step,
+                media_step: match remap_by_clip.get(&c.clip_id) {
+                    Some(rm) => rm.step_at(c.clip_start, range_start + a as f64 / fps),
+                    None => c.media_step,
+                },
                 fx: c.fx.clone(),
                 grade: c.grade.clone(),
                 effects: c.effects.clone(),
@@ -1237,6 +1367,7 @@ pub(crate) fn plan_video_segments(
                 solid: c.solid,
                 title: c.title.clone(),
                 nest_seq: c.nest_seq.clone(),
+                adjustment: c.adjustment,
                 blend_mode: c.blend_mode,
             })
             .collect();

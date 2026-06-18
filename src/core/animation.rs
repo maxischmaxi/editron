@@ -51,6 +51,20 @@ impl Interp {
             Interp::EaseInOut => u * u * (3.0 - 2.0 * u),
         }
     }
+
+    /// Stammfunktion von `apply` auf [0, 1] mit A(0) = 0 — exaktes Integral
+    /// eines interpolierten Segments (für die Time-Remap-Medienzeit).
+    fn apply_integ(&self, u: f64) -> f64 {
+        match self {
+            Interp::Linear => 0.5 * u * u,
+            Interp::Hold => 0.0,
+            Interp::EaseIn => u * u * u / 3.0,
+            // 2u − u² ⇒ u² − u³/3
+            Interp::EaseOut => u * u - u * u * u / 3.0,
+            // 3u² − 2u³ ⇒ u³ − u⁴/2
+            Interp::EaseInOut => u * u * u - 0.5 * u * u * u * u,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -124,6 +138,60 @@ impl AnimatedParam {
         }
         let u = a.interp.apply(((t - a.t) / span).clamp(0.0, 1.0));
         a.value + (b.value - a.value) * u
+    }
+
+    /// Bestimmtes Integral der Kurve über [`lo`, `hi`] (geschlossene Form pro
+    /// Segment, gleiche Randwert-Haltung wie `eval`: vor dem ersten / nach dem
+    /// letzten Keyframe konstant). Grundlage der Time-Remap-Medienzeit:
+    /// ∫ Geschwindigkeit dt = zurückgelegte Medienzeit. `lo > hi` negiert.
+    pub fn integral(&self, lo: f64, hi: f64) -> f64 {
+        if !(lo.is_finite() && hi.is_finite()) || hi == lo {
+            return 0.0;
+        }
+        if hi < lo {
+            return -self.integral(hi, lo);
+        }
+        let keys = &self.keyframes;
+        if keys.is_empty() {
+            return self.value * (hi - lo);
+        }
+        let n = keys.len();
+        let mut acc = 0.0;
+        // Kopfbereich [lo, min(hi, keys[0].t)] auf erstem Wert gehalten.
+        let first_t = keys[0].t;
+        if lo < first_t {
+            let seg_hi = hi.min(first_t);
+            acc += keys[0].value * (seg_hi - lo);
+            if hi <= first_t {
+                return acc;
+            }
+        }
+        // Innere Segmente [keys[i].t, keys[i+1].t].
+        for w in keys.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            let span = b.t - a.t;
+            let cl = lo.max(a.t);
+            let ch = hi.min(b.t);
+            if ch <= cl {
+                continue;
+            }
+            if span <= 0.0 {
+                acc += b.value * (ch - cl);
+                continue;
+            }
+            let u0 = (cl - a.t) / span;
+            let u1 = (ch - a.t) / span;
+            acc += span
+                * (a.value * (u1 - u0)
+                    + (b.value - a.value) * (a.interp.apply_integ(u1) - a.interp.apply_integ(u0)));
+        }
+        // Schwanzbereich [max(lo, last.t), hi] auf letztem Wert gehalten.
+        let last_t = keys[n - 1].t;
+        if hi > last_t {
+            let seg_lo = lo.max(last_t);
+            acc += keys[n - 1].value * (hi - seg_lo);
+        }
+        acc
     }
 
     pub fn key_index_at(&self, t: f64) -> Option<usize> {
@@ -510,6 +578,53 @@ mod tests {
         let json = serde_json::to_string(&fx2).unwrap();
         let back: ClipFx = serde_json::from_str(&json).unwrap();
         assert_eq!(fx2, back);
+    }
+
+    #[test]
+    fn integral_of_static_param_is_value_times_length() {
+        let p = AnimatedParam::fixed(2.0);
+        assert!((p.integral(0.0, 5.0) - 10.0).abs() < 1e-12);
+        assert!((p.integral(5.0, 0.0) + 10.0).abs() < 1e-12); // umgekehrt → negativ
+        assert_eq!(p.integral(3.0, 3.0), 0.0);
+    }
+
+    #[test]
+    fn integral_of_linear_ramp_matches_trapezoid() {
+        // Geschwindigkeit 1 → 3 linear über [0, 2]: Fläche = Trapez (1+3)/2·2 = 4.
+        let mut p = AnimatedParam::fixed(1.0);
+        p.upsert_key(0.0, 1.0);
+        p.upsert_key(2.0, 3.0);
+        assert!((p.integral(0.0, 2.0) - 4.0).abs() < 1e-12);
+        // Teilintervall [0, 1]: ∫(1+t) dt = 1 + 0,5 = 1,5.
+        assert!((p.integral(0.0, 1.0) - 1.5).abs() < 1e-12);
+        // Additivität: ∫[0,1] + ∫[1,2] = ∫[0,2].
+        assert!((p.integral(0.0, 1.0) + p.integral(1.0, 2.0) - p.integral(0.0, 2.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn integral_holds_edges_outside_keyframes() {
+        let mut p = AnimatedParam::fixed(0.0);
+        p.upsert_key(1.0, 2.0);
+        p.upsert_key(3.0, 4.0);
+        // Vor erstem Key: Wert 2 gehalten ⇒ ∫[-1,1] = 2·2 = 4.
+        assert!((p.integral(-1.0, 1.0) - 4.0).abs() < 1e-12);
+        // Nach letztem Key: Wert 4 gehalten ⇒ ∫[3,5] = 4·2 = 8.
+        assert!((p.integral(3.0, 5.0) - 8.0).abs() < 1e-12);
+        // Über die ganze Spanne inkl. Ränder: 4 (Kopf) + 6 (Rampe 2→4 über 2) + 8 (Schwanz).
+        assert!((p.integral(-1.0, 5.0) - (4.0 + 6.0 + 8.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn integral_of_eased_segment_uses_closed_form() {
+        // EaseIn (u²) von 0 → 1 über [0,1]: ∫ u² du = 1/3.
+        let mut p = AnimatedParam::fixed(0.0);
+        p.upsert_key(0.0, 0.0);
+        p.upsert_key(1.0, 1.0);
+        p.keyframes[0].interp = Interp::EaseIn;
+        assert!((p.integral(0.0, 1.0) - 1.0 / 3.0).abs() < 1e-12);
+        // EaseOut spiegelbildlich: ∫ (2u−u²) du = 1 − 1/3 = 2/3.
+        p.keyframes[0].interp = Interp::EaseOut;
+        assert!((p.integral(0.0, 1.0) - 2.0 / 3.0).abs() < 1e-12);
     }
 
     #[test]

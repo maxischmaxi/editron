@@ -22,6 +22,17 @@ const STRIP_W: f32 = 64.0;
 /// Inkl. Insert-Rack unter Mute/Solo (bis zu 4 sichtbare Bus-Effekte).
 const STRIP_H: f32 = 430.0;
 const METER_H: f32 = 160.0;
+/// Breite der Lautheits-Karte (BS.1770-Metering) rechts neben dem Master.
+const LOUDNESS_W: f32 = 158.0;
+/// Anzeigebereich der LUFS-Skala (−LOUDNESS_FLOOR..0 LUFS).
+const LOUDNESS_FLOOR: f32 = 36.0;
+/// Ziel-Presets der Lautheits-Linie (LUFS; −∞ = aus).
+const LOUDNESS_TARGETS: [(f32, &str); 4] = [
+    (f32::NEG_INFINITY, "Aus"),
+    (-14.0, "−14"),
+    (-16.0, "−16"),
+    (-23.0, "−23"),
+];
 /// Maximal sichtbare Insert-Effekte je Kanalzug.
 const MAX_INSERTS: usize = 4;
 /// Sichtbarer dB-Bereich der Meter (−60..0 dBFS).
@@ -74,6 +85,8 @@ pub struct AudioMixerPanel {
     /// Eine laufende Fader-/Pan-Geste hat ihren Undo-Snapshot schon angelegt.
     gesture_pushed: bool,
     scroll: ScrollState,
+    /// Gewähltes Lautheits-Ziel (Index in [`LOUDNESS_TARGETS`]).
+    loudness_target: usize,
 }
 
 
@@ -159,7 +172,8 @@ impl Panel for AudioMixerPanel {
         let mut edits: Vec<StripEdit> = Vec::new();
         let mut any_held = false;
 
-        let total_w = strips.len() as f32 * (STRIP_W + 8.0) + 18.0;
+        // Spuren + Master-Trenner (9) + Master + Abstand (12) + Lautheits-Karte.
+        let total_w = strips.len() as f32 * (STRIP_W + 8.0) + 18.0 + 9.0 + 12.0 + LOUDNESS_W;
         let content_h = STRIP_H + 24.0;
         let view = self.scroll.begin(ui, area, total_w, content_h);
 
@@ -526,6 +540,10 @@ impl Panel for AudioMixerPanel {
             x += STRIP_W + 8.0;
         }
 
+        // ---- Lautheits-Karte (BS.1770: Momentary/Short-Term/Integrated + dBTP) ----
+        let card = Rect::new(x + 4.0, y, LOUDNESS_W, STRIP_H);
+        self.loudness_card(ui, app, card);
+
         self.scroll.end(ui, area, total_w, content_h);
 
         // ---- Änderungen anwenden (Fader/Pan-Gesten mit einem Undo-Schritt) ----
@@ -547,6 +565,205 @@ impl Panel for AudioMixerPanel {
                 StripEdit::ToggleMute(id) => app.timeline.toggle_track_flag(&id, TrackFlag::Muted),
                 StripEdit::ToggleSolo(id) => app.timeline.toggle_track_flag(&id, TrackFlag::Solo),
             }
+        }
+    }
+}
+
+impl AudioMixerPanel {
+    /// Lautheits-Karte rechts vom Master: BS.1770-Skala mit Momentary-Füllung,
+    /// Short-Term-/Integrated-Marken und optionaler Ziel-Linie; daneben die
+    /// Zahlenwerte (M/S/I in LUFS, True-Peak in dBTP) plus Ziel-Wahl und Reset.
+    fn loudness_card(&mut self, ui: &mut Ui, app: &mut AppState, card: Rect) {
+        let l = app.audio.loudness;
+        let (target, target_label) = LOUDNESS_TARGETS[self.loudness_target];
+
+        ui.fill_rounded(card, theme::RADIUS_SM, theme::SURFACE_2);
+        ui.stroke_rounded(card, theme::RADIUS_SM, 1.0, theme::LINE);
+
+        // LUFS → Anteil 0..1 auf der Skala (−LOUDNESS_FLOOR..0).
+        let norm = |v: f32| -> f32 {
+            if !v.is_finite() {
+                0.0
+            } else {
+                ((v + LOUDNESS_FLOOR) / LOUDNESS_FLOOR).clamp(0.0, 1.0)
+            }
+        };
+        let fmt = |v: f32| -> String {
+            if v.is_finite() {
+                format!("{:.1}", v)
+            } else {
+                "–".to_string()
+            }
+        };
+
+        let mut cy = card.y + 8.0;
+        ui.text_centered(
+            "Lautheit · LUFS",
+            Rect::new(card.x, cy, card.w, 16.0),
+            theme::TEXT_1,
+            FontKind::Sans12Medium,
+        );
+        cy += 22.0;
+
+        // ---- Vertikale BS.1770-Skala ----
+        let bar = Rect::new(card.x + 12.0, cy, 14.0, METER_H);
+        ui.fill_rounded(bar, theme::RADIUS_XS, theme::SURFACE_4);
+        // Rasterlinien alle 6 LU.
+        let mut tick = 6.0;
+        while tick < LOUDNESS_FLOOR {
+            let ty = bar.y + (tick / LOUDNESS_FLOOR) * bar.h;
+            ui.fill(
+                Rect::new(bar.x, ty, bar.w, 1.0),
+                theme::with_alpha(theme::LINE, 90),
+            );
+            tick += 6.0;
+        }
+        // Momentary-Füllung von unten.
+        let mn = norm(l.momentary);
+        if mn > 0.0 {
+            ui.fill(
+                Rect::new(bar.x, bar.y + (1.0 - mn) * bar.h, bar.w, mn * bar.h),
+                theme::with_alpha(theme::ACCENT, 200),
+            );
+        }
+        // Short-Term-Marke (heller Strich).
+        if l.short_term.is_finite() {
+            let sy = bar.y + (1.0 - norm(l.short_term)) * (bar.h - 2.0);
+            ui.fill(Rect::new(bar.x, sy, bar.w, 2.0), theme::TEXT_1);
+        }
+        // Integrated-Marke (kräftiger Strich, etwas über den Balken hinaus).
+        if l.integrated.is_finite() {
+            let iy = bar.y + (1.0 - norm(l.integrated)) * (bar.h - 2.0);
+            ui.fill(
+                Rect::new(bar.x - 2.0, iy, bar.w + 4.0, 2.0),
+                theme::ACCENT_HOVER,
+            );
+        }
+        // Ziel-Linie.
+        if target.is_finite() {
+            let gy = bar.y + (1.0 - norm(target)) * bar.h;
+            ui.fill(
+                Rect::new(bar.x - 3.0, gy, bar.w + 6.0, 1.0),
+                theme::WARNING,
+            );
+        }
+
+        // ---- Zahlenwerte rechts neben der Skala ----
+        let nx = bar.x + bar.w + 8.0;
+        let nw = card.x + card.w - 8.0 - nx;
+        let i_color = match (target.is_finite(), l.integrated.is_finite()) {
+            (true, true) => {
+                let d = (l.integrated - target).abs();
+                if d <= 1.0 {
+                    theme::SUCCESS
+                } else if d <= 3.0 {
+                    theme::WARNING
+                } else {
+                    theme::DANGER
+                }
+            }
+            _ => theme::TEXT_1,
+        };
+        let tp_color = if l.true_peak.is_finite() {
+            if l.true_peak > -1.0 {
+                theme::DANGER
+            } else if l.true_peak > -2.0 {
+                theme::WARNING
+            } else {
+                theme::TEXT_2
+            }
+        } else {
+            theme::TEXT_3
+        };
+        let rows = [
+            ("M", fmt(l.momentary), theme::TEXT_2, ""),
+            ("S", fmt(l.short_term), theme::TEXT_2, ""),
+            ("I", fmt(l.integrated), i_color, ""),
+            (
+                "TP",
+                if l.true_peak.is_finite() {
+                    format!("{:.1}", l.true_peak)
+                } else {
+                    "–".to_string()
+                },
+                tp_color,
+                " dBTP",
+            ),
+        ];
+        let mut ny = bar.y + 6.0;
+        for (label, value, color, unit) in rows {
+            ui.text_left(
+                label,
+                Rect::new(nx, ny, 24.0, 18.0),
+                theme::TEXT_3,
+                FontKind::Mono11,
+            );
+            ui.text_right(
+                &format!("{value}{unit}"),
+                Rect::new(nx, ny, nw, 18.0),
+                color,
+                FontKind::Mono12,
+            );
+            ny += 24.0;
+        }
+
+        // ---- Ziel-Wahl (Klick zykelt durch die Presets) ----
+        let mut by = bar.y + METER_H + 14.0;
+        let tgt_rect = Rect::new(card.x + 10.0, by, card.w - 20.0, 22.0);
+        let tgt_id = ui.id("mixer.loudness.target");
+        let tit = ui.interact(tgt_id, tgt_rect);
+        ui.fill_rounded(
+            tgt_rect,
+            theme::RADIUS_SM,
+            if tit.hovered { theme::SURFACE_3 } else { theme::SURFACE_1 },
+        );
+        ui.stroke_rounded(tgt_rect, theme::RADIUS_SM, 1.0, theme::LINE);
+        let tgt_text = if target.is_finite() {
+            format!("Ziel: {target_label} LUFS")
+        } else {
+            "Ziel: Aus".to_string()
+        };
+        ui.text_centered(&tgt_text, tgt_rect, theme::TEXT_2, FontKind::Sans12);
+        if tit.hovered {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+        }
+        if tit.clicked {
+            self.loudness_target = (self.loudness_target + 1) % LOUDNESS_TARGETS.len();
+        }
+        by += 26.0;
+
+        // ---- Abstand zum Ziel (nur bei gesetztem Ziel + gültiger Messung) ----
+        if target.is_finite() && l.integrated.is_finite() {
+            ui.text_centered(
+                &format!("Δ {:+.1} LU", l.integrated - target),
+                Rect::new(card.x, by, card.w, 14.0),
+                i_color,
+                FontKind::Mono12,
+            );
+        }
+        by += 18.0;
+
+        // ---- Reset (Integrated + True-Peak-Max-Hold neu beginnen) ----
+        let rst_rect = Rect::new(card.x + 10.0, by, card.w - 20.0, 22.0);
+        let rst_id = ui.id("mixer.loudness.reset");
+        let rit = ui.interact(rst_id, rst_rect);
+        ui.stroke_rounded(
+            rst_rect,
+            theme::RADIUS_SM,
+            1.0,
+            if rit.hovered { theme::LINE_STRONG } else { theme::LINE },
+        );
+        ui.text_centered(
+            "Messung zurücksetzen",
+            rst_rect,
+            if rit.hovered { theme::TEXT_1 } else { theme::TEXT_3 },
+            FontKind::Sans12,
+        );
+        if rit.hovered {
+            ui.want_cursor(MouseCursor::MOUSE_CURSOR_POINTING_HAND);
+        }
+        if rit.clicked {
+            app.audio.loudness_reset = true;
         }
     }
 }

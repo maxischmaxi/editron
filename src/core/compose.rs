@@ -8,6 +8,9 @@
 //! und Export (beliebige Zielauflösung) identisch aus.
 
 use crate::core::animation::ClipFx;
+use crate::core::effects;
+use crate::core::grade;
+use crate::core::lut::LutStack;
 use crate::core::timeline::{TimelineClip, TimelineStore, TrackKind};
 use crate::core::title::TitleSpec;
 use crate::core::transitions::{self, TransitionFx, TransitionRole};
@@ -123,6 +126,11 @@ pub enum ProgramLayer<'a> {
     },
     /// Volldeckende Farbfläche (Dip zu Schwarz/Weiß) mit Alpha 0–1.
     Solid { white: bool, alpha: f64 },
+    /// Adjustment Layer (Einstellungsebene): kein eigenes Bild, sondern ein
+    /// Korrektur-Pass (`clip.effects` → `clip.grade`) auf das bis hierhin
+    /// zusammengesetzte Canvas der Spuren DARUNTER. `fx.opacity` regelt die
+    /// Wirkstärke (Vorher/Nachher-Überblendung).
+    Adjustment { clip: &'a TimelineClip },
 }
 
 /// Sichtbare Programm-Layer am Zeitpunkt `t` (unten → oben), inklusive der
@@ -190,13 +198,85 @@ pub fn visible_program_layers<'a>(timeline: &'a TimelineStore, t: f64) -> Vec<Pr
             .iter()
             .find(|c| c.track_id == track.id && c.enabled && t >= c.start && t < c.end())
         {
-            out.push(ProgramLayer::Clip {
-                clip,
-                t_fx: TransitionFx::IDENTITY,
-            });
+            // Adjustment Layer: kein eigenes Bild, sondern Korrektur-Stufe an
+            // seiner Position in der Zeichenreihenfolge (wirkt auf alles
+            // Darunterliegende). Übergänge betreffen ihn nicht.
+            if clip.is_adjustment() {
+                out.push(ProgramLayer::Adjustment { clip });
+            } else {
+                out.push(ProgramLayer::Clip {
+                    clip,
+                    t_fx: TransitionFx::IDENTITY,
+                });
+            }
         }
     }
     out
+}
+
+/// Adjustment-Layer-Korrektur (`clip.effects` → `clip.grade`) auf ein bereits
+/// komponiertes, opakes f32-RGBA-Canvas (`w`×`h`) anwenden. `media_t` =
+/// Clip-Medienzeit (Effekt-/Grade-Keyframes), `opacity` 0–1 = Wirkstärke
+/// (Vorher/Nachher-Überblendung). DIE gemeinsame Stufe für CPU-Compositor,
+/// Player-Programm-Composite und Export — damit Vorschau und Export
+/// formelgleich sind. 3D-LUTs eines Adjustment-Grades wirken NICHT (v1, siehe
+/// `core/adjustment.rs`): die Stufe rechnet mit [`LutStack::EMPTY`].
+pub fn apply_adjustment_pass(
+    canvas: &mut [f32],
+    w: usize,
+    h: usize,
+    clip: &TimelineClip,
+    media_t: f64,
+    threads: usize,
+) {
+    if w == 0 || h == 0 || canvas.len() != w * h * 4 {
+        return;
+    }
+    let opacity = eval_fx(&clip.fx, media_t).opacity as f32;
+    let resolved = effects::resolve_video_effects(&clip.effects, media_t);
+    let grade_params = grade::precompute(&clip.grade);
+    adjustment_pass_buffer(canvas, w, h, &resolved, &grade_params, opacity, threads);
+}
+
+/// DER eigentliche Adjustment-Korrektur-Pass auf einem opaken f32-RGBA-Canvas:
+/// (Effekte → Grade) auf eine Arbeitskopie, dann per `opacity` (0–1)
+/// Vorher/Nachher zurückblenden. Geteilt von Compositing-Kern (Player) und
+/// Export-Worker, damit beide formelgleich sind. 3D-LUTs wirken NICHT (v1) —
+/// die Stufe rechnet bewusst mit [`LutStack::EMPTY`]. `resolved`/`grade_params`
+/// werden vom Aufrufer zur passenden Medienzeit aufgelöst.
+pub fn adjustment_pass_buffer(
+    canvas: &mut [f32],
+    w: usize,
+    h: usize,
+    resolved: &[effects::ResolvedEffect],
+    grade_params: &grade::GradeParams,
+    opacity: f32,
+    threads: usize,
+) {
+    if w == 0 || h == 0 || canvas.len() != w * h * 4 || opacity <= 0.0 {
+        return;
+    }
+    let has_fx = !resolved.is_empty();
+    let has_grade = !grade_params.is_identity();
+    if !has_fx && !has_grade {
+        return;
+    }
+    // Korrektur auf eine Arbeitskopie des Canvas (Effekte → Grading, gleiche
+    // Reihenfolge wie bei normalen Clips), dann nach Wirkstärke zurückblenden.
+    let mut adjusted = canvas.to_vec();
+    if has_fx {
+        effects::apply_effects_buffer(&mut adjusted, w, h, (0, 0, w, h), resolved, threads);
+    }
+    if has_grade {
+        grade::grade_buffer(&mut adjusted, w, h, (0, 0, w, h), grade_params, &LutStack::EMPTY, threads);
+    }
+    if opacity >= 1.0 {
+        canvas.copy_from_slice(&adjusted);
+    } else {
+        for (c, a) in canvas.iter_mut().zip(adjusted.iter()) {
+            *c += (*a - *c) * opacity;
+        }
+    }
 }
 
 /// Text-Spec eines Layers auflösen: Titel-Clips tragen ihren Spec selbst,
@@ -565,14 +645,47 @@ pub fn composite_sequence_frame(
     }
 
     let layers = visible_program_layers(timeline, t);
-    // Layer-Puffer am Leben halten und am Ende in einem Rutsch komponieren.
+    // Layer-Puffer am Leben halten und stapelweise komponieren. Adjustment
+    // Layer unterbrechen den Stapel: erst wird der Stapel DARUNTER auf das
+    // Canvas komponiert, dann die Korrektur-Stufe darauf angewendet, dann der
+    // nächste Stapel begonnen.
     let mut buffers: Vec<Vec<f32>> = Vec::new();
     // (quad, opacity, mask, layer_w, layer_h, blend_mode)
     type Meta = (LayerQuad, f64, Option<(usize, usize, usize, usize)>, usize, usize, BlendMode);
     let mut metas: Vec<Meta> = Vec::new();
 
+    // Anstehenden Stapel (unten → oben) auf das Canvas komponieren und leeren.
+    let flush = |canvas: &mut [f32], buffers: &mut Vec<Vec<f32>>, metas: &mut Vec<Meta>| {
+        if metas.is_empty() {
+            return;
+        }
+        let frames: Vec<CpuLayerFrame> = metas
+            .iter()
+            .enumerate()
+            .map(|(i, (quad, opacity, mask, lw, lh, bm))| CpuLayerFrame {
+                data: &buffers[i],
+                w: *lw,
+                h: *lh,
+                quad: *quad,
+                opacity: *opacity,
+                mask: *mask,
+                blend_mode: *bm,
+            })
+            .collect();
+        composite_frame(canvas, w, h, &frames, threads);
+        buffers.clear();
+        metas.clear();
+    };
+
     for layer in &layers {
         match layer {
+            ProgramLayer::Adjustment { clip } => {
+                // Korrektur-Stufe: erst alles Darunterliegende komponieren,
+                // dann den Pass (Effekte → Grade) auf das Canvas anwenden.
+                flush(&mut canvas, &mut buffers, &mut metas);
+                let media_t = clip_media_time(clip, t);
+                apply_adjustment_pass(&mut canvas, w, h, clip, media_t, threads);
+            }
             ProgramLayer::Solid { white, alpha } => {
                 if *alpha <= 0.0 {
                     continue;
@@ -651,20 +764,8 @@ pub fn composite_sequence_frame(
         }
     }
 
-    let frames: Vec<CpuLayerFrame> = metas
-        .iter()
-        .enumerate()
-        .map(|(i, (quad, opacity, mask, lw, lh, bm))| CpuLayerFrame {
-            data: &buffers[i],
-            w: *lw,
-            h: *lh,
-            quad: *quad,
-            opacity: *opacity,
-            mask: *mask,
-            blend_mode: *bm,
-        })
-        .collect();
-    composite_frame(&mut canvas, w, h, &frames, threads);
+    // Verbleibenden Stapel (über der letzten Korrektur-Stufe) komponieren.
+    flush(&mut canvas, &mut buffers, &mut metas);
     canvas
 }
 
@@ -1081,5 +1182,231 @@ mod tests {
         let old: crate::core::timeline::TimelineClip =
             serde_json::from_value(v).unwrap();
         assert_eq!(old.blend_mode, BlendMode::Normal);
+    }
+
+    // ------------------------------------------------ Adjustment Layer
+
+    /// Ein Adjustment Layer über ZWEI aufeinanderfolgenden Clips (untere Spur)
+    /// gradet beide: an jeder Clip-Position hellt der Korrektur-Pass das
+    /// komponierte Bild auf, während die Kontrolle (Adjustment deaktiviert)
+    /// exakt die Blatt-Farbe zeigt. Verifiziert „färbt beide".
+    #[test]
+    fn adjustment_layer_grades_all_clips_below() {
+        use crate::core::timeline::{test_clip, TimelineStore, TrackKind};
+        let mut tl = TimelineStore::default();
+        let vids: Vec<String> = tl
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .map(|t| t.id.clone())
+            .collect();
+        // tracks[0] = oberste Videospur (Adjustment), tracks[1] = untere (Clips).
+        let (upper, lower) = (vids[0].clone(), vids[1].clone());
+
+        let mut a = test_clip(&lower);
+        a.asset_id = "A".into();
+        a.start = 0.0;
+        a.duration = 10.0;
+        a.src_in = 0.0;
+        a.src_duration = 1000.0;
+        let mut b = test_clip(&lower);
+        b.asset_id = "B".into();
+        b.start = 10.0;
+        b.duration = 10.0;
+        b.src_in = 0.0;
+        b.src_duration = 1000.0;
+        tl.clips.push(a);
+        tl.clips.push(b);
+
+        // Adjustment Layer deckt beide Clips ab (Aufhellung per exposure).
+        let mut adj = test_clip(&upper);
+        adj.asset_id = String::new();
+        adj.start = 0.0;
+        adj.duration = 20.0;
+        adj.src_in = 0.0;
+        adj.src_duration = f64::INFINITY;
+        adj.adjustment = Some(crate::core::adjustment::AdjustmentSpec::new());
+        adj.grade = crate::core::grade::parse_test_grade("exposure=1");
+        assert!(adj.is_adjustment() && adj.is_generator());
+        tl.clips.push(adj);
+
+        // Normalisierter Blatt-Fetcher: je Asset eine eigene Farbe (0..1).
+        let color = |asset: &str| -> [f32; 4] {
+            match asset {
+                "A" => [0.4, 0.2, 0.1, 1.0],
+                _ => [0.1, 0.2, 0.4, 1.0],
+            }
+        };
+        let mut fetch = |clip: &TimelineClip, _mt: f64, w: usize, h: usize| -> Option<Vec<f32>> {
+            if clip.is_generator() {
+                return None;
+            }
+            Some(vec![color(&clip.asset_id); w * h].concat())
+        };
+
+        let resolver = MapResolver(HashMap::new());
+        let (w, h) = (4usize, 4usize);
+        let c = (h / 2 * w + w / 2) * 4;
+        let luma = |p: &[f32]| 0.2126 * p[c] + 0.7152 * p[c + 1] + 0.0722 * p[c + 2];
+
+        for (t, asset) in [(5.0, "A"), (15.0, "B")] {
+            let with = composite_sequence_frame(&tl, &resolver, t, w, h, 1, &mut fetch, 0);
+            // Kontrolle: Adjustment deaktiviert ⇒ exakt die Blatt-Farbe.
+            tl.clips.iter_mut().for_each(|cl| {
+                if cl.is_adjustment() {
+                    cl.enabled = false;
+                }
+            });
+            let without = composite_sequence_frame(&tl, &resolver, t, w, h, 1, &mut fetch, 0);
+            tl.clips.iter_mut().for_each(|cl| {
+                if cl.is_adjustment() {
+                    cl.enabled = true;
+                }
+            });
+
+            let base = color(asset);
+            assert!(
+                (without[c] - base[0]).abs() < 1e-3 && (without[c + 1] - base[1]).abs() < 1e-3,
+                "{asset}: ohne Adjustment muss die Blatt-Farbe sein (war {:?})",
+                &without[c..c + 3]
+            );
+            // Der Korrektur-Pass verändert (hellt auf) — für BEIDE Clips.
+            let changed = (0..3).any(|k| (with[c + k] - without[c + k]).abs() > 0.05);
+            assert!(
+                changed,
+                "Adjustment muss Clip {asset} verändern (with={:?} without={:?})",
+                &with[c..c + 3],
+                &without[c..c + 3]
+            );
+            assert!(
+                luma(&with) > luma(&without) + 1e-3,
+                "{asset}: exposure-Adjustment hellt auf (with_luma={}, without_luma={})",
+                luma(&with),
+                luma(&without)
+            );
+        }
+    }
+
+    /// Der Adjustment-Pass wendet auch EFFEKTE (nicht nur Grade) auf das
+    /// Bild darunter an: ein Invert-Effekt invertiert die Clip-Farbe.
+    #[test]
+    fn adjustment_layer_applies_effects() {
+        use crate::core::animation::AnimatedParam;
+        use crate::core::effects::{EffectInstance, EffectKind};
+        use crate::core::timeline::{test_clip, TimelineStore, TrackKind};
+        let mut tl = TimelineStore::default();
+        let vids: Vec<String> = tl
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .map(|t| t.id.clone())
+            .collect();
+        let (upper, lower) = (vids[0].clone(), vids[1].clone());
+
+        let mut base = test_clip(&lower);
+        base.asset_id = "A".into();
+        base.start = 0.0;
+        base.duration = 10.0;
+        base.src_duration = 1000.0;
+        tl.clips.push(base);
+
+        let mut adj = test_clip(&upper);
+        adj.asset_id = String::new();
+        adj.start = 0.0;
+        adj.duration = 10.0;
+        adj.src_duration = f64::INFINITY;
+        adj.adjustment = Some(crate::core::adjustment::AdjustmentSpec::new());
+        let mut inv = EffectInstance::new(EffectKind::Invert);
+        inv.params[0] = AnimatedParam::fixed(100.0);
+        adj.effects = vec![inv];
+        tl.clips.push(adj);
+
+        let mut fetch = |clip: &TimelineClip, _mt: f64, w: usize, h: usize| -> Option<Vec<f32>> {
+            if clip.is_generator() {
+                return None;
+            }
+            Some(vec![[0.2f32, 0.6, 0.8, 1.0]; w * h].concat())
+        };
+        let resolver = MapResolver(HashMap::new());
+        let (w, h) = (2usize, 2usize);
+        let frame = composite_sequence_frame(&tl, &resolver, 5.0, w, h, 1, &mut fetch, 0);
+        // Invert (mix 100 %): 1 − Kanal.
+        assert!((frame[0] - 0.8).abs() < 0.02, "R: {}", frame[0]);
+        assert!((frame[1] - 0.4).abs() < 0.02, "G: {}", frame[1]);
+        assert!((frame[2] - 0.2).abs() < 0.02, "B: {}", frame[2]);
+    }
+
+    /// Ein Adjustment-Clip überlebt den serde-Roundtrip; fehlt das Feld (alte
+    /// Datei), lädt er als normaler Clip (kein Adjustment) — Vorwärtskompat.
+    #[test]
+    fn clip_adjustment_roundtrips() {
+        let mut clip = crate::core::timeline::test_clip("track-1");
+        clip.adjustment = Some(crate::core::adjustment::AdjustmentSpec::new());
+        let json = serde_json::to_string(&clip).unwrap();
+        assert!(json.contains("\"adjustment\":{}"), "{json}");
+        let back: crate::core::timeline::TimelineClip = serde_json::from_str(&json).unwrap();
+        assert!(back.is_adjustment() && back.is_generator());
+        // Feld entfernen ⇒ kein Adjustment (Datei vor v20).
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("adjustment");
+        let old: crate::core::timeline::TimelineClip = serde_json::from_value(v).unwrap();
+        assert!(!old.is_adjustment());
+    }
+
+    /// Die Wirkstärke (`fx.opacity`) blendet den Adjustment-Pass: bei 0 %
+    /// bleibt das Bild unverändert, bei 50 % liegt es zwischen Roh und voll.
+    #[test]
+    fn adjustment_layer_opacity_scales_strength() {
+        use crate::core::timeline::{test_clip, TimelineStore, TrackKind};
+        let mut tl = TimelineStore::default();
+        let vids: Vec<String> = tl
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Video)
+            .map(|t| t.id.clone())
+            .collect();
+        let (upper, lower) = (vids[0].clone(), vids[1].clone());
+
+        let mut base = test_clip(&lower);
+        base.asset_id = "A".into();
+        base.start = 0.0;
+        base.duration = 10.0;
+        base.src_duration = 1000.0;
+        tl.clips.push(base);
+
+        let mut adj = test_clip(&upper);
+        adj.asset_id = String::new();
+        adj.start = 0.0;
+        adj.duration = 10.0;
+        adj.src_duration = f64::INFINITY;
+        adj.adjustment = Some(crate::core::adjustment::AdjustmentSpec::new());
+        adj.grade = crate::core::grade::parse_test_grade("exposure=1");
+        let adj_id = adj.id.clone();
+        tl.clips.push(adj);
+
+        let mut fetch = |clip: &TimelineClip, _mt: f64, w: usize, h: usize| -> Option<Vec<f32>> {
+            if clip.is_generator() {
+                return None;
+            }
+            Some(vec![[0.4f32, 0.4, 0.4, 1.0]; w * h].concat())
+        };
+        let resolver = MapResolver(HashMap::new());
+        let (w, h) = (2usize, 2usize);
+        let c = 0;
+
+        let set_op = |tl: &mut TimelineStore, p: f64| {
+            let clip = tl.clips.iter_mut().find(|x| x.id == adj_id).unwrap();
+            clip.fx.opacity = crate::core::animation::AnimatedParam::fixed(p);
+        };
+
+        set_op(&mut tl, 0.0);
+        let off = composite_sequence_frame(&tl, &resolver, 5.0, w, h, 1, &mut fetch, 0);
+        set_op(&mut tl, 50.0);
+        let half = composite_sequence_frame(&tl, &resolver, 5.0, w, h, 1, &mut fetch, 0);
+        set_op(&mut tl, 100.0);
+        let full = composite_sequence_frame(&tl, &resolver, 5.0, w, h, 1, &mut fetch, 0);
+
+        assert!((off[c] - 0.4).abs() < 1e-3, "0 % = roh");
+        assert!(half[c] > off[c] + 1e-3 && half[c] < full[c] - 1e-3, "50 % liegt dazwischen");
     }
 }

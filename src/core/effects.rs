@@ -44,6 +44,13 @@ pub enum EffectKind {
     Reverb,
     NoiseGate,
     Delay,
+    /// De-Esser: frequenzselektive Kompression im Zisch-Band (EQ-Detektor
+    /// steuert die Gain-Reduktion, die NUR auf das Band wirkt).
+    DeEsser,
+    /// Auto-Ducking: Kompressor mit Sidechain-Eingang. Der Pegel-Detektor
+    /// folgt dem KEY-Signal (Summe der anderen Spuren), die Gain-Reduktion
+    /// senkt das eigene Signal (Musik unter Sprache).
+    Ducking,
 }
 
 /// Anzeige-Kategorie im Effekte-Panel.
@@ -271,9 +278,25 @@ static SPECS_DELAY: [EffectParamSpec; 3] = [
     slider("feedback", "Feedback", "%", 0.0, 90.0, 35.0, 0.5),
     slider("mixWet", "Anteil", "%", 0.0, 100.0, 40.0, 0.5),
 ];
+// De-Esser: Zisch-Band (Frequenz/Güte) treibt einen frequenzselektiven
+// Kompressor — die Gain-Reduktion wirkt NUR auf das bandgefilterte Signal.
+static SPECS_DE_ESSER: [EffectParamSpec; 4] = [
+    no_decimals(slider("freq", "Frequenz", "Hz", 2000.0, 16000.0, 7000.0, 20.0)),
+    slider("threshold", "Threshold", "dB", -60.0, 0.0, -30.0, 0.25),
+    slider("ratio", "Ratio", ": 1", 1.0, 20.0, 6.0, 0.05),
+    dec2(slider("q", "Bandbreite (Güte)", "", 0.5, 6.0, 2.0, 0.02)),
+];
+// Auto-Ducking: Sidechain-Kompressor. Der Detektor folgt dem KEY-Signal
+// (andere Spuren), die Gain-Reduktion senkt das eigene Signal.
+static SPECS_DUCKING: [EffectParamSpec; 4] = [
+    slider("threshold", "Threshold", "dB", -60.0, 0.0, -30.0, 0.25),
+    slider("ratio", "Ratio", ": 1", 1.0, 20.0, 8.0, 0.05),
+    slider("attack", "Attack", "ms", 0.1, 500.0, 10.0, 0.5),
+    slider("release", "Release", "ms", 10.0, 3000.0, 300.0, 2.0),
+];
 
 impl EffectKind {
-    pub const ALL: [EffectKind; 21] = [
+    pub const ALL: [EffectKind; 23] = [
         EffectKind::GaussianBlur,
         EffectKind::Sharpen,
         EffectKind::Glow,
@@ -295,6 +318,8 @@ impl EffectKind {
         EffectKind::Reverb,
         EffectKind::NoiseGate,
         EffectKind::Delay,
+        EffectKind::DeEsser,
+        EffectKind::Ducking,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -320,6 +345,8 @@ impl EffectKind {
             EffectKind::Reverb => "Hall",
             EffectKind::NoiseGate => "Rauschgate",
             EffectKind::Delay => "Echo",
+            EffectKind::DeEsser => "De-Esser",
+            EffectKind::Ducking => "Auto-Ducking",
         }
     }
 
@@ -346,6 +373,8 @@ impl EffectKind {
             EffectKind::Reverb => "Raumhall mit Raumgröße, Dämpfung und Mischanteil.",
             EffectKind::NoiseGate => "Schaltet Signal unterhalb der Schwelle stumm (Atmo/Rauschen zwischen Takes).",
             EffectKind::Delay => "Echo mit Verzögerungszeit, Feedback und Mischanteil.",
+            EffectKind::DeEsser => "Frequenzselektive Kompression: dämpft scharfe Zischlaute (S-/Sch-Laute) im Zisch-Band, ohne den restlichen Klang zu verändern.",
+            EffectKind::Ducking => "Sidechain-Kompressor: senkt diese Spur automatisch ab, sobald die anderen Spuren (Sprache) lauter werden — Musik unter Sprache.",
         }
     }
 
@@ -372,6 +401,8 @@ impl EffectKind {
             EffectKind::Reverb => "audio-waveform",
             EffectKind::NoiseGate => "mic-off",
             EffectKind::Delay => "timer-reset",
+            EffectKind::DeEsser => "scissors",
+            EffectKind::Ducking => "chevron-down",
         }
     }
 
@@ -394,7 +425,9 @@ impl EffectKind {
             | EffectKind::Gain
             | EffectKind::Reverb
             | EffectKind::NoiseGate
-            | EffectKind::Delay => EffectCategory::Audio,
+            | EffectKind::Delay
+            | EffectKind::DeEsser
+            | EffectKind::Ducking => EffectCategory::Audio,
         }
     }
 
@@ -426,6 +459,8 @@ impl EffectKind {
             EffectKind::Reverb => &SPECS_REVERB,
             EffectKind::NoiseGate => &SPECS_NOISE_GATE,
             EffectKind::Delay => &SPECS_DELAY,
+            EffectKind::DeEsser => &SPECS_DE_ESSER,
+            EffectKind::Ducking => &SPECS_DUCKING,
         }
     }
 
@@ -453,6 +488,8 @@ impl EffectKind {
             EffectKind::Reverb => "reverb",
             EffectKind::NoiseGate => "noiseGate",
             EffectKind::Delay => "delay",
+            EffectKind::DeEsser => "deEsser",
+            EffectKind::Ducking => "ducking",
         }
     }
 }

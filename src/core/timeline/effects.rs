@@ -450,6 +450,94 @@ impl TimelineStore {
         }
     }
 
+    // ------------------------------------------- Geschwindigkeit (Time-Remap)
+    // Die Speed-Kurve (`clip.speed`) lebt in CLIP-LOKALER Timeline-Zeit `tc`
+    // (0 am Clipanfang). Die Dauer bleibt beim Editieren fix — die belegte
+    // Medienspanne folgt dem Integral der Kurve (`media_span`); im Gegensatz
+    // zum Geschwindigkeit/Dauer-Dialog wird die Dauer also NICHT nachgeführt.
+
+    /// Tempo-Stopwatch umschalten: an ⇒ erster Keyframe bei `tc`; aus ⇒ Kurve
+    /// verwerfen, Tempo bei `tc` als konstanten Wert einfrieren.
+    pub fn speed_toggle_animated(&mut self, id: &str, tc: f64) {
+        if self.fx_clip_mut(id).is_none() {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        if clip.speed.is_animated() {
+            clip.speed.clear_animation(tc);
+        } else {
+            clip.speed.enable_animation(tc);
+        }
+    }
+
+    /// Tempo-Keyframe bei der clip-lokalen Zeit `tc` setzen bzw. entfernen.
+    pub fn speed_toggle_keyframe(&mut self, id: &str, tc: f64) {
+        let Some(clip) = self.clip(id) else { return };
+        let value = crate::core::timeline::clamp_speed(clip.speed.eval(tc));
+        let exists = clip.speed.key_index_at(tc).is_some();
+        if self.fx_clip_mut(id).is_none() {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        if exists {
+            clip.speed.remove_key_at(tc);
+        } else {
+            clip.speed.upsert_key(tc, value);
+        }
+    }
+
+    /// Tempo bei `tc` anwenden (ohne Snapshot — laufende Geste nach
+    /// `begin_fx_edit`). Animiert ⇒ Keyframe, sonst statischer Basiswert.
+    pub fn speed_set_value_live(&mut self, id: &str, tc: f64, value: f64) {
+        if let Some(clip) = self.fx_clip_mut(id) {
+            clip.speed
+                .set_at(tc, crate::core::timeline::clamp_speed(value));
+        }
+    }
+
+    /// Tempo-Keyframe bei `tc` anlegen (Doppelklick in der Kurve): aktiviert
+    /// nötigenfalls die Animation und setzt einen Key mit dem aktuellen Tempo.
+    pub fn speed_add_key(&mut self, id: &str, tc: f64) {
+        let Some(clip) = self.clip(id) else { return };
+        let val = crate::core::timeline::clamp_speed(clip.speed.eval(tc));
+        if self.fx_clip_mut(id).is_none() {
+            return;
+        }
+        self.push_history();
+        let clip = self.fx_clip_mut(id).expect("clip nach Snapshot");
+        if !clip.speed.is_animated() {
+            // Ersten Keyframe am Clipanfang verankern, damit die Kurve dort
+            // beginnt (sonst hielte sie den neuen Wert konstant).
+            clip.speed.enable_animation(0.0);
+        }
+        clip.speed.upsert_key(tc, val);
+    }
+
+    /// Tempo-Kurve ersetzen (ohne Snapshot — Keyframe-Drag im Lane). Werte
+    /// werden auf den gültigen Bereich geklemmt.
+    pub fn speed_replace_keys_live(&mut self, id: &str, mut keys: Vec<Keyframe>) {
+        for k in &mut keys {
+            k.value = crate::core::timeline::clamp_speed(k.value);
+        }
+        if let Some(clip) = self.fx_clip_mut(id) {
+            clip.speed.replace_keys(keys);
+        }
+    }
+
+    /// Geschwindigkeit auf konstant 100 % zurücksetzen (undoable).
+    pub fn speed_reset(&mut self, id: &str) {
+        let Some(clip) = self.clip(id) else { return };
+        if !clip.speed.is_animated() && (clip.speed.value - 1.0).abs() < 1e-9 {
+            return;
+        }
+        self.push_history();
+        if let Some(clip) = self.fx_clip_mut(id) {
+            clip.speed = AnimatedParam::fixed(1.0);
+        }
+    }
+
     /// Keyframes zu gegebenen Medienzeiten entfernen (Keyframe-Editor).
     pub fn kf_remove_keyframes(&mut self, id: &str, keys: &[(ParamRef, f64)]) {
         if keys.is_empty() || self.fx_clip_mut(id).is_none() {

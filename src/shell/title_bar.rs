@@ -47,6 +47,7 @@ fn file_menu_items(app: &AppState) -> Vec<MenuEntry> {
         MenuEntry::Separator,
         MenuEntry::Item(MenuItem::command("project.save")),
         MenuEntry::Item(MenuItem::command("project.saveAs")),
+        MenuEntry::Item(MenuItem::command("project.consolidate").with_icon("folder-open")),
         MenuEntry::Separator,
         MenuEntry::Item(MenuItem::command("sequence.settings").with_icon("sliders-horizontal")),
         MenuEntry::Separator,

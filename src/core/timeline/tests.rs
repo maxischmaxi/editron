@@ -20,7 +20,8 @@
             effects: Vec::new(),
             title: None,
             subtitle: None,
-            speed: 1.0,
+            adjustment: None,
+            speed: crate::core::animation::AnimatedParam::fixed(1.0),
             reverse: false,
             freeze: false,
             markers: Vec::new(),
@@ -872,6 +873,27 @@
             .is_err());
     }
 
+    /// Einstellungsebenen (Adjustment Layer) sind Vollbild-Korrektur-Pässe und
+    /// nehmen KEINE Übergänge — weder direkt (`add_transition`) noch über die
+    /// Auswahl (`apply_transition_to_selection`).
+    #[test]
+    fn adjustment_layer_rejects_transitions() {
+        let mut store = TimelineStore::default();
+        let id1 = store.add_adjustment_clip(0.0, 5.0);
+        let id2 = store.add_adjustment_clip(5.0, 5.0);
+        // Direkt an der Schnittkante zwischen zwei Einstellungsebenen.
+        assert!(store
+            .add_transition(TransitionKind::CrossDissolve, &id2, TrimEdge::Start, 1.0)
+            .is_err());
+        // Über die Auswahl: Adjustments werden übersprungen.
+        store.selected_clip_ids = vec![id1, id2];
+        assert_eq!(
+            store.apply_transition_to_selection(TransitionKind::CrossDissolve),
+            0
+        );
+        assert!(store.transitions.is_empty());
+    }
+
     #[test]
     fn transitions_follow_trims_and_die_with_adjacency() {
         let (mut store, aid, bid) = store_with_cut();
@@ -1569,7 +1591,7 @@
         let mut c = test_clip(track_id, TrackKind::Video, 0.0, 4.0);
         c.src_in = 2.0;
         c.src_duration = 30.0;
-        c.speed = speed;
+        c.speed = AnimatedParam::fixed(speed);
         c.reverse = reverse;
         c
     }
@@ -1749,13 +1771,136 @@
     fn speed_labels_match_premiere_conventions() {
         let mut c = speed_clip("t", 1.0, false);
         assert_eq!(c.speed_label(), None);
-        c.speed = 0.5;
+        c.speed = AnimatedParam::fixed(0.5);
         assert_eq!(c.speed_label().as_deref(), Some("50 %"));
         c.reverse = true;
-        c.speed = 1.0;
+        c.speed = AnimatedParam::fixed(1.0);
         assert_eq!(c.speed_label().as_deref(), Some("−100 %"));
         c.freeze = true;
         assert_eq!(c.speed_label().as_deref(), Some("Standbild"));
+    }
+
+    /// Hilfe: animierter Speed-Clip (Kurve in clip-lokaler Timeline-Zeit).
+    fn remap_clip(track_id: &str, keys: &[(f64, f64)]) -> TimelineClip {
+        let mut c = speed_clip(track_id, 1.0, false);
+        let mut sp = AnimatedParam::fixed(keys[0].1);
+        for (t, v) in keys {
+            sp.upsert_key(*t, *v);
+        }
+        c.speed = sp;
+        c
+    }
+
+    #[test]
+    fn time_remap_media_time_integrates_speed_curve() {
+        // Lineare Rampe 1× → 3× über die clip-lokale Zeit [0, 4] (start 0).
+        let c = remap_clip("t", &[(0.0, 1.0), (4.0, 3.0)]);
+        assert!(c.is_time_remapped());
+        // speed(t) = 1 + 0,5·t ⇒ Medienzeit = src_in + ∫₀ᵗᶜ = 2 + tc + 0,25·tc².
+        let media = |tc: f64| 2.0 + tc + 0.25 * tc * tc;
+        for tc in [0.0, 1.0, 2.5, 4.0] {
+            assert!((c.media_time_at(tc) - media(tc)).abs() < 1e-9, "media tc={tc}");
+            // Umkehrung (Bisektion) trifft die Sequenzzeit zurück.
+            assert!(
+                (c.seq_time_of_media(c.media_time_at(tc)) - tc).abs() < 1e-6,
+                "inverse tc={tc}"
+            );
+        }
+        // Volle Spanne = ∫₀⁴ (1+0,5t) dt = 4 + 4 = 8; media_out konsistent.
+        assert!((c.media_span() - 8.0).abs() < 1e-9);
+        assert!((c.media_out() - 10.0).abs() < 1e-9);
+        // eff_speed = mittleres Tempo = Spanne/Dauer = 2.
+        assert!((c.eff_speed() - 2.0).abs() < 1e-9);
+        // Instantanes Tempo (numerische Ableitung der Medienzeit) an den Rändern:
+        // 1× am Anfang, 3× am Ende.
+        let d = 1e-4;
+        assert!(((c.media_time_at(d) - c.media_time_at(0.0)) / d - 1.0).abs() < 1e-3);
+        assert!(((c.media_time_at(4.0) - c.media_time_at(4.0 - d)) / d - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn time_remap_reverse_runs_curve_from_media_out() {
+        let mut c = remap_clip("t", &[(0.0, 1.0), (4.0, 3.0)]);
+        c.reverse = true;
+        // Rückwärts: am Clipanfang der Medien-Out, am Ende der In-Punkt.
+        assert!((c.media_time_at(0.0) - c.media_out()).abs() < 1e-9);
+        assert!((c.media_time_at(4.0) - c.src_in).abs() < 1e-9);
+        for tc in [0.5, 2.0, 3.7] {
+            assert!((c.seq_time_of_media(c.media_time_at(tc)) - tc).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn time_remap_split_preserves_span_and_continuity() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let clip = remap_clip(&v1, &[(0.0, 0.5), (4.0, 2.0)]);
+        let span = clip.media_span();
+        store.clips.push(clip);
+        store.split_at(1.5, None);
+        let mut parts: Vec<&TimelineClip> = store.clips.iter().collect();
+        parts.sort_by(|a, b| a.start.total_cmp(&b.start));
+        assert_eq!(parts.len(), 2);
+        let (l, r) = (parts[0], parts[1]);
+        // Lineare Kurve: Spanne exakt erhalten und Abbildung an der Kante stetig.
+        assert!((l.media_span() + r.media_span() - span).abs() < 1e-7, "Spanne erhalten");
+        assert!(
+            (l.media_time_at(1.5) - r.media_time_at(1.5)).abs() < 1e-7,
+            "Kante stetig"
+        );
+        // Beide Hälften behalten eine (neu verankerte) Kurve.
+        assert!(l.speed.is_animated() && r.speed.is_animated());
+        assert!((r.speed.keyframes[0].t).abs() < 1e-9, "rechte Hälfte ab 0 verankert");
+    }
+
+    #[test]
+    fn time_remap_dialog_flattens_to_constant() {
+        let mut store = TimelineStore::default();
+        let v1 = track_ids(&store, TrackKind::Video)[1].clone();
+        let clip = remap_clip(&v1, &[(0.0, 0.5), (4.0, 2.0)]);
+        let id = clip.id.clone();
+        let span = clip.media_span();
+        store.clips.push(clip);
+        // Geschwindigkeit/Dauer-Dialog: konstante 200 % anwenden.
+        store.set_clip_speed(&[id.clone()], 2.0, false, false, false);
+        let c = store.clip(&id).unwrap();
+        assert!(!c.speed.is_animated(), "Kurve durch festen Wert ersetzt");
+        assert!((c.eff_speed() - 2.0).abs() < 1e-9);
+        // Medienspanne bleibt erhalten (Dauer = Spanne ÷ 2).
+        assert!((c.media_span() - span).abs() < 1e-6, "Spanne erhalten");
+        assert!((c.duration - span / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn time_remap_head_extend_clamps_src_in() {
+        // Kopf-Tempo (3×) liegt über dem Mittel; bei wenig Vormaterial darf das
+        // Verlängern den In-Punkt nicht unter 0 schieben (avg-Schranke schießt
+        // sonst über das Integral hinaus).
+        let mut c = remap_clip("t", &[(0.0, 3.0), (4.0, 0.5)]);
+        c.src_in = 0.5;
+        let trimmed = apply_trim(&c, TrimEdge::Start, -0.286);
+        assert!(
+            trimmed.src_in >= 0.0,
+            "src_in geklemmt statt negativ: {}",
+            trimmed.src_in
+        );
+    }
+
+    #[test]
+    fn time_remap_speed_serializes_compactly_and_roundtrips() {
+        // Statisch ⇒ blanke Zahl (v5-kompatibel).
+        let stat = speed_clip("t", 0.5, false);
+        let j = serde_json::to_value(&stat).unwrap();
+        assert!(j["speed"].is_number(), "statische Speed bleibt eine Zahl");
+        let back: TimelineClip = serde_json::from_value(j).unwrap();
+        assert!((back.eff_speed() - 0.5).abs() < 1e-12 && !back.speed.is_animated());
+        // Animiert ⇒ Objekt mit Keyframes, unveränderter Roundtrip.
+        let anim = remap_clip("t", &[(0.0, 0.5), (4.0, 2.0)]);
+        let j = serde_json::to_value(&anim).unwrap();
+        assert!(j["speed"].is_object(), "Time-Remap als Objekt");
+        let back: TimelineClip = serde_json::from_value(j).unwrap();
+        assert_eq!(back.speed, anim.speed, "Kurve unverändert");
+        assert!(back.is_time_remapped());
     }
 
     // ------------------------------------------------------------ Marker

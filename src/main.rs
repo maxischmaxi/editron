@@ -43,6 +43,7 @@ struct App {
     marker_dialog: overlays::marker_dialog::MarkerDialog,
     media_dialogs: overlays::media_dialogs::MediaDialogs,
     interop_report: overlays::interop_report::InteropReportDialog,
+    consolidate_dialog: overlays::consolidate_dialog::ConsolidateDialog,
     player: crate::core::player::PlayerEngine,
     titles: crate::core::title_engine::TitleEngine,
     /// Letzte Proxy-Revalidierung (Sekunden) — gedrosselte Prüfung, ob ein
@@ -87,6 +88,7 @@ impl App {
             marker_dialog: Default::default(),
             media_dialogs: Default::default(),
             interop_report: Default::default(),
+            consolidate_dialog: Default::default(),
             player: crate::core::player::PlayerEngine::new(),
             titles: Default::default(),
             last_proxy_check: 0.0,
@@ -639,6 +641,32 @@ impl App {
                                     }
                                 }
                             }
+                            // Adjustment Layer (Einstellungsebene) für Smoke-Tests,
+                            // z. B. EDITRON_TEST_ADJUSTMENT="exposure=1,saturation=0":
+                            // legt eine Einstellungsebene über die gesamte Test-
+                            // Timeline und setzt ihr Grade — der Korrektur-Pass
+                            // wirkt auf das Bild ALLER Spuren darunter (Player CPU-
+                            // Composite, formelgleich zum Export). Playhead mittig.
+                            if let Ok(spec) = std::env::var("EDITRON_TEST_ADJUSTMENT") {
+                                let end = crate::core::timeline::sequence_end(
+                                    &self.state.timeline.clips,
+                                );
+                                if end > 0.0 {
+                                    let id =
+                                        self.state.timeline.add_adjustment_clip(0.0, end);
+                                    let grade = crate::core::grade::parse_test_grade(&spec);
+                                    if let Some(clip) = self
+                                        .state
+                                        .timeline
+                                        .clips
+                                        .iter_mut()
+                                        .find(|c| c.id == id)
+                                    {
+                                        clip.grade = grade;
+                                    }
+                                    self.state.timeline.set_playhead(end / 2.0);
+                                }
+                            }
                             // Effekt-Maske für Smoke-Tests, z. B.
                             // EDITRON_TEST_MASK="ellipse:cx=0.5,cy=0.5,rx=0.3,ry=0.3,feather=0.1"
                             // Hängt die Maske(n) an den ersten Video-Effekt
@@ -690,10 +718,42 @@ impl App {
                             // Geschwindigkeit für Smoke-Tests, z. B.
                             // EDITRON_TEST_SPEED="0.5" (Faktor; negativ =
                             // rückwärts, "freeze" = Standbild) auf die
-                            // eingefügten Test-Clips (mit Ripple).
+                            // eingefügten Test-Clips (mit Ripple). Time-Remap-
+                            // Kurve als "tc/value;tc/value;…" (tc in clip-
+                            // lokalen Sekunden, value = Faktor), z. B.
+                            // EDITRON_TEST_SPEED="0/1;2/3;4/1".
                             if let Ok(spec) = std::env::var("EDITRON_TEST_SPEED") {
                                 let sel = self.state.timeline.selected_clip_ids.clone();
-                                if spec.trim().eq_ignore_ascii_case("freeze") {
+                                if spec.contains('/') {
+                                    let keys: Vec<crate::core::animation::Keyframe> = spec
+                                        .split(';')
+                                        .filter_map(|p| {
+                                            let (t, v) = p.split_once('/')?;
+                                            Some(crate::core::animation::Keyframe {
+                                                t: t.trim().replace(',', ".").parse().ok()?,
+                                                value: v.trim().replace(',', ".").parse().ok()?,
+                                                interp: crate::core::animation::Interp::Linear,
+                                            })
+                                        })
+                                        .collect();
+                                    if keys.len() >= 2 {
+                                        for c in self
+                                            .state
+                                            .timeline
+                                            .clips
+                                            .iter_mut()
+                                            .filter(|c| sel.contains(&c.id) && !c.is_generator())
+                                        {
+                                            let mut p = crate::core::animation::AnimatedParam::fixed(
+                                                keys[0].value,
+                                            );
+                                            p.replace_keys(keys.clone());
+                                            c.speed = p;
+                                        }
+                                        // Time-Remap-Kurve im Editor zeigen.
+                                        self.state.dock.open_panel("effectControls");
+                                    }
+                                } else if spec.trim().eq_ignore_ascii_case("freeze") {
                                     self.state
                                         .timeline
                                         .set_clip_speed(&sel, 1.0, false, true, true);
@@ -1251,6 +1311,15 @@ impl App {
                         self.export_interop(format, path, now);
                     }
                 }
+                ServiceEvent::ConsolidateFolderPicked(path) => {
+                    self.consolidate_dialog.on_folder_picked(path);
+                }
+                ServiceEvent::ConsolidateProgress { done, total, pct, current } => {
+                    self.consolidate_dialog.on_progress(done, total, pct, current);
+                }
+                ServiceEvent::ConsolidateDone { results } => {
+                    self.consolidate_dialog.on_done(&mut self.state, results, now);
+                }
                 ServiceEvent::RelinkScanFinished { cancelled, unresolved } => {
                     self.relink_dialog.on_finished(cancelled, unresolved);
                     let msg = if cancelled {
@@ -1654,6 +1723,7 @@ fn main() {
             "proxy" => Some(stores::DialogId::ProxySettings),
             "settings" => Some(stores::DialogId::Settings),
             "autosave" => Some(stores::DialogId::AutosaveVersions),
+            "consolidate" => Some(stores::DialogId::Consolidate),
             _ => None,
         };
     }
@@ -1990,6 +2060,8 @@ fn main() {
         app.marker_dialog.render(&mut ui, &mut app.state);
         app.media_dialogs.render(&mut ui, &mut app.state);
         app.interop_report.render(&mut ui, &mut app.state);
+        app.consolidate_dialog
+            .render(&mut ui, &mut app.state, &app.services);
         render_select_popup(&mut ui);
 
         // Drag-Ghost (z. B. Assets aus dem Medien-Browser)

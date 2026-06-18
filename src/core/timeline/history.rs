@@ -356,6 +356,12 @@ impl TimelineStore {
         if clip.kind == TrackKind::Subtitle || kind.is_audio() != (clip.kind == TrackKind::Audio) {
             return Err(format!("„{}“ passt nicht zur Spurart", kind.label()));
         }
+        // Adjustment Layer sind Vollbild-Korrektur-Pässe — Übergänge (Wipe/Push/
+        // Dissolve) sind dafür weder sinnvoll noch im Compositor abgebildet; zum
+        // Ein-/Ausblenden der Wirkung dienen Deckkraft-Keyframes.
+        if clip.is_adjustment() {
+            return Err("Einstellungsebenen nehmen keine Übergänge (Deckkraft-Keyframes nutzen)".into());
+        }
         // Nachbar an der Kante (direkt angrenzend auf derselben Spur).
         let neighbor = match edge {
             TrimEdge::Start => self
@@ -429,6 +435,8 @@ impl TimelineStore {
             .filter(|c| {
                 self.selected_clip_ids.contains(&c.id)
                     && c.kind != TrackKind::Subtitle
+                    // Einstellungsebenen nehmen keine Übergänge (Vollbild-Pass).
+                    && !c.is_adjustment()
                     && (c.kind == TrackKind::Audio) == want_audio
                     && !locked.contains(&c.track_id)
             })

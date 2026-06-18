@@ -393,7 +393,7 @@ fn build_track(
                 display_name(clip)
             ));
         }
-        if clip.reverse || clip.freeze || (clip.speed - 1.0).abs() > 1e-6 {
+        if clip.reverse || clip.freeze || clip.is_time_remapped() || (clip.eff_speed() - 1.0).abs() > 1e-6 {
             warnings.push(format!(
                 "Geschwindigkeit/Standbild an '{}' ({name}) wird nicht übertragen — Clip läuft normal.",
                 display_name(clip)
@@ -727,7 +727,8 @@ fn emit_track_clips(
                     effects: Vec::new(),
                     title: None,
                     subtitle: None,
-                    speed: 1.0,
+                    adjustment: None,
+                    speed: crate::core::animation::AnimatedParam::fixed(1.0),
                     reverse: false,
                     freeze: false,
                     markers: Vec::new(),

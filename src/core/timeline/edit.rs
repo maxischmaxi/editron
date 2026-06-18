@@ -108,7 +108,8 @@ impl TimelineStore {
                 effects: Vec::new(),
                 title: None,
                 subtitle: None,
-                speed: 1.0,
+                adjustment: None,
+                speed: crate::core::animation::AnimatedParam::fixed(1.0),
                 reverse: false,
                 freeze: false,
                 markers,
@@ -178,6 +179,7 @@ impl TimelineStore {
                 let mut left = c.clone();
                 left.src_in = left_src_in;
                 left.duration = left_len;
+                left.speed = c.sliced_speed(0.0, left_len);
                 left.markers = c.markers.iter().filter(|m| !on_right(m)).cloned().collect();
                 let mut right = c.clone();
                 right.id = new_id();
@@ -185,6 +187,7 @@ impl TimelineStore {
                 right.start = at + amount;
                 right.src_in = right_src_in;
                 right.duration = c.end() - at;
+                right.speed = c.sliced_speed(left_len, c.duration);
                 right.link_id = right_link;
                 right.markers = c.markers.iter().filter(|m| on_right(m)).cloned().collect();
                 out.push(left);
@@ -987,10 +990,12 @@ impl TimelineStore {
             right.start = time;
             right.src_in = right_src_in;
             right.duration = c.duration - left_len;
+            right.speed = c.sliced_speed(left_len, c.duration);
             right.link_id = right_link;
             let mut left = c.clone();
             left.src_in = left_src_in;
             left.duration = left_len;
+            left.speed = c.sliced_speed(0.0, left_len);
             // Clip-Marker an der Schnittkante (Medienzeit) auf die Hälften
             // aufteilen — jede Hälfte behält die Marker ihres Quellausschnitts.
             let cut_media = c.media_time_at(time);

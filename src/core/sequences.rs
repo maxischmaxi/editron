@@ -131,6 +131,12 @@ impl SequenceStore {
         self.sequences.iter()
     }
 
+    /// Veränderbarer Durchlauf über ALLE Sequenzen — z. B. für die
+    /// Konsolidierung, die Medienpfade/`src_in` projektweit anpasst.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Sequence> {
+        self.sequences.iter_mut()
+    }
+
     pub fn len(&self) -> usize {
         self.sequences.len()
     }

@@ -129,6 +129,22 @@ impl Biquad {
         self.a2 = ((1.0 - alpha) / a0) as f32;
     }
 
+    /// Bandpass mit konstanter Spitzenverstärkung 0 dB (RBJ „constant 0 dB
+    /// peak gain"): am Mittenfrequenz-Punkt ist |H| = 1 und phasenneutral —
+    /// genau das, was der De-Esser braucht, um exakt das Zisch-Band
+    /// herauszugreifen (`out = x − band·(1−gain)`).
+    fn set_bandpass(&mut self, rate: u32, freq: f64, q: f64) {
+        let w0 = 2.0 * std::f64::consts::PI * freq.clamp(1.0, rate as f64 / 2.0 - 1.0) / rate as f64;
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / (2.0 * q.max(0.01));
+        let a0 = 1.0 + alpha;
+        self.b0 = (alpha / a0) as f32;
+        self.b1 = 0.0;
+        self.b2 = (-alpha / a0) as f32;
+        self.a1 = ((-2.0 * cos) / a0) as f32;
+        self.a2 = ((1.0 - alpha) / a0) as f32;
+    }
+
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
@@ -306,6 +322,31 @@ enum Stage {
         feedback: f32,
         wet: f32,
     },
+    /// De-Esser: ein Bandpass-Detektor (Zisch-Band) je Kanal greift exakt das
+    /// bandgefilterte Signal heraus; sein Pegel treibt eine Kompressor-
+    /// Gain-Reduktion, die NUR auf dieses Band wirkt (`out = x − band·(1−g)`).
+    /// Frequenzselektiv: außerhalb des Bands bleibt das Signal unangetastet.
+    DeEsser {
+        det: [Biquad; MAX_CHANNELS],
+        threshold_db: f32,
+        ratio: f32,
+        attack: f32,
+        release: f32,
+        env: f32,
+        gr_db: f32,
+    },
+    /// Auto-Ducking: Kompressor mit Sidechain. Der Pegelfolger reagiert auf das
+    /// KEY-Signal (per `process_with_sidechain` durchgereicht — Summe der
+    /// anderen Spuren); fehlt der Key, fällt er auf das eigene Signal zurück
+    /// (Selbst-Kompression). Die Gain-Reduktion senkt das eigene Signal.
+    Ducking {
+        threshold_db: f32,
+        ratio: f32,
+        attack: f32,
+        release: f32,
+        env: f32,
+        gr_db: f32,
+    },
 }
 
 /// Eine Effekt-Stufe der Kette: Instanz-Identität + DSP-Zustand.
@@ -376,9 +417,20 @@ impl AudioFxChain {
             .filter_map(|s| match &s.stage {
                 Stage::Compressor { gr_db, .. } => Some((s.fx_id.clone(), *gr_db)),
                 Stage::Limiter { gr_db, .. } => Some((s.fx_id.clone(), *gr_db)),
+                Stage::DeEsser { gr_db, .. } => Some((s.fx_id.clone(), *gr_db)),
+                Stage::Ducking { gr_db, .. } => Some((s.fx_id.clone(), *gr_db)),
                 _ => None,
             })
             .collect()
+    }
+
+    /// Braucht die Kette ein Sidechain-Key-Signal? (Wahr, sobald eine
+    /// Ducking-Stufe vorhanden ist.) Player und Export entscheiden daran, ob
+    /// sie den Key (Summe der anderen Spuren) aufbauen und durchreichen.
+    pub fn needs_sidechain(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|s| matches!(s.stage, Stage::Ducking { .. }))
     }
 
     /// Parameter zur (Medien- bzw. Sequenz-)Zeit nachführen (Filterzustände
@@ -477,12 +529,57 @@ impl AudioFxChain {
                     *feedback = (v(1) / 100.0).clamp(0.0, 0.95) as f32;
                     *wet = (v(2) / 100.0).clamp(0.0, 1.0) as f32;
                 }
+                Stage::DeEsser {
+                    det,
+                    threshold_db,
+                    ratio,
+                    ..
+                } => {
+                    // Specs: [freq, threshold, ratio, q]. Detektor = Bandpass
+                    // aufs Zisch-Band; Koeffizienten neu setzen, Zustand behalten.
+                    for b in det.iter_mut() {
+                        let mut nb = Biquad::default();
+                        nb.set_bandpass(rate, v(0), v(3));
+                        b.b0 = nb.b0;
+                        b.b1 = nb.b1;
+                        b.b2 = nb.b2;
+                        b.a1 = nb.a1;
+                        b.a2 = nb.a2;
+                    }
+                    *threshold_db = v(1) as f32;
+                    *ratio = (v(2).max(1.0)) as f32;
+                    // Attack/Release fest (De-Essing muss schnell greifen).
+                }
+                Stage::Ducking {
+                    threshold_db,
+                    ratio,
+                    attack,
+                    release,
+                    ..
+                } => {
+                    // Specs: [threshold, ratio, attack, release].
+                    *threshold_db = v(0) as f32;
+                    *ratio = (v(1).max(1.0)) as f32;
+                    *attack = smoothing_coef(v(2), rate);
+                    *release = smoothing_coef(v(3), rate);
+                }
             }
         }
     }
 
     /// Interleaved-Samples in place verarbeiten (`channels` wie beim Bauen).
     pub fn process(&mut self, samples: &mut [f32]) {
+        self.process_with_sidechain(samples, None);
+    }
+
+    /// Wie [`AudioFxChain::process`], aber mit optionalem Sidechain-Key
+    /// (`key`, gleiches Interleaving/Frame-Raster wie `samples`). Nur die
+    /// Ducking-Stufe wertet den Key aus — sein Pegelfolger reagiert auf das
+    /// KEY-Signal, die Gain-Reduktion wirkt aufs eigene `samples`. Da der Key
+    /// extern ist (von früheren Stufen unberührt), bleibt Frame i des Keys
+    /// stets zu Frame i von `samples` ausgerichtet — Block-/Sub-Block-genau,
+    /// daher in Player (ein Block) wie Export (ENV-Sub-Blöcke) formelgleich.
+    pub fn process_with_sidechain(&mut self, samples: &mut [f32], key: Option<&[f32]>) {
         let ch = self.channels;
         if ch == 0 || samples.is_empty() {
             return;
@@ -647,6 +744,77 @@ impl AudioFxChain {
                         *pos = (*pos + 1) % len;
                     }
                 }
+                Stage::DeEsser {
+                    det,
+                    threshold_db,
+                    ratio,
+                    attack,
+                    release,
+                    env,
+                    gr_db,
+                } => {
+                    let mut band = [0f32; MAX_CHANNELS];
+                    for frame in samples.chunks_exact_mut(ch) {
+                        // Zisch-Band je Kanal herausfiltern (Detektor-Bandpass,
+                        // 0-dB-Peak ⇒ am Band gilt band ≈ Signal, sonst ≈ 0).
+                        let mut level = 0f32;
+                        for (c, s) in frame.iter().enumerate() {
+                            let b = det[c].process(*s);
+                            band[c] = b;
+                            level = level.max(b.abs());
+                        }
+                        // Pegelfolger auf der Band-Energie → Gain-Reduktion.
+                        let coef = if level > *env { *attack } else { *release };
+                        *env = level + (*env - level) * coef;
+                        let env_db = linear_to_db(*env);
+                        let over = (env_db - *threshold_db).max(0.0);
+                        let target_gr = over * (1.0 - 1.0 / *ratio);
+                        let coef = if target_gr > *gr_db { *attack } else { *release };
+                        *gr_db = target_gr + (*gr_db - target_gr) * coef;
+                        let gain = db_to_linear(-*gr_db as f64);
+                        // Reduktion NUR aufs Band: out = x − band·(1−gain).
+                        let cut = 1.0 - gain;
+                        for (c, s) in frame.iter_mut().enumerate() {
+                            *s -= band[c] * cut;
+                        }
+                    }
+                }
+                Stage::Ducking {
+                    threshold_db,
+                    ratio,
+                    attack,
+                    release,
+                    env,
+                    gr_db,
+                } => {
+                    for (i, frame) in samples.chunks_exact_mut(ch).enumerate() {
+                        // Key-Pegel: Sidechain-Frame (sonst eigenes Signal als
+                        // Selbst-Kompression). Liegt ein Key vor, aber fehlt der
+                        // Frame (Längen-Mismatch), gilt Stille statt Selbst-
+                        // Duck — der Key ist die alleinige Steuerung.
+                        let level = match key {
+                            Some(k) => k
+                                .get(i * ch..i * ch + ch)
+                                .map(|kf| kf.iter().fold(0f32, |m, s| m.max(s.abs())))
+                                .unwrap_or(0.0),
+                            None => frame.iter().fold(0f32, |m, s| m.max(s.abs())),
+                        };
+                        // Key kommt extern (ungeflusht) — ein Inf/NaN dürfte den
+                        // Hüllkurven-Zustand nicht dauerhaft vergiften.
+                        let level = if level.is_finite() { level } else { 0.0 };
+                        let coef = if level > *env { *attack } else { *release };
+                        *env = level + (*env - level) * coef;
+                        let env_db = linear_to_db(*env);
+                        let over = (env_db - *threshold_db).max(0.0);
+                        let target_gr = over * (1.0 - 1.0 / *ratio);
+                        let coef = if target_gr > *gr_db { *attack } else { *release };
+                        *gr_db = target_gr + (*gr_db - target_gr) * coef;
+                        let gain = db_to_linear(-*gr_db as f64);
+                        for s in frame.iter_mut() {
+                            *s *= gain;
+                        }
+                    }
+                }
             }
         }
     }
@@ -720,6 +888,24 @@ fn new_stage(kind: EffectKind, rate: u32, channels: usize) -> Stage {
             delay_samples: (0.35 * rate as f64) as usize,
             feedback: 0.35,
             wet: 0.4,
+        },
+        EffectKind::DeEsser => Stage::DeEsser {
+            det: Default::default(),
+            threshold_db: -30.0,
+            ratio: 6.0,
+            // De-Essing greift sehr schnell, lässt aber sanft los.
+            attack: smoothing_coef(1.0, rate),
+            release: smoothing_coef(50.0, rate),
+            env: 0.0,
+            gr_db: 0.0,
+        },
+        EffectKind::Ducking => Stage::Ducking {
+            threshold_db: -30.0,
+            ratio: 8.0,
+            attack: smoothing_coef(10.0, rate),
+            release: smoothing_coef(300.0, rate),
+            env: 0.0,
+            gr_db: 0.0,
         },
         // Video-Effekte landen nie in der Audio-Kette.
         _ => Stage::Gain {
@@ -1010,5 +1196,128 @@ mod tests {
         inst.enabled = false;
         let video = instance(EffectKind::GaussianBlur, &[]);
         assert!(AudioFxChain::build(&[&inst, &video], RATE, 2, 0.0).is_none());
+    }
+
+    #[test]
+    fn de_esser_attenuates_sibilant_band_but_not_low_freq() {
+        // Zisch-Band 7 kHz, Threshold −40 dB, Ratio 8, Q 2 → starke Reduktion
+        // im Band, tiefe Frequenzen unangetastet (frequenzselektiv).
+        let inst = instance(EffectKind::DeEsser, &[(0, 7000.0), (1, -40.0), (2, 8.0), (3, 2.0)]);
+        let fx = [&inst];
+        let mut low = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let glow = measured_gain(&mut low, 300.0);
+        let mut high = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let ghigh = measured_gain(&mut high, 7000.0);
+        assert!(glow > 0.85, "Tiefer Ton bleibt (greift nur im Zisch-Band): {glow}");
+        assert!(ghigh < 0.5, "Zisch-Band deutlich gedämpft: {ghigh}");
+        // De-Esser meldet seine Gain-Reduktion (GR-Meter im Panel).
+        let gr = high
+            .dynamic_gain_reductions()
+            .iter()
+            .find(|(id, _)| id == &inst.id)
+            .map(|(_, g)| *g)
+            .unwrap();
+        assert!(gr > 3.0, "Gain-Reduktion gemeldet: {gr}");
+    }
+
+    #[test]
+    fn ducking_lowers_signal_under_key_signal() {
+        // Sidechain-Kompressor: stiller Key ⇒ Signal bleibt; lauter Key ⇒
+        // Signal wird deutlich abgesenkt (Musik unter Sprache).
+        let inst = instance(EffectKind::Ducking, &[(0, -30.0), (1, 8.0), (2, 5.0), (3, 200.0)]);
+        let fx = [&inst];
+        let main = sine(440.0, RATE as usize);
+
+        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let mut open_buf = main.clone();
+        let silent_key = vec![0f32; main.len()];
+        chain.process_with_sidechain(&mut open_buf, Some(&silent_key));
+        let open = rms(&open_buf[RATE as usize..]);
+
+        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let mut ducked_buf = main.clone();
+        let loud_key = sine(1000.0, RATE as usize);
+        chain.process_with_sidechain(&mut ducked_buf, Some(&loud_key));
+        let down = rms(&ducked_buf[RATE as usize..]);
+
+        assert!(open > 0.5, "Ohne Key bleibt das Signal hörbar: {open}");
+        assert!(down < open * 0.25, "Lauter Key duckt deutlich: {down} vs {open}");
+        let gr = chain
+            .dynamic_gain_reductions()
+            .iter()
+            .find(|(id, _)| id == &inst.id)
+            .map(|(_, g)| *g)
+            .unwrap();
+        assert!(gr > 6.0, "Gain-Reduktion am Key gemeldet: {gr}");
+    }
+
+    #[test]
+    fn ducking_falls_back_to_self_without_sidechain() {
+        // Ohne Key (None) verhält sich Ducking wie eine Selbst-Kompression —
+        // ein lautes Eigensignal über der Schwelle wird gedämpft.
+        let inst = instance(EffectKind::Ducking, &[(0, -30.0), (1, 8.0), (2, 5.0), (3, 200.0)]);
+        let fx = [&inst];
+        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let mut loud = sine(440.0, RATE as usize);
+        chain.process(&mut loud); // key = None
+        let out = rms(&loud[RATE as usize..]);
+        assert!(out < 0.3, "Selbst-Kompression ohne Key: {out}");
+    }
+
+    #[test]
+    fn ducking_survives_non_finite_key() {
+        // Der Sidechain-Key kommt extern (ungeflusht). Ein Inf/NaN-Key darf den
+        // Hüllkurven-Zustand nicht dauerhaft vergiften (Ausgabe bleibt finit,
+        // und nach einem sauberen Key ist das Signal wieder hörbar).
+        let inst = instance(EffectKind::Ducking, &[(0, -30.0), (1, 8.0), (2, 5.0), (3, 200.0)]);
+        let fx = [&inst];
+        let mut chain = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let mut main = sine(440.0, RATE as usize);
+        let mut bad_key = vec![f32::INFINITY; main.len()];
+        for (i, s) in bad_key.iter_mut().enumerate() {
+            if i % 2 == 0 {
+                *s = f32::NAN;
+            }
+        }
+        chain.process_with_sidechain(&mut main, Some(&bad_key));
+        assert!(main.iter().all(|s| s.is_finite()), "Inf/NaN-Key bleibt finit");
+        // Sauberer (stiller) Key → Signal muss wieder voll durchkommen.
+        let mut good = sine(440.0, RATE as usize);
+        let silent = vec![0f32; good.len()];
+        chain.process_with_sidechain(&mut good, Some(&silent));
+        let tail = rms(&good[RATE as usize / 2..]);
+        assert!(tail > 0.1 && tail.is_finite(), "nach schlechtem Key wieder hörbar: {tail}");
+    }
+
+    #[test]
+    fn ducking_is_block_size_invariant_with_sidechain() {
+        // Der Sidechain-Pfad muss blockgrößen-unabhängig sein (Player = ein
+        // Block, Export = ENV-Sub-Blöcke): gleicher Key, gleiches Ergebnis.
+        let inst = instance(EffectKind::Ducking, &[(0, -30.0), (1, 6.0), (2, 10.0), (3, 200.0)]);
+        let fx = [&inst];
+        let main = sine(440.0, 10000);
+        let key = sine(1000.0, 10000);
+
+        let mut whole = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let mut a = main.clone();
+        whole.process_with_sidechain(&mut a, Some(&key));
+
+        let mut chunked = AudioFxChain::build(&fx, RATE, 2, 0.0).unwrap();
+        let mut b = main.clone();
+        let mut off = 0;
+        for block in [37, 256, 1, 999, 4096] {
+            let n = (block * 2).min(b.len() - off);
+            if n == 0 {
+                break;
+            }
+            chunked.process_with_sidechain(&mut b[off..off + n], Some(&key[off..off + n]));
+            off += n;
+        }
+        if off < b.len() {
+            chunked.process_with_sidechain(&mut b[off..], Some(&key[off..]));
+        }
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-5, "Blockgrößen-Invarianz Sidechain: {x} vs {y}");
+        }
     }
 }
