@@ -102,7 +102,14 @@ pub const PROJECT_FORMAT: &str = "editron-project";
 /// die relativen Pfade als Literale lesen und alle Medien offline melden,
 /// deshalb der Versionssprung; v20-und-älter-Dateien (absolute Pfade) laden
 /// unverändert (`portable` default = false).
-pub const PROJECT_VERSION: u32 = 21;
+///
+/// v22: Nummerierte Bildsequenzen (VFX-Renders) als EIN Asset (`MediaAsset.image_seq`
+/// = printf-Muster + Start-Frame + Frame-Anzahl; `kind = Video`, `path` = erster
+/// realer Frame). Wiedergabe/Export dekodieren über den ffmpeg-image2-Demuxer.
+/// Ältere App-Versionen lesen das Asset als gewöhnliches Video (zeigen nur den
+/// ersten Frame), `image_seq` überlebt im `extra`-Catch-all — daher additiv und
+/// abwärtskompatibel; v21-und-älter laden unverändert (`image_seq` default = None).
+pub const PROJECT_VERSION: u32 = 22;
 const RECENT_LIMIT: usize = 10;
 
 // ------------------------------------------------------------------- Format
@@ -909,6 +916,7 @@ mod tests {
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         };
         state.media.add_asset(asset);
         let track_id = state.timeline.tracks[0].id.clone();
@@ -1296,6 +1304,7 @@ mod tests {
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         };
         state.media.add_asset(asset);
         state.project.portable = true;
@@ -1385,7 +1394,33 @@ mod tests {
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         }
+    }
+
+    #[test]
+    fn image_sequence_survives_serde_roundtrip() {
+        let mut a = sample_asset();
+        a.image_seq = Some(crate::core::types::ImageSequence {
+            pattern: "/renders/shot_%04d.exr".into(),
+            start: 7,
+            count: 120,
+        });
+        let json = serde_json::to_string(&a).unwrap();
+        // camelCase-Schlüssel + verschachtelte Felder werden geschrieben.
+        assert!(json.contains("\"imageSeq\""), "{json}");
+        let back: MediaAsset = serde_json::from_str(&json).unwrap();
+        let seq = back.image_seq.expect("image_seq erhalten");
+        assert_eq!(seq.pattern, "/renders/shot_%04d.exr");
+        assert_eq!(seq.start, 7);
+        assert_eq!(seq.count, 120);
+        // Kein Feld landet versehentlich im extra-Catch-all.
+        assert!(!back.extra.contains_key("imageSeq"));
+
+        // Altprojekt OHNE imageSeq lädt mit None (Abwärtskompatibilität).
+        let legacy = json.replace(",\"imageSeq\":{\"pattern\":\"/renders/shot_%04d.exr\",\"start\":7,\"count\":120}", "");
+        let old: MediaAsset = serde_json::from_str(&legacy).unwrap();
+        assert!(old.image_seq.is_none());
     }
 
     #[test]
@@ -1947,6 +1982,7 @@ mod tests {
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         }
     }
 

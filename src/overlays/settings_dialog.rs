@@ -50,6 +50,10 @@ pub struct SettingsDialog {
     synced_ffmpeg: String,
     ffprobe_input: TextInputState,
     synced_ffprobe: String,
+    whisper_input: TextInputState,
+    synced_whisper: String,
+    whisper_model_input: TextInputState,
+    synced_whisper_model: String,
     /// Letztes Validierungs-Ergebnis der ffmpeg-Pfade `(ok, Text)`.
     ffmpeg_status: Option<(bool, String)>,
     /// UI-Scale wurde live geändert, aber noch nicht auf die Platte geschrieben
@@ -349,6 +353,98 @@ impl SettingsDialog {
             theme::TEXT_3,
             FontKind::Sans12,
         );
+
+        // ---- Auto-Transkription (Whisper) ----
+        body.cut_top(10.0);
+        section(ui, &mut body, "Auto-Transkription (Whisper)");
+
+        // Status: Modell vorhanden?
+        let row = body.cut_top(20.0);
+        let ready = state.settings.transcription_ready();
+        let (txt, col, icon) = if ready {
+            ("Einsatzbereit — Modell konfiguriert.".to_string(), theme::SUCCESS, "circle-check")
+        } else {
+            ("Kein Modell — Auto-Transkription deaktiviert.".to_string(), theme::TEXT_3, "info")
+        };
+        ui.icon(icon, Rect::new(row.x, row.y, 14.0, 14.0), 14.0, col);
+        ui.text_left(&txt, Rect::new(row.x + 20.0, row.y, row.w - 20.0, row.h), col, FontKind::Sans12);
+        body.cut_top(4.0);
+
+        self.whisper_row(ui, state, services, &mut body, "whisper.cpp", false);
+        self.whisper_row(ui, state, services, &mut body, "Modell (ggml)", true);
+
+        // Standard-Sprache.
+        let r = labeled_row(ui, &mut body, "Sprache");
+        let labels: Vec<&str> = crate::core::transcribe::LANGUAGES.iter().map(|(_, l)| *l).collect();
+        let cur = crate::core::transcribe::language_index(&state.settings.whisper_language);
+        let sel = Rect::new(r.x, r.y + 1.0, r.w.min(260.0), 24.0);
+        if let Some(i) = select(ui, "settings.whisperLang", sel, &labels, cur) {
+            state.settings.whisper_language = crate::core::transcribe::LANGUAGES[i].0.to_string();
+            state.settings.save();
+        }
+
+        body.cut_top(6.0);
+        let hint = body.cut_top(16.0);
+        ui.text_left(
+            "whisper.cpp-CLI (Standard whisper-cli) + Modell (ggml-*.bin) — beide einmalig festlegen.",
+            hint,
+            theme::TEXT_3,
+            FontKind::Sans12,
+        );
+    }
+
+    /// Eine Pfad-Zeile für die Whisper-CLI bzw. das Whisper-Modell: Textfeld +
+    /// Durchsuchen + Übernehmen. `model = true` ⇒ Modellpfad, sonst Binärpfad.
+    fn whisper_row(
+        &mut self,
+        ui: &mut Ui,
+        state: &mut AppState,
+        services: &Services,
+        body: &mut Rect,
+        label: &str,
+        model: bool,
+    ) {
+        let mut r = labeled_row(ui, body, label);
+        let apply_w = 92.0;
+        let browse_w = 34.0;
+        let apply_cell = r.cut_right(apply_w);
+        r.cut_right(6.0);
+        let browse_cell = r.cut_right(browse_w);
+        r.cut_right(6.0);
+        let field = r;
+        let res = if model {
+            self.whisper_model_input.show(ui, "settings.whisperModel", field, "Pfad zum Modell")
+        } else {
+            self.whisper_input.show(ui, "settings.whisperBin", field, "whisper-cli (im PATH)")
+        };
+        if IconButton::new("folder-open")
+            .tooltip("Durchsuchen…")
+            .show(ui, ("settings.whisperBrowse", model), browse_cell)
+            .clicked
+        {
+            if model {
+                services.pick_whisper_model();
+            } else {
+                services.pick_whisper_binary();
+            }
+        }
+        let apply = TextButton::new("Übernehmen").style(TextButtonStyle::Outline);
+        if apply.show(ui, ("settings.whisperApply", model), apply_cell).clicked || res.submitted {
+            let raw = if model {
+                self.whisper_model_input.text.trim().to_string()
+            } else {
+                self.whisper_input.text.trim().to_string()
+            };
+            let path = if raw.is_empty() { None } else { Some(raw.clone()) };
+            if model {
+                state.settings.whisper_model = path;
+                self.synced_whisper_model = raw;
+            } else {
+                state.settings.whisper_path = path;
+                self.synced_whisper = raw;
+            }
+            state.settings.save();
+        }
     }
 
     fn content_appearance(&mut self, ui: &mut Ui, state: &mut AppState, mut body: Rect) {
@@ -492,6 +588,16 @@ impl SettingsDialog {
         if fp != self.synced_ffprobe {
             self.ffprobe_input.set_text(&fp);
             self.synced_ffprobe = fp;
+        }
+        let wp = state.settings.whisper_path.clone().unwrap_or_default();
+        if wp != self.synced_whisper {
+            self.whisper_input.set_text(&wp);
+            self.synced_whisper = wp;
+        }
+        let wm = state.settings.whisper_model.clone().unwrap_or_default();
+        if wm != self.synced_whisper_model {
+            self.whisper_model_input.set_text(&wm);
+            self.synced_whisper_model = wm;
         }
     }
 }

@@ -1,16 +1,20 @@
 //! Scopes-Panel: Waveform (Luma), RGB-Parade, Vektorskop und Histogramm
-//! des Programm-Bilds am Playhead. Die Bildquelle spiegelt den
+//! des Programm-Bilds am Playhead sowie das Goniometer (Lissajous) mit
+//! Korrelationsmeter des Audio-Mixdowns. Die Bildquelle spiegelt den
 //! Programmmonitor: alle sichtbaren Video-Layer werden CPU-seitig in ein
 //! kleines Analyse-Canvas komponiert — Live-Frames aus der Decode-Engine
 //! (`monitor.preview_frames`), Thumbnails als Fallback (Bilder, noch kein
 //! Frame), inklusive Transformationen UND Farbkorrektur (gleiche Mathematik
-//! wie Export/Shader). Die Scopes zeigen damit das gegradete Bild.
+//! wie Export/Shader). Die Scopes zeigen damit das gegradete Bild. Der
+//! Audio-Modus liest den Stereo-Snapshot des Master-Mixdowns
+//! (`AudioStore::scope_stereo`/`correlation`, gespeist vom Player).
 
 use crate::core::{compose, effects, grade};
 use crate::core::types::MediaKind;
 use crate::panels::Panel;
 use crate::services::Services;
 use crate::state::AppState;
+use crate::stores::AudioStore;
 use crate::theme;
 use crate::ui::geom::{v2, Rect};
 use crate::ui::widgets::select::select;
@@ -20,7 +24,10 @@ use crate::ui::{FontKind, Ui};
 const CANVAS_W: usize = 192;
 const CANVAS_H: usize = 108;
 
-const MODES: [&str; 4] = ["Waveform", "RGB-Parade", "Vektorskop", "Histogramm"];
+const MODES: [&str; 5] = ["Waveform", "RGB-Parade", "Vektorskop", "Histogramm", "Goniometer"];
+/// Index des Audio-Modus (Goniometer + Korrelationsmeter); die übrigen Modi
+/// analysieren das Programmbild.
+const AUDIO_MODE: usize = 4;
 
 #[derive(Default)]
 pub struct ScopesPanel {
@@ -184,6 +191,136 @@ fn draw_graticule(ui: &mut Ui, area: Rect) {
     }
 }
 
+/// Audio-Goniometer (Lissajous) + Korrelationsmeter aus dem Master-Mixdown.
+/// Der Plot ist um 45° gedreht: mono (L=R) ⇒ senkrechte Spur, gegenphasig
+/// (L=−R) ⇒ waagerechte Spur, volle Stereobreite ⇒ runde Wolke. Software-Plot
+/// wie die Video-Scopes (kein GPU-Readback-Stall).
+fn draw_audio_scope(ui: &mut Ui, audio: &AudioStore, mut area: Rect) {
+    use raylib::color::Color;
+
+    // Korrelationsmeter als unterer Streifen, darüber das Plotfeld.
+    let meter = area.cut_bottom(74.0);
+    ui.hline(meter.x, meter.y, meter.w, theme::LINE);
+    draw_correlation_meter(ui, audio, meter.inset_xy(14.0, 10.0));
+
+    // Quadratisches Plotfeld zentrieren.
+    let side = area.w.min(area.h);
+    let plot = area.center_box(side, side);
+    let cx = plot.x + plot.w / 2.0;
+    let cy = plot.y + plot.h / 2.0;
+    let half = (side / 2.0 - 14.0).max(10.0);
+    // Vollausschlag eines EINZELNEN Kanals liegt auf dem Referenzkreis; mono
+    // (beide Kanäle voll) erreicht die obere Kante (= half), gegenphasig die
+    // seitlichen Kanten — daraus der Plot-Gain g = half/2.
+    let r_circle = half * std::f32::consts::FRAC_1_SQRT_2;
+    let g = half / 2.0;
+
+    // ---- Graticule -------------------------------------------------------
+    let line = Color::new(255, 255, 255, 26);
+    let line_soft = Color::new(255, 255, 255, 14);
+    ui.circle_outline(v2(cx, cy), r_circle, line);
+    // M-Achse (senkrecht = mono) betont, S-Achse (waagerecht = Seite) zart.
+    ui.line_thin(v2(cx, cy - half), v2(cx, cy + half), line);
+    ui.line_thin(v2(cx - half, cy), v2(cx + half, cy), line_soft);
+    // L/R-Diagonalen = Einzelkanal-Richtungen (oben links/rechts).
+    ui.line_thin(v2(cx, cy), v2(cx - r_circle, cy - r_circle), line_soft);
+    ui.line_thin(v2(cx, cy), v2(cx + r_circle, cy - r_circle), line_soft);
+    // Beschriftung der Pole.
+    ui.text(
+        "L",
+        v2(cx - r_circle - 10.0, cy - r_circle - 6.0),
+        theme::TEXT_3,
+        FontKind::Sans12,
+    );
+    ui.text(
+        "R",
+        v2(cx + r_circle + 3.0, cy - r_circle - 6.0),
+        theme::TEXT_3,
+        FontKind::Sans12,
+    );
+    ui.text("M", v2(cx + 4.0, cy - half - 1.0), theme::TEXT_3, FontKind::Sans12);
+
+    // ---- Streupunkte (oder Hinweis) --------------------------------------
+    if audio.scope_stereo.is_empty() {
+        let center = plot.center_box(260.0, 52.0);
+        let mut c = center;
+        let ic = c.cut_top(20.0);
+        ui.icon("activity", ic, 20.0, theme::TEXT_3);
+        c.cut_top(8.0);
+        ui.text_centered(
+            "Kein Audiosignal — Wiedergabe starten.",
+            c,
+            theme::TEXT_3,
+            FontKind::Sans12,
+        );
+        return;
+    }
+    let dot = Color::new(110, 240, 165, 46);
+    for &[l, r] in &audio.scope_stereo {
+        let px = cx + g * (r - l);
+        let py = cy - g * (l + r);
+        ui.fill(Rect::new(px, py, 1.5, 1.5), dot);
+    }
+}
+
+/// Horizontaler Korrelationsbalken (−1 … +1) mit numerischem Wert. +1 grün
+/// (mono-kompatibel), 0 neutral (volle Breite), −1 rot (gegenphasig,
+/// mono-inkompatibel — Phasenwarnung).
+fn draw_correlation_meter(ui: &mut Ui, audio: &AudioStore, area: Rect) {
+    use raylib::color::Color;
+    let have = !audio.scope_stereo.is_empty();
+    let val = audio.correlation.clamp(-1.0, 1.0);
+    let pos = Color::new(90, 215, 140, 255);
+
+    // Kopfzeile: Label links, Wert rechts (vorzeichenfarbig).
+    let mut a = area;
+    let head = a.cut_top(20.0);
+    ui.text_left("Korrelation", head, theme::TEXT_2, FontKind::Sans12);
+    let val_col = if !have {
+        theme::TEXT_3
+    } else if val >= 0.0 {
+        pos
+    } else {
+        theme::DANGER
+    };
+    let val_txt = if have { format!("{val:+.2}") } else { "—".to_string() };
+    ui.text_right(&val_txt, head, val_col, FontKind::Mono12);
+
+    // Messbalken.
+    a.cut_top(2.0);
+    let bar = a.cut_top(14.0);
+    ui.fill(bar, theme::SURFACE_2);
+    let mid_x = bar.x + bar.w / 2.0;
+    ui.vline(mid_x, bar.y, bar.h, theme::LINE_STRONG);
+    if have {
+        // Füllung von der Mitte bis zum Wert.
+        let x = bar.x + (val * 0.5 + 0.5) * bar.w;
+        let (fx, fw) = if val >= 0.0 {
+            (mid_x, x - mid_x)
+        } else {
+            (x, mid_x - x)
+        };
+        let fill_col = if val >= 0.0 {
+            theme::with_alpha(pos, 200)
+        } else {
+            theme::with_alpha(theme::DANGER, 200)
+        };
+        ui.fill(Rect::new(fx, bar.y, fw.max(1.0), bar.h), fill_col);
+        ui.vline(
+            x.clamp(bar.x, bar.right() - 1.0),
+            bar.y - 2.0,
+            bar.h + 4.0,
+            theme::TEXT_1,
+        );
+    }
+
+    // Skala.
+    let scale = a.cut_top(14.0);
+    ui.text_left("-1", scale, theme::TEXT_3, FontKind::Sans12);
+    ui.text_centered("0", scale, theme::TEXT_3, FontKind::Sans12);
+    ui.text_right("+1", scale, theme::TEXT_3, FontKind::Sans12);
+}
+
 impl Panel for ScopesPanel {
     fn update(&mut self, ui: &mut Ui, app: &mut AppState, _services: &Services, rect: Rect) {
         ui.fill(rect, theme::SURFACE_1);
@@ -202,7 +339,8 @@ impl Panel for ScopesPanel {
                 0 => "Luma (709)",
                 1 => "R / G / B",
                 2 => "Cb/Cr (709)",
-                _ => "RGB",
+                3 => "RGB",
+                _ => "L/R · Phase",
             },
             bar_inner,
             theme::TEXT_3,
@@ -210,6 +348,13 @@ impl Panel for ScopesPanel {
         );
 
         ui.fill(area, theme::BLACK);
+
+        // ---- Audio-Modus: Goniometer + Korrelationsmeter (Mixdown) ----------
+        if self.mode == AUDIO_MODE {
+            draw_audio_scope(ui, &app.audio, area);
+            return;
+        }
+
         let Some(canvas) = self.compose_program(app) else {
             let center = area.center_box(260.0, 52.0);
             let mut c = center;

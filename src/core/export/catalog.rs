@@ -50,6 +50,22 @@ pub const CONTAINERS: &[ContainerDef] = &[
         image_sequence: false,
     },
     ContainerDef {
+        id: "mxf",
+        label: "MXF (OP1a, Broadcast)",
+        ext: "mxf",
+        video: true,
+        // Sendeserver-taugliche Master: XDCAM HD422 (MPEG-2 4:2:2), DNxHD/HR
+        // und ProRes. Der MXF-OP1a-Muxer ist der ffmpeg-Standard-`mxf`.
+        video_codecs: &["xdcamhd422", "dnxhr", "prores"],
+        // MXF trägt unkomprimiertes PCM (Broadcast-Norm) — keine verlustbehaftete
+        // Tonspur.
+        audio_codecs: &["pcm24", "pcm16"],
+        faststart: false,
+        muxer: "mxf",
+        subtitle_codec: None,
+        image_sequence: false,
+    },
+    ContainerDef {
         id: "mkv",
         label: "Matroska (MKV)",
         ext: "mkv",
@@ -270,6 +286,8 @@ const HEVC_ENCODERS: &[EncoderDef] = &[
     EncoderDef { id: "hevc_vaapi", label: "Hardware — VAAPI", quality: EncoderQuality::Qp(0, 52, 26), vaapi: true },
     EncoderDef { id: "hevc_videotoolbox", label: "Hardware — VideoToolbox", quality: EncoderQuality::BitrateOnly, vaapi: false },
 ];
+const XDCAM_ENCODERS: &[EncoderDef] =
+    &[EncoderDef { id: "mpeg2video", label: "Software (MPEG-2 4:2:2)", quality: EncoderQuality::Crf, vaapi: false }];
 const PRORES_ENCODERS: &[EncoderDef] =
     &[EncoderDef { id: "prores_ks", label: "Software (prores_ks)", quality: EncoderQuality::Crf, vaapi: false }];
 const DNXHD_ENCODERS: &[EncoderDef] =
@@ -326,6 +344,21 @@ pub const VIDEO_CODECS: &[VideoCodecDef] = &[
         default_speed: 5,
         pix_fmt: "yuv420p",
         encoders: HEVC_ENCODERS,
+    },
+    VideoCodecDef {
+        id: "xdcamhd422",
+        label: "XDCAM HD422 (MPEG-2 4:2:2, 50 Mbit/s)",
+        encoder: "mpeg2video",
+        // Festes Sony-Broadcast-Profil (50 Mbit/s CBR, 4:2:2) — kein
+        // Qualitätsregler. Einzelnes „Profil" nur fürs Dialog-Label; das
+        // tatsächliche 4:2:2-Profil leitet der Encoder aus `yuv422p` ab
+        // (explizites `-profile:v` bricht den MXF-Muxer). Siehe
+        // `xdcam_hd422_args` im Worker.
+        quality: QualityKind::Profiles(&[("hd422", "HD422 — 50 Mbit/s (4:2:2)", "yuv422p")]),
+        speed_presets: &[],
+        default_speed: 0,
+        pix_fmt: "yuv422p",
+        encoders: XDCAM_ENCODERS,
     },
     VideoCodecDef {
         id: "prores",
@@ -446,6 +479,18 @@ pub fn video_codec(id: &str) -> &'static VideoCodecDef {
         .iter()
         .find(|c| c.id == id)
         .unwrap_or(&VIDEO_CODECS[0])
+}
+
+/// Codecs mit ECHTER Interlaced-Ausgabe (Broadcast). Steuert die
+/// Abtastungs-Auswahl im Export-Dialog und die Feld-Encoder-Flags in
+/// `video_codec_args`. Nur XDCAM HD422 (MPEG-2 Feldkodierung) liefert in
+/// dieser Pipeline tatsächlich interlaced: der ffmpeg-`dnxhd`-Encoder LEHNT
+/// interlaced DNxHR-Profile ab (harter Fehler), und `prores_ks` ignoriert
+/// `-field_order` und bleibt progressiv — beide sind daher progressive
+/// Mastering-Formate. Web-Codecs (H.264/HEVC/VP9/AV1) liefern ohnehin
+/// progressiv.
+pub fn codec_supports_interlace(codec_id: &str) -> bool {
+    codec_id == "xdcamhd422"
 }
 
 pub struct AudioCodecDef {

@@ -110,6 +110,7 @@
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         }
     }
 
@@ -1145,6 +1146,120 @@
         let mut av10 = default_video("av1", 1920, 1080, 25.0);
         av10.tenbit = true;
         assert!(video_codec_args(&av10, container("mp4"), OutputColor::Bt709).join(" ").contains("yuv420p10le"));
+    }
+
+    #[test]
+    fn mxf_broadcast_catalog_wired() {
+        // MXF-Container ist vorhanden (OP1a-Muxer) und bietet die
+        // Broadcast-Codecs an; XDCAM HD422 ist als Codec registriert.
+        let mxf = container("mxf");
+        assert_eq!(mxf.muxer, "mxf");
+        assert_eq!(mxf.ext, "mxf");
+        assert!(mxf.video);
+        assert!(mxf.video_codecs.contains(&"xdcamhd422"));
+        assert!(mxf.video_codecs.contains(&"dnxhr"));
+        assert!(mxf.video_codecs.contains(&"prores"));
+        // MXF trägt PCM, keine verlustbehaftete Tonspur.
+        assert!(mxf.audio_codecs.contains(&"pcm24"));
+        assert!(!mxf.audio_codecs.contains(&"aac"));
+        // XDCAM-Codec aufgelöst.
+        assert_eq!(video_codec("xdcamhd422").encoder, "mpeg2video");
+        // Nur XDCAM HD422 kann in dieser Pipeline echtes Interlaced.
+        assert!(codec_supports_interlace("xdcamhd422"));
+        assert!(!codec_supports_interlace("dnxhr"));
+        assert!(!codec_supports_interlace("prores"));
+        assert!(!codec_supports_interlace("h264"));
+        // Es gibt Broadcast-Presets, die nach MXF schreiben.
+        let mxf_presets = PRESETS
+            .iter()
+            .filter(|p| (p.build)((1920, 1080), 25.0).container.id == "mxf")
+            .count();
+        assert!(mxf_presets >= 3, "mind. 3 MXF-Presets erwartet, fand {mxf_presets}");
+    }
+
+    #[test]
+    fn xdcam_hd422_args_are_broadcast_grade() {
+        // 1080i25 (interlaced, oberes Feld zuerst).
+        let mut v = default_video("xdcamhd422", 1920, 1080, 25.0);
+        v.scan = ScanMode::InterlacedTff;
+        let joined = video_codec_args(&v, container("mxf"), OutputColor::Bt709).join(" ");
+        // MPEG-2 4:2:2 @ 50 Mbit/s CBR.
+        assert!(joined.contains("-c:v mpeg2video"), "{joined}");
+        assert!(joined.contains("-pix_fmt yuv422p"), "{joined}");
+        assert!(joined.contains("-b:v 50M") && joined.contains("-minrate 50M") && joined.contains("-maxrate 50M"));
+        // Kein explizites -profile:v (würde den MXF-Muxer brechen).
+        assert!(!joined.contains("-profile:v"), "XDCAM darf kein -profile:v setzen: {joined}");
+        // non_linear_quant verlangt qmax ≤ 28.
+        assert!(joined.contains("-non_linear_quant 1") && joined.contains("-qmax 28"), "{joined}");
+        // Interlaced: Feldkodierung + oberes Feld zuerst, auch im setparams-Filter.
+        assert!(joined.contains("-flags +ilme+ildct") && joined.contains("-top 1"), "{joined}");
+        assert!(joined.contains("field_mode=tff"), "{joined}");
+        // Ehrliche Color-Tags inkl. setparams (alle drei überleben den Mux).
+        assert!(joined.contains("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709"), "{joined}");
+        assert!(joined.contains("-color_primaries bt709") && joined.contains("-color_trc bt709"));
+
+        // Progressiv (1080p25): keine Feld-Flags.
+        let vp = default_video("xdcamhd422", 1920, 1080, 25.0);
+        let prog = video_codec_args(&vp, container("mxf"), OutputColor::Bt709).join(" ");
+        assert!(!prog.contains("-flags +ilme+ildct") && !prog.contains("-top"), "{prog}");
+        assert!(prog.contains("field_mode=prog"), "{prog}");
+    }
+
+    #[test]
+    fn setparams_makes_all_color_tags_survive() {
+        // Der setparams-Schritt schreibt Primaries/Transfer auf die Frames,
+        // sonst meldet ffprobe „unknown" (scale taggt nur die Matrix).
+        let v = default_video("prores", 1920, 1080, 25.0);
+        let hdr = video_codec_args(&v, container("mxf"), OutputColor::Bt2020Pq).join(" ");
+        assert!(hdr.contains("setparams="), "setparams fehlt: {hdr}");
+        assert!(hdr.contains("color_primaries=bt2020"), "{hdr}");
+        assert!(hdr.contains("color_trc=smpte2084"), "PQ-Transfer durchgereicht: {hdr}");
+        // Interlaced wird auf Codecs geklemmt, die es WIRKLICH können: der
+        // ffmpeg-dnxhd-Encoder bricht bei interlaced DNxHR ab, prores_ks bleibt
+        // trotzdem progressiv. Beide ⇒ erzwungen progressiv (keine
+        // Feldkodierung, keine irreführende Interlaced-Markierung).
+        assert!(!codec_supports_interlace("prores"));
+        assert!(!codec_supports_interlace("dnxhr"));
+        for codec in ["prores", "dnxhr"] {
+            let mut vi = default_video(codec, 1920, 1080, 25.0);
+            vi.scan = ScanMode::InterlacedBff;
+            let il = video_codec_args(&vi, container("mxf"), OutputColor::Bt709).join(" ");
+            assert!(il.contains("field_mode=prog"), "{codec}: progressiv erzwungen: {il}");
+            assert!(!il.contains("-field_order"), "{codec}: keine Feldreihenfolge: {il}");
+            assert!(!il.contains("ilme"), "{codec}: keine Feldkodierung: {il}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_codec_container_mismatch() {
+        let (tl, media) = state_with(
+            vec![track("v", TrackKind::Video)],
+            vec![clip("c", "v", TrackKind::Video, "V", 0.0, 4.0)],
+            vec![video_asset("V", "/v.mov")],
+        );
+        // ProRes (nur MOV/MXF) in einen MP4-Container → Fehler.
+        let mut settings = test_settings();
+        settings.video = Some(default_video("prores", 1920, 1080, 25.0));
+        settings.container = container("mp4");
+        settings.output = "/tmp/out.mp4".into();
+        let issues = validate(&tl, &media, Some(true), None, &settings, &NoNests);
+        assert!(
+            issues.iter().any(|i| i.severity == Severity::Error
+                && i.message.contains("passt nicht in den Container")),
+            "Codec/Container-Mismatch muss blockieren: {issues:?}"
+        );
+
+        // Korrekte Kombination (ProRes in MXF) → kein Kombinations-Fehler.
+        let mut ok = test_settings();
+        ok.video = Some(default_video("prores", 1920, 1080, 25.0));
+        ok.audio = Some(default_audio("pcm24", None));
+        ok.container = container("mxf");
+        ok.output = "/tmp/out.mxf".into();
+        let issues = validate(&tl, &media, Some(true), None, &ok, &NoNests);
+        assert!(
+            !issues.iter().any(|i| i.message.contains("passt nicht in den Container")),
+            "gültige MXF-Kombination darf nicht meckern: {issues:?}"
+        );
     }
 
     #[test]
@@ -2225,6 +2340,133 @@
                 "audio.m4a" => {
                     assert!(info.video.is_empty(), "{name}: darf kein Video haben");
                     assert_eq!(info.audio[0].codec, "aac", "{name}");
+                }
+                _ => unreachable!(),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ein einzelnes ffprobe-Stream-/Format-Feld als String (leer = unbekannt).
+    fn ffprobe_field(path: &std::path::Path, entries: &str) -> String {
+        let out = Command::new(crate::services::ffprobe_bin())
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", entries])
+            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(path)
+            .output()
+            .expect("ffprobe");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// End-to-End: Sendeserver-tauglicher MXF-Master (OP1a). Exportiert XDCAM
+    /// HD422 (1080i25) und ProRes-422-HQ-MXF durch den echten App-Pfad und
+    /// bestätigt per ffprobe Container, Codec, 4:2:2-Pixelformat, Interlaced-
+    /// Feldreihenfolge und — der Kern des Color-Taggings — dass ALLE drei
+    /// Color-Tags (Primaries/Transfer/Matrix) den Mux überleben.
+    #[test]
+    fn end_to_end_mxf_broadcast_master_tags_color() {
+        let dir = std::env::temp_dir().join(format!("editron-export-mxf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("quelle.mp4");
+        let gen = Command::new(crate::services::ffmpeg_bin())
+            .args(["-y", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "testsrc2=duration=0.5:size=1920x1080:rate=25"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=0.5"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(gen.success());
+
+        let (tl, media) = state_with(
+            vec![track("v1", TrackKind::Video), track("a1", TrackKind::Audio)],
+            vec![
+                clip("v", "v1", TrackKind::Video, "VID", 0.0, 0.5),
+                clip("a", "a1", TrackKind::Audio, "VID", 0.0, 0.5),
+            ],
+            vec![video_asset("VID", &src.to_string_lossy())],
+        );
+
+        // (a) XDCAM HD422 1080i25 (interlaced, oberes Feld zuerst).
+        let mut xdcam = default_video("xdcamhd422", 1920, 1080, 25.0);
+        xdcam.scan = ScanMode::InterlacedTff;
+        // (b) ProRes 422 HQ in MXF (progressiv).
+        let mut prores = default_video("prores", 1920, 1080, 25.0);
+        prores.profile = 3;
+        // (c) DNxHR HQ in MXF mit interlaced ANGEFORDERT — der dnxhd-Encoder
+        // lehnt interlaced DNxHR ab; muss auf progressiv geklemmt werden und
+        // DARF NICHT abstürzen (Regressionsschutz).
+        let mut dnxhr = default_video("dnxhr", 1920, 1080, 25.0);
+        dnxhr.profile = 2;
+        dnxhr.scan = ScanMode::InterlacedTff;
+        let cases: Vec<(&str, VideoSettings)> =
+            vec![("xdcam.mxf", xdcam), ("prores.mxf", prores), ("dnxhr.mxf", dnxhr)];
+
+        for (name, video) in cases {
+            let out = dir.join(name);
+            let settings = ExportSettings {
+                container: container("mxf"),
+                video: Some(video),
+                audio: Some(default_audio("pcm24", None)),
+                loudness: None,
+                use_in_out: false,
+                audio_stems: false,
+                subtitles: SubtitleMode::None,
+                image_start: 1,
+                output: out.to_string_lossy().into_owned(),
+            };
+            let plan = build_render_plan(&tl, &media, &settings, &NoNests);
+            let (tx, rx) = std::sync::mpsc::channel();
+            run_export_worker(
+                format!("mxf-{name}"),
+                plan,
+                settings.clone(),
+                tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(Vec::new())),
+            );
+            let mut ok = false;
+            let mut error = None;
+            while let Ok(ev) = rx.try_recv() {
+                if let ServiceEvent::SequenceExportDone { ok: o, error: e, .. } = ev {
+                    ok = o;
+                    error = e;
+                }
+            }
+            assert!(ok, "{name}: {error:?}");
+
+            // Container ist MXF (OP1a).
+            let fmt = ffprobe_field(&out, "format=format_name");
+            assert!(fmt.contains("mxf"), "{name}: Container {fmt}");
+
+            let info = crate::services::probe_media(&out.to_string_lossy()).expect(name);
+            let v0 = &info.video[0];
+            // Tonspur ist PCM (Broadcast-Norm).
+            assert_eq!(info.audio[0].codec, "pcm_s24le", "{name}: PCM-Audio");
+            // ALLE drei Color-Tags müssen den Mux überleben (Kern des Tickets).
+            assert_eq!(v0.color_primaries.as_deref(), Some("bt709"), "{name}: Primaries");
+            assert_eq!(v0.color_transfer.as_deref(), Some("bt709"), "{name}: Transfer");
+            assert_eq!(v0.color_space.as_deref(), Some("bt709"), "{name}: Matrix");
+
+            match name {
+                "xdcam.mxf" => {
+                    assert_eq!(v0.codec, "mpeg2video", "{name}: Codec");
+                    assert_eq!(v0.pix_fmt.as_deref(), Some("yuv422p"), "{name}: 4:2:2");
+                    // Interlaced, oberes Feld zuerst.
+                    let fo = ffprobe_field(&out, "stream=field_order");
+                    assert_eq!(fo, "tt", "{name}: Feldreihenfolge {fo}");
+                }
+                "prores.mxf" => {
+                    assert_eq!(v0.codec, "prores", "{name}: Codec");
+                }
+                "dnxhr.mxf" => {
+                    assert_eq!(v0.codec, "dnxhd", "{name}: Codec");
+                    // Interlaced wurde auf progressiv geklemmt (dnxhd kann kein
+                    // interlaced DNxHR) — nicht „tt"/„bb".
+                    let fo = ffprobe_field(&out, "stream=field_order");
+                    assert!(fo != "tt" && fo != "bb", "{name}: progressiv erwartet, war {fo}");
                 }
                 _ => unreachable!(),
             }

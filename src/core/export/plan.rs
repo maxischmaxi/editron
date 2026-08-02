@@ -49,6 +49,9 @@ pub struct VideoLayerPlan {
     pub clip_id: String,
     pub path: String,
     pub image: bool,
+    /// Bildsequenz (VFX-Render): `path` ist das printf-Muster, dekodiert über
+    /// den image2-Demuxer (`-framerate`/`-start_number`). None = normales Medium.
+    pub seq: Option<crate::core::export::SeqInput>,
     /// Medienzeit des ersten Segment-Frames.
     pub src_in: f64,
     /// Medienfortschritt pro Ausgabesekunde (signiert): speed vorwärts,
@@ -244,6 +247,8 @@ pub struct NestMediaInfo {
     pub natural_w: u32,
     pub natural_h: u32,
     pub image: bool,
+    /// Bildsequenz (`path` = printf-Muster, image2-Decode). None = Einzelmedium.
+    pub seq: Option<crate::core::export::SeqInput>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -385,11 +390,22 @@ fn gather_nests(
                             .first()
                             .map(|v| (v.width, v.height))
                             .unwrap_or((0, 0));
+                        let (path, seq) = match &a.image_seq {
+                            Some(s) => (
+                                s.pattern.clone(),
+                                Some(crate::core::export::SeqInput {
+                                    start: s.start,
+                                    fps: a.info.video.first().map(|v| v.fps).unwrap_or(24.0),
+                                }),
+                            ),
+                            None => (a.path.clone(), None),
+                        };
                         plan.nest_media.entry(c.asset_id.clone()).or_insert(NestMediaInfo {
-                            path: a.path.clone(),
+                            path,
                             natural_w: nw,
                             natural_h: nh,
                             image: a.kind == MediaKind::Image,
+                            seq,
                         });
                     }
                 }
@@ -823,6 +839,7 @@ pub(crate) fn plan_video_segments(
         media_step: f64,
         path: String,
         image: bool,
+        seq: Option<crate::core::export::SeqInput>,
         fx: ClipFx,
         grade: ColorGrade,
         effects: Vec<EffectInstance>,
@@ -839,6 +856,22 @@ pub(crate) fn plan_video_segments(
 
     let frame_of = |t: f64| -> u64 {
         (((t - range_start) * fps).round().max(0.0) as u64).min(total_frames)
+    };
+
+    // Decode-Quelle eines Assets: Bildsequenz ⇒ printf-Muster + SeqInput (native
+    // Bildrate), damit der Worker über den image2-Demuxer dekodiert; sonst der
+    // reale Pfad. Der EXPORT nutzt immer das Original (nie den Proxy).
+    let decode_src = |asset: &crate::core::types::MediaAsset| -> (String, Option<crate::core::export::SeqInput>) {
+        match &asset.image_seq {
+            Some(s) => (
+                s.pattern.clone(),
+                Some(crate::core::export::SeqInput {
+                    start: s.start,
+                    fps: asset.info.video.first().map(|v| v.fps).unwrap_or(24.0),
+                }),
+            ),
+            None => (asset.path.clone(), None),
+        }
     };
 
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -892,6 +925,7 @@ pub(crate) fn plan_video_segments(
                 media_step: clip.media_step(),
                 path: String::new(),
                 image: false,
+                seq: None,
                 fx: clip.fx.clone(),
                 grade: clip.grade.clone(),
                 effects: clip
@@ -936,6 +970,7 @@ pub(crate) fn plan_video_segments(
                 media_step: clip.media_step(),
                 path: String::new(),
                 image: false,
+                seq: None,
                 fx: clip.fx.clone(),
                 grade: clip.grade.clone(),
                 effects: clip
@@ -971,6 +1006,7 @@ pub(crate) fn plan_video_segments(
                 media_step: clip.media_step(),
                 path: String::new(),
                 image: false,
+                seq: None,
                 fx: clip.fx.clone(),
                 grade: clip.grade.clone(),
                 effects: clip
@@ -1011,6 +1047,7 @@ pub(crate) fn plan_video_segments(
                 media_step: clip.media_step(),
                 path: String::new(),
                 image: false,
+                seq: None,
                 fx: clip.fx.clone(),
                 grade: clip.grade.clone(),
                 effects: clip
@@ -1058,6 +1095,7 @@ pub(crate) fn plan_video_segments(
                 .first()
                 .map(|v| (v.width, v.height, v.bit_depth))
                 .unwrap_or((0, 0, 8));
+            let (path, seq) = decode_src(asset);
             candidates.push(Candidate {
                 draw_order: order,
                 is_solid: false,
@@ -1068,8 +1106,9 @@ pub(crate) fn plan_video_segments(
                 clip_duration: clip.duration,
                 src_in: clip.src_in - angle.pos,
                 media_step: clip.media_step(),
-                path: asset.path.clone(),
+                path,
                 image,
+                seq,
                 fx: clip.fx.clone(),
                 grade: clip.grade.clone(),
                 effects: clip
@@ -1106,6 +1145,7 @@ pub(crate) fn plan_video_segments(
             .first()
             .map(|v| (v.width, v.height, v.bit_depth))
             .unwrap_or((0, 0, 8));
+        let (path, seq) = decode_src(asset);
         candidates.push(Candidate {
             draw_order: order,
             is_solid: false,
@@ -1116,8 +1156,9 @@ pub(crate) fn plan_video_segments(
             clip_duration: clip.duration,
             src_in: clip.src_in,
             media_step: clip.media_step(),
-            path: asset.path.clone(),
+            path,
             image,
+            seq,
             fx: clip.fx.clone(),
             grade: clip.grade.clone(),
             effects: clip
@@ -1212,6 +1253,7 @@ pub(crate) fn plan_video_segments(
                 media_step: 1.0,
                 path: String::new(),
                 image: false,
+                seq: None,
                 fx: ClipFx::default(),
                 grade: ColorGrade::default(),
                 effects: Vec::new(),
@@ -1328,6 +1370,7 @@ pub(crate) fn plan_video_segments(
                 clip_id: c.clip_id.clone(),
                 path: c.path.clone(),
                 image: c.image,
+                seq: c.seq,
                 // Medienzeit des Segmentbeginns aus der Sequenzzeit ableiten
                 // (identische Formel wie `TimelineClip::media_time_at` —
                 // rückwärts läuft die Spanne vom Medien-Out abwärts).

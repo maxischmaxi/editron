@@ -208,6 +208,59 @@ pub fn validate(
         }
     }
 
+    // ---- Codec ↔ Container ----
+    // Nur erlaubte Kombinationen muxen (XDCAM HD422/ProRes/DNxHR nur in MXF/MOV,
+    // PCM-Audio nur in passenden Containern, …). Der Dialog clampt zwar bei
+    // jedem Wechsel, aber Nutzer-Presets und ältere Projektstände könnten eine
+    // ungültige Kombination tragen.
+    if settings.container.video {
+        if let Some(v) = &settings.video {
+            if !settings.container.video_codecs.contains(&v.codec.id) {
+                issues.push(error(format!(
+                    "Video-Codec „{}“ passt nicht in den Container „{}“.",
+                    v.codec.label, settings.container.label
+                )));
+            }
+        }
+    }
+    if let Some(a) = &settings.audio {
+        if !settings.container.audio_codecs.contains(&a.codec.id) {
+            issues.push(error(format!(
+                "Audio-Codec „{}“ passt nicht in den Container „{}“.",
+                a.codec.label, settings.container.label
+            )));
+        }
+    }
+
+    // ---- XDCAM HD422: Broadcast-Rahmenmaße/-Raten ----
+    // Sendeserver akzeptieren XDCAM HD422 nur als HD mit Broadcast-Bildrate.
+    if let Some(v) = &settings.video {
+        if v.codec.id == "xdcamhd422" {
+            if !matches!((v.width, v.height), (1920, 1080) | (1280, 720)) {
+                issues.push(warning(format!(
+                    "XDCAM HD422 erwartet 1920×1080 oder 1280×720 — {}×{} ist nicht spezifikationskonform.",
+                    v.width, v.height
+                )));
+            }
+            let broadcast_rate = [
+                25.0_f64,
+                30.0,
+                50.0,
+                60.0,
+                30000.0 / 1001.0,
+                60000.0 / 1001.0,
+                24000.0 / 1001.0,
+            ]
+            .iter()
+            .any(|r| (r - v.fps).abs() < 0.01);
+            if !broadcast_rate {
+                issues.push(warning(
+                    "XDCAM HD422 erwartet eine Broadcast-Bildrate (25, 29,97, 30, 50, 59,94, 60).",
+                ));
+            }
+        }
+    }
+
     // ---- Zieldatei ----
     if settings.output.trim().is_empty() {
         issues.push(error("Keine Zieldatei gewählt."));

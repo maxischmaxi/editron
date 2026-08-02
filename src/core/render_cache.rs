@@ -395,6 +395,7 @@ mod tests {
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         });
         m
     }

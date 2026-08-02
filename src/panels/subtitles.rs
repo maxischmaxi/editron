@@ -15,6 +15,7 @@ use crate::panels::color::slider_row;
 use crate::panels::Panel;
 use crate::services::Services;
 use crate::state::AppState;
+use crate::stores::TranscribeJobStatus;
 use crate::theme;
 use crate::ui::geom::{v2, Rect};
 use crate::ui::widgets::scroll::ScrollState;
@@ -196,6 +197,12 @@ impl Panel for SubtitlesPanel {
                 active: self.style_open,
             },
             BarBtn {
+                icon: "sparkles",
+                tip: "Auto-Transkription (ausgewählten Clip transkribieren)…",
+                command: "subtitle.autoTranscribe",
+                active: false,
+            },
+            BarBtn {
                 icon: "file-output",
                 tip: "Untertitel exportieren (SRT)…",
                 command: "subtitle.exportSrt",
@@ -249,6 +256,59 @@ impl Panel for SubtitlesPanel {
                 }
             }
             bx -= 4.0;
+        }
+
+        // ------------------------------------ Auto-Transkriptions-Status
+        // Fortschritt/Fehler einer laufenden Transkription (Muster wie der
+        // Proxy-Workflow): Banner unter der Kopfzeile, Abbrechen rechts.
+        if !app.app.transcribe_jobs.is_empty() {
+            let running = app.app.transcribe_jobs.values().find_map(|s| match s {
+                TranscribeJobStatus::Running(p) => Some(*p),
+                _ => None,
+            });
+            let failed = app.app.transcribe_jobs.values().find_map(|s| match s {
+                TranscribeJobStatus::Failed(e) => Some(e.clone()),
+                _ => None,
+            });
+            let banner = area.cut_top(30.0);
+            ui.fill(banner, theme::SURFACE_2);
+            ui.hline(banner.x, banner.bottom() - 1.0, banner.w, theme::LINE);
+            let mut b = banner.inset_xy(10.0, 0.0);
+
+            // Abbrechen/Schließen rechts.
+            let btn = Rect::new(b.right() - 24.0, b.y + 3.0, 24.0, 24.0);
+            if IconButton::new("x")
+                .tooltip("Auto-Transkription abbrechen")
+                .show(ui, "subtitles.tx.cancel", btn)
+                .clicked
+            {
+                ui.run_command("subtitle.cancelTranscribe");
+            }
+            b.cut_right(28.0);
+
+            if let Some(pct) = running {
+                let icon_cell = b.cut_left(16.0);
+                ui.icon("sparkles", Rect::new(icon_cell.x, icon_cell.y + 7.0, 14.0, 14.0), 14.0, theme::ACCENT);
+                b.cut_left(8.0);
+                let label_cell = Rect::new(b.x, b.y + 4.0, b.w, 12.0);
+                ui.text_left(
+                    &format!("Transkribiere … {} %", (pct * 100.0).round() as u32),
+                    label_cell,
+                    theme::TEXT_1,
+                    FontKind::Sans12,
+                );
+                // Dünner Fortschrittsbalken darunter.
+                let track = Rect::new(b.x, b.y + 19.0, b.w, 3.0);
+                ui.fill_rounded(track, 1.5, theme::SURFACE_4);
+                let fill_w = (track.w * pct.clamp(0.0, 1.0)).max(2.0);
+                ui.fill_rounded(Rect::new(track.x, track.y, fill_w, 3.0), 1.5, theme::ACCENT);
+            } else if let Some(err) = failed {
+                let icon_cell = b.cut_left(16.0);
+                ui.icon("triangle-alert", Rect::new(icon_cell.x, icon_cell.y + 8.0, 14.0, 14.0), 14.0, theme::DANGER);
+                b.cut_left(8.0);
+                let msg = ui.font(FontKind::Sans12).ellipsize(&err, b.w);
+                ui.text_left(&msg, Rect::new(b.x, b.y + 9.0, b.w, 14.0), theme::DANGER, FontKind::Sans12);
+            }
         }
 
         // ------------------------------------------------------ Leerzustand

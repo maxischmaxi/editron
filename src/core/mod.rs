@@ -36,6 +36,7 @@ pub mod timecode;
 pub mod timeline;
 pub mod title;
 pub mod title_engine;
+pub mod transcribe;
 pub mod transitions;
 pub mod types;
 

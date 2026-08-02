@@ -42,6 +42,7 @@ struct App {
     speed_dialog: overlays::speed_dialog::SpeedDialog,
     marker_dialog: overlays::marker_dialog::MarkerDialog,
     media_dialogs: overlays::media_dialogs::MediaDialogs,
+    transcribe_dialog: overlays::transcribe_dialog::TranscribeDialog,
     interop_report: overlays::interop_report::InteropReportDialog,
     consolidate_dialog: overlays::consolidate_dialog::ConsolidateDialog,
     player: crate::core::player::PlayerEngine,
@@ -87,6 +88,7 @@ impl App {
             speed_dialog: Default::default(),
             marker_dialog: Default::default(),
             media_dialogs: Default::default(),
+            transcribe_dialog: Default::default(),
             interop_report: Default::default(),
             consolidate_dialog: Default::default(),
             player: crate::core::player::PlayerEngine::new(),
@@ -484,6 +486,80 @@ impl App {
                         Some(format!("Proxy fehlgeschlagen ({name}): {error}")),
                         now,
                     );
+                }
+                ServiceEvent::TranscribeProgress { clip_id, pct } => {
+                    // Nur weiterführen, solange der Job nicht quittiert/abgebrochen
+                    // wurde (verspätete Events nach Cancel ignorieren).
+                    if self.state.app.transcribe_status(&clip_id).is_some() {
+                        self.state.app.set_transcribe_running(&clip_id, pct);
+                    }
+                }
+                ServiceEvent::TranscribeDone {
+                    clip_id,
+                    sequence_id,
+                    cues,
+                    language,
+                } => {
+                    self.state.app.clear_transcribe_job(&clip_id);
+                    let lang = crate::core::transcribe::language_label(&language);
+                    // GENAU in die Quell-Sequenz importieren — der Nutzer kann
+                    // während des Laufs die aktive Sequenz gewechselt haben. Erst
+                    // den (mutable) Sequenz-Borrow abschließen, dann Statusbau.
+                    let imported: Option<(usize, String)> =
+                        self.state.timeline.get_mut(&sequence_id).map(|seq| {
+                            let (track_id, n) = seq.timeline.import_subtitle_cues(&cues);
+                            let name = seq
+                                .timeline
+                                .tracks
+                                .iter()
+                                .find(|t| t.id == track_id)
+                                .map(|t| {
+                                    crate::core::timeline::track_name(t, &seq.timeline.tracks)
+                                })
+                                .unwrap_or_default();
+                            (n, name)
+                        });
+                    let msg = match imported {
+                        Some((n, track)) if self.state.timeline.active_id() == sequence_id => {
+                            // Zielsequenz ist aktiv: Panel zeigt die neue Spur.
+                            self.state.dock.open_panel("subtitles");
+                            format!("{n} Untertitel transkribiert ({lang}, Spur {track})")
+                        }
+                        Some((n, _)) => {
+                            // In eine andere (inaktive) Sequenz importiert.
+                            let seq_name =
+                                self.state.timeline.name_of(&sequence_id).unwrap_or("").to_string();
+                            format!("{n} Untertitel transkribiert ({lang}, Sequenz {seq_name})")
+                        }
+                        None => "Transkript verworfen — Zielsequenz nicht mehr vorhanden".to_string(),
+                    };
+                    self.state.app.set_status_message(Some(msg), now);
+                }
+                ServiceEvent::TranscribeFailed { clip_id, error } => {
+                    self.state.app.set_transcribe_failed(&clip_id, error.clone());
+                    self.state
+                        .app
+                        .set_status_message(Some(format!("Transkription fehlgeschlagen: {error}")), now);
+                }
+                ServiceEvent::WhisperBinaryPicked(path) => {
+                    if let Some(p) = path {
+                        self.state.settings.whisper_path =
+                            Some(p.to_string_lossy().into_owned());
+                        self.state.settings.save();
+                        self.state
+                            .app
+                            .set_status_message(Some("Whisper-Pfad gesetzt".to_string()), now);
+                    }
+                }
+                ServiceEvent::WhisperModelPicked(path) => {
+                    if let Some(p) = path {
+                        self.state.settings.whisper_model =
+                            Some(p.to_string_lossy().into_owned());
+                        self.state.settings.save();
+                        self.state
+                            .app
+                            .set_status_message(Some("Whisper-Modell gesetzt".to_string()), now);
+                    }
                 }
                 ServiceEvent::AssetImported(asset) => {
                     // Duplikate (gleicher Pfad) überspringen.
@@ -938,6 +1014,29 @@ impl App {
                             // selektierten Clip als Referenz.
                             if std::env::var("EDITRON_TEST_DIALOG").is_ok_and(|d| d == "speed") {
                                 self.state.app.open_dialog = Some(stores::DialogId::ClipSpeed);
+                            }
+                            // Auto-Transkriptions-Dialog erst nach dem Import
+                            // öffnen — er braucht den selektierten Medien-Clip.
+                            if std::env::var("EDITRON_TEST_DIALOG")
+                                .is_ok_and(|d| d == "transcribe")
+                            {
+                                self.state.app.open_dialog = Some(stores::DialogId::Transcribe);
+                            }
+                            // Auto-Transkription End-to-End durch den echten
+                            // App-Pfad: EDITRON_TEST_TRANSCRIBE=1 startet sofort
+                            // einen Job auf dem selektierten Test-Clip (Sprache
+                            // aus den Einstellungen) — der Worker extrahiert
+                            // Audio, ruft whisper.cpp und legt die Cue-Spur an.
+                            if std::env::var("EDITRON_TEST_TRANSCRIBE").is_ok() {
+                                let lang = self.state.settings.whisper_language.clone();
+                                if let Some(task) =
+                                    crate::core::commands::build_transcribe_task(&self.state, &lang)
+                                {
+                                    let id = task.clip_id.clone();
+                                    self.services.start_transcribe_job(task);
+                                    self.state.app.set_transcribe_running(&id, 0.0);
+                                    self.state.dock.open_panel("subtitles");
+                                }
                             }
                             if std::env::var("EDITRON_TEST_PLAY").is_ok() {
                                 self.state.playback.program_playing = true;
@@ -1724,6 +1823,7 @@ fn main() {
             "settings" => Some(stores::DialogId::Settings),
             "autosave" => Some(stores::DialogId::AutosaveVersions),
             "consolidate" => Some(stores::DialogId::Consolidate),
+            "transcribe" => Some(stores::DialogId::Transcribe),
             _ => None,
         };
     }
@@ -2059,6 +2159,8 @@ fn main() {
         app.speed_dialog.render(&mut ui, &mut app.state);
         app.marker_dialog.render(&mut ui, &mut app.state);
         app.media_dialogs.render(&mut ui, &mut app.state);
+        app.transcribe_dialog
+            .render(&mut ui, &mut app.state, &app.services);
         app.interop_report.render(&mut ui, &mut app.state);
         app.consolidate_dialog
             .render(&mut ui, &mut app.state, &app.services);
@@ -2138,6 +2240,7 @@ fn main() {
     // sonst laufen ffmpeg-Waisen weiter.
     app.services.cancel_all_jobs();
     app.services.cancel_all_proxies();
+    app.services.cancel_all_transcribe();
     // Render-Cache-Dateien sind sitzungsgebunden (der Store wird nicht
     // persistiert) — verwaiste Dateien beim Beenden aufräumen.
     for f in app.state.render_cache.clear() {

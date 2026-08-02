@@ -13,7 +13,21 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub const VIDEO_EXT: [&str; 8] = ["mp4", "mov", "mkv", "webm", "avi", "m4v", "mts", "mxf"];
 pub const AUDIO_EXT: [&str; 7] = ["wav", "mp3", "flac", "aac", "m4a", "ogg", "opus"];
-pub const IMAGE_EXT: [&str; 8] = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif"];
+pub const IMAGE_EXT: [&str; 11] = [
+    "png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif", "exr", "dpx", "tga",
+];
+
+/// Standard-Bildrate einer importierten Bildsequenz (VFX-Renders tragen keine
+/// eigene Bildrate). 24 fps ist die Film-/VFX-Konvention; die Clip-Dauer/-Tempo
+/// lässt sich in der Timeline jederzeit anpassen. Per `EDITRON_IMAGE_SEQ_FPS`
+/// überschreibbar (Tests/Sonderfälle).
+pub fn image_sequence_fps() -> f64 {
+    std::env::var("EDITRON_IMAGE_SEQ_FPS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(24.0)
+}
 
 pub enum ServiceEvent {
     FfmpegInfo(FfmpegInfo),
@@ -41,6 +55,24 @@ pub enum ServiceEvent {
     ProxyFailed { asset_id: String, error: String },
     /// Ablageordner für Proxys im Verzeichnis-Dialog gewählt.
     ProxyFolderPicked(Option<PathBuf>),
+    /// Fortschritt einer laufenden Auto-Transkription (0..1). `clip_id` ist der
+    /// Quell-Clip (Schlüssel der Job-Anzeige).
+    TranscribeProgress { clip_id: String, pct: f32 },
+    /// Auto-Transkription fertig: fertig gemappte Cues in SEQUENZZEIT (offset +
+    /// auf das Clip-Fenster geklemmt). Der Mainloop legt daraus eine
+    /// Untertitel-Spur an.
+    TranscribeDone {
+        clip_id: String,
+        sequence_id: String,
+        cues: Vec<crate::core::subtitle::SrtCue>,
+        language: String,
+    },
+    /// Auto-Transkription fehlgeschlagen.
+    TranscribeFailed { clip_id: String, error: String },
+    /// whisper.cpp-Binary im Datei-Dialog gewählt (Einstellungen → Medien).
+    WhisperBinaryPicked(Option<PathBuf>),
+    /// whisper.cpp-Modell (`ggml-*.bin`) im Datei-Dialog gewählt.
+    WhisperModelPicked(Option<PathBuf>),
     /// Fortschritt eines laufenden Sequenz-Exports.
     SequenceExportProgress {
         job_id: String,
@@ -180,6 +212,45 @@ enum ProxyCmd {
     Finished(String, u64),
 }
 
+/// Auftrag, das Audio eines Clips zu transkribieren (Whisper). Der Aufrufer
+/// (Dialog/Command) füllt das Quellfenster + die Zeit-Abbildung über
+/// [`crate::core::transcribe`] und die Binärpfade aus [`crate::core::settings`].
+#[derive(Clone)]
+pub struct TranscribeTask {
+    /// Quell-Clip (Schlüssel der Fortschrittsanzeige + Ziel der Zeit-Abbildung).
+    pub clip_id: String,
+    /// ORIGINAL-Quelldatei des Clips (nie der Proxy — Transkriptionsgüte zählt).
+    pub src: String,
+    /// Quell-In-Punkt (Sekunden) des Clip-Fensters.
+    pub media_in: f64,
+    /// Belegte Medienspanne (Sekunden) des Clip-Fensters (0/∞ ⇒ ganze Datei).
+    pub media_dur: f64,
+    /// Timeline-Startzeit des Clips (Offset der erzeugten Cues).
+    pub clip_start: f64,
+    /// Effektive Clip-Geschwindigkeit (Zeit-Skalierung der Cues).
+    pub eff_speed: f64,
+    /// Clipdauer (Sekunden) — Klemmgrenze der erzeugten Cues.
+    pub clip_dur: f64,
+    /// Sequenz, in der der Quell-Clip liegt — die Cues landen GENAU dort, auch
+    /// wenn der Nutzer während des Laufs die aktive Sequenz wechselt.
+    pub sequence_id: String,
+    /// whisper.cpp-CLI (konfiguriert oder `whisper-cli` im PATH).
+    pub whisper_bin: String,
+    /// whisper.cpp-Modell (`ggml-*.bin`).
+    pub model: String,
+    /// Sprachcode (`auto`/`de`/`en`/…).
+    pub language: String,
+}
+
+/// Steuerbefehle an den Transkriptions-Dispatcher (Muster wie `ProxyCmd`).
+enum TranscribeCmd {
+    Enqueue(TranscribeTask),
+    Cancel(String),
+    CancelAll,
+    /// Worker meldet Abschluss (Clip-ID + Run-ID) — Slot freigeben.
+    Finished(String, u64),
+}
+
 /// Ein laufender Proxy-Transcode: Abbruch-Flag + Kindprozess-Handle (für
 /// hartes Beenden).
 struct RunningProxy {
@@ -209,12 +280,15 @@ pub struct Services {
     relink_cancel: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     /// Befehlskanal zum Proxy-Dispatcher (Warteschlange + begrenzte Parallelität).
     proxy_cmd_tx: Sender<ProxyCmd>,
+    /// Befehlskanal zum Transkriptions-Dispatcher (Warteschlange, abbrechbar).
+    transcribe_cmd_tx: Sender<TranscribeCmd>,
 }
 
 impl Services {
     pub fn new() -> Services {
         let (tx, rx) = channel();
         let (proxy_cmd_tx, proxy_cmd_rx) = channel::<ProxyCmd>();
+        let (transcribe_cmd_tx, transcribe_cmd_rx) = channel::<TranscribeCmd>();
         let s = Services {
             tx,
             rx,
@@ -224,6 +298,7 @@ impl Services {
             jobs: Mutex::new(std::collections::HashMap::new()),
             relink_cancel: Mutex::new(None),
             proxy_cmd_tx,
+            transcribe_cmd_tx,
         };
         // Proxy-Dispatcher: bündelt Transcode-Aufträge mit begrenzter
         // Parallelität (ffmpeg ist selbst multithreaded).
@@ -231,6 +306,13 @@ impl Services {
             let ev = s.tx.clone();
             let cmd_tx = s.proxy_cmd_tx.clone();
             std::thread::spawn(move || proxy_dispatcher(proxy_cmd_rx, cmd_tx, ev));
+        }
+        // Transkriptions-Dispatcher: whisper.cpp ist CPU-hungrig und selbst
+        // multithreaded ⇒ höchstens ein Lauf gleichzeitig (Warteschlange).
+        {
+            let ev = s.tx.clone();
+            let cmd_tx = s.transcribe_cmd_tx.clone();
+            std::thread::spawn(move || transcribe_dispatcher(transcribe_cmd_rx, cmd_tx, ev));
         }
         // Binary-Discovery beim Start (Version) für die Statusanzeige.
         let tx = s.tx.clone();
@@ -591,6 +673,50 @@ impl Services {
     /// Alle Proxy-Transcodes hart beenden (App-Ende).
     pub fn cancel_all_proxies(&self) {
         let _ = self.proxy_cmd_tx.send(ProxyCmd::CancelAll);
+    }
+
+    // ------------------------------------------------------ Auto-Transkription
+
+    /// Auto-Transkription eines Clips einreihen (abbrechbar; bereits laufende/
+    /// eingereihte Clips überspringt der Dispatcher).
+    pub fn start_transcribe_job(&self, task: TranscribeTask) {
+        let _ = self.transcribe_cmd_tx.send(TranscribeCmd::Enqueue(task));
+    }
+
+    /// Laufende/wartende Transkription eines Clips abbrechen.
+    pub fn cancel_transcribe(&self, clip_id: &str) {
+        let _ = self
+            .transcribe_cmd_tx
+            .send(TranscribeCmd::Cancel(clip_id.to_string()));
+    }
+
+    /// Alle Transkriptionen hart beenden (App-Ende).
+    pub fn cancel_all_transcribe(&self) {
+        let _ = self.transcribe_cmd_tx.send(TranscribeCmd::CancelAll);
+    }
+
+    /// Datei-Dialog für die whisper.cpp-CLI (eigener Thread).
+    pub fn pick_whisper_binary(&self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("whisper.cpp-Programm wählen")
+                .pick_file();
+            let _ = tx.send(ServiceEvent::WhisperBinaryPicked(picked));
+        });
+    }
+
+    /// Datei-Dialog für ein whisper.cpp-Modell (`ggml-*.bin`, eigener Thread).
+    pub fn pick_whisper_model(&self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Whisper-Modell wählen (ggml-*.bin)")
+                .add_filter("Whisper-Modell", &["bin"])
+                .add_filter("Alle Dateien", &["*"])
+                .pick_file();
+            let _ = tx.send(ServiceEvent::WhisperModelPicked(picked));
+        });
     }
 
     /// ffmpeg-Discovery erneut anstoßen (nach Pfad-Änderung in den
@@ -1285,6 +1411,281 @@ fn run_proxy_transcode(
     }
 }
 
+// -------------------------------------------------------- Auto-Transkription
+
+/// Ein laufender Transkriptionslauf: Abbruch-Flag + Kindprozess-Handle (ffmpeg
+/// ODER whisper, je nach Phase) für hartes Beenden.
+struct RunningTranscribe {
+    cancel: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    run: u64,
+}
+
+/// Dispatcher-Thread der Auto-Transkription (Muster wie [`proxy_dispatcher`],
+/// aber höchstens ein Lauf gleichzeitig — whisper.cpp ist CPU-hungrig und
+/// selbst multithreaded).
+fn transcribe_dispatcher(
+    cmd_rx: Receiver<TranscribeCmd>,
+    cmd_tx: Sender<TranscribeCmd>,
+    event_tx: Sender<ServiceEvent>,
+) {
+    let max = 1usize;
+    let mut queue: VecDeque<TranscribeTask> = VecDeque::new();
+    let mut running: std::collections::HashMap<String, RunningTranscribe> =
+        std::collections::HashMap::new();
+    let mut next_run: u64 = 0;
+
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            TranscribeCmd::Enqueue(task) => {
+                let busy = running.contains_key(&task.clip_id)
+                    || queue.iter().any(|t| t.clip_id == task.clip_id);
+                if !busy {
+                    // Sofort als „in Arbeit" sichtbar machen (0 %).
+                    let _ = event_tx.send(ServiceEvent::TranscribeProgress {
+                        clip_id: task.clip_id.clone(),
+                        pct: 0.0,
+                    });
+                    queue.push_back(task);
+                }
+            }
+            TranscribeCmd::Cancel(id) => {
+                queue.retain(|t| t.clip_id != id);
+                if let Some(job) = running.remove(&id) {
+                    job.cancel.store(true, Ordering::Relaxed);
+                    if let Some(child) = job.child.lock().unwrap().as_mut() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+            TranscribeCmd::CancelAll => {
+                queue.clear();
+                for (_, job) in running.drain() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                    if let Some(child) = job.child.lock().unwrap().as_mut() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+            TranscribeCmd::Finished(id, run) => {
+                if running.get(&id).is_some_and(|r| r.run == run) {
+                    running.remove(&id);
+                }
+            }
+        }
+        while running.len() < max {
+            let Some(task) = queue.pop_front() else { break };
+            let cancel = Arc::new(AtomicBool::new(false));
+            let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+            let run = next_run;
+            next_run += 1;
+            running.insert(
+                task.clip_id.clone(),
+                RunningTranscribe {
+                    cancel: Arc::clone(&cancel),
+                    child: Arc::clone(&child_slot),
+                    run,
+                },
+            );
+            let ev = event_tx.clone();
+            let done_tx = cmd_tx.clone();
+            let id = task.clip_id.clone();
+            std::thread::spawn(move || {
+                run_transcribe(task, cancel, child_slot, &ev);
+                let _ = done_tx.send(TranscribeCmd::Finished(id, run));
+            });
+        }
+    }
+}
+
+/// Eine Auto-Transkription abarbeiten: (1) Clip-Audio per ffmpeg als
+/// 16-kHz-Mono-WAV in eine Temp-Datei extrahieren, (2) whisper.cpp darauf
+/// laufen lassen (Fortschritt aus stderr), (3) die SRT-Ausgabe parsen und die
+/// Cues über [`crate::core::transcribe::map_cues_to_sequence`] in Sequenzzeit
+/// abbilden. Abbruch killt den jeweils aktiven Kindprozess.
+fn run_transcribe(
+    task: TranscribeTask,
+    cancel: Arc<AtomicBool>,
+    child_slot: Arc<Mutex<Option<Child>>>,
+    tx: &Sender<ServiceEvent>,
+) {
+    use crate::core::transcribe;
+    let clip_id = task.clip_id.clone();
+    let fail = |error: String| {
+        let _ = tx.send(ServiceEvent::TranscribeFailed {
+            clip_id: clip_id.clone(),
+            error,
+        });
+    };
+
+    // Eindeutiges Temp-Basis (PID + Clip-ID-tauglich) im System-Temp.
+    let tag: String = task
+        .clip_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let base = std::env::temp_dir().join(format!("editron-tx-{}-{tag}", std::process::id()));
+    let wav = base.with_extension("wav");
+    let out_base = base.to_string_lossy().into_owned();
+    let srt = base.with_extension("srt");
+    let cleanup = || {
+        let _ = std::fs::remove_file(&wav);
+        let _ = std::fs::remove_file(&srt);
+    };
+
+    // ---- (1) Audio extrahieren ----
+    let extract = transcribe::extract_args(
+        &task.src,
+        task.media_in,
+        task.media_dur,
+        &wav.to_string_lossy(),
+    );
+    let spawn = Command::new(ffmpeg_bin())
+        .args(&extract)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup();
+            return fail(format!("ffmpeg konnte nicht gestartet werden: {e}"));
+        }
+    };
+    let ff_stderr = child.stderr.take();
+    *child_slot.lock().unwrap() = Some(child);
+    let ff_err = ff_stderr.map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let status = {
+        let taken = child_slot.lock().unwrap().take();
+        taken.and_then(|mut c| c.wait().ok())
+    };
+    let ff_buf = ff_err.map(|t| t.join().unwrap_or_default()).unwrap_or_default();
+    if cancel.load(Ordering::Relaxed) {
+        cleanup();
+        return; // Abbruch — kein Event (die UI hat den Job verworfen).
+    }
+    if !status.map(|s| s.success()).unwrap_or(false) {
+        cleanup();
+        return fail(format!("Audio-Extraktion fehlgeschlagen: {}", stderr_tail(&ff_buf)));
+    }
+    // ffmpeg meldet die WAV-Extraktion grob als die ersten 15 %.
+    let _ = tx.send(ServiceEvent::TranscribeProgress {
+        clip_id: clip_id.clone(),
+        pct: 0.15,
+    });
+
+    // ---- (2) whisper.cpp ----
+    let wargs = transcribe::whisper_args(&task.model, &wav.to_string_lossy(), &out_base, &task.language);
+    let spawn = Command::new(&task.whisper_bin)
+        .args(&wargs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup();
+            return fail(format!(
+                "whisper.cpp ({}) konnte nicht gestartet werden: {e}",
+                task.whisper_bin
+            ));
+        }
+    };
+    let stderr = child.stderr.take();
+    *child_slot.lock().unwrap() = Some(child);
+
+    // Fortschritt aus whisper-stderr (15 %…100 % skaliert). stderr enthält auch
+    // die Fehlermeldungen ⇒ mitschneiden für den Fehlerfall.
+    let mut tail: Vec<String> = Vec::new();
+    if let Some(stderr) = stderr {
+        let reader = BufReader::new(stderr);
+        let mut last_p100: i64 = -1;
+        for line in reader.lines().map_while(Result::ok) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(p) = transcribe::parse_progress(&line) {
+                let scaled = 0.15 + p * 0.85;
+                let p100 = (scaled * 100.0) as i64;
+                if p100 != last_p100 {
+                    last_p100 = p100;
+                    let _ = tx.send(ServiceEvent::TranscribeProgress {
+                        clip_id: clip_id.clone(),
+                        pct: scaled,
+                    });
+                }
+            } else {
+                tail.push(line);
+                if tail.len() > 40 {
+                    tail.remove(0);
+                }
+            }
+        }
+    }
+    let status = {
+        let taken = child_slot.lock().unwrap().take();
+        taken.and_then(|mut c| c.wait().ok())
+    };
+    if cancel.load(Ordering::Relaxed) {
+        cleanup();
+        return;
+    }
+    if !status.map(|s| s.success()).unwrap_or(false) {
+        let msg = tail
+            .iter()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| "Unbekannter Fehler".to_string());
+        cleanup();
+        return fail(format!("whisper.cpp: {}", msg.trim()));
+    }
+
+    // ---- (3) SRT lesen + in Sequenzzeit abbilden ----
+    let raw = match std::fs::read(&srt) {
+        Ok(b) => crate::core::subtitle::decode_subtitle_bytes(&b),
+        Err(e) => {
+            cleanup();
+            return fail(format!("Keine Untertitel-Ausgabe gefunden: {e}"));
+        }
+    };
+    cleanup();
+    let cues = match crate::core::subtitle::parse_srt(&raw) {
+        Ok(c) => c,
+        Err(_) => {
+            // Leere Ausgabe (z. B. nur Stille) ist kein harter Fehler.
+            return fail("Keine Sprache erkannt (leeres Transkript)".to_string());
+        }
+    };
+    let mapped = transcribe::map_cues_to_sequence(
+        &cues,
+        task.clip_start,
+        task.eff_speed,
+        task.clip_dur,
+    );
+    if mapped.is_empty() {
+        return fail("Keine Sprache erkannt (leeres Transkript)".to_string());
+    }
+    let _ = tx.send(ServiceEvent::TranscribeProgress {
+        clip_id: clip_id.clone(),
+        pct: 1.0,
+    });
+    let _ = tx.send(ServiceEvent::TranscribeDone {
+        clip_id,
+        sequence_id: task.sequence_id,
+        cues: mapped,
+        language: task.language,
+    });
+}
+
 // ------------------------------------------------------------ Konsolidieren
 
 /// Eine Konsolidierung abarbeiten: jedes Item kopieren oder (best-effort) neu
@@ -1539,6 +1940,160 @@ fn detect_kind(path: &str, info: &MediaInfo) -> MediaKind {
     MediaKind::Video
 }
 
+/// Erkanntes Ergebnis einer Bildsequenz-Prüfung.
+struct SeqDetect {
+    /// printf-Muster (absoluter Pfad, `%0Nd`) für den ffmpeg-image2-Demuxer.
+    pattern: String,
+    /// Erster realer Frame (kanonischer Asset-Pfad — Offline/Relink/Thumbnail).
+    first: PathBuf,
+    /// Nummer des ersten Frames (ffmpeg `-start_number`).
+    start: u64,
+    /// Anzahl gefundener Frames der Folge.
+    count: u64,
+    /// Namens-Präfix vor der Zifferngruppe (Anzeigename).
+    prefix: String,
+    /// Ziffernbreite (`%0Nd`).
+    width: usize,
+    /// Dateiendung (Original-Schreibweise).
+    ext: String,
+    /// Alle zur Folge gehörenden Frame-Pfade (Entdopplung beim Ordner-Import).
+    members: Vec<PathBuf>,
+}
+
+/// Prüft, ob `path` Teil einer nummerierten Bildsequenz ist: letzte Zifferngruppe
+/// im Namen = Frame-Nummer, dann wird der lückenlose Lauf um diesen Frame durch
+/// **Existenz-Probing per Reformatierung** bestimmt — die erwarteten Dateinamen
+/// werden mit GENAU der Formatierung gebildet, die ffmpegs image2-Demuxer aus
+/// `%0Nd` erzeugt (`{:0w$}` == printf `%0Nd`), und auf Existenz geprüft. So
+/// entspricht `count` exakt den Frames, die ffmpeg ab `start` liest (es bricht an
+/// der ersten fehlenden Nummer ab), unabhängig von Ziffernbreite/Padding und
+/// ohne den ganzen Ordner zu scannen. `None`, wenn die Datei keine Bild-Endung
+/// trägt, keine Zifferngruppe im Namen hat oder allein steht (< 2 Frames). So
+/// wird ein einzelner gedroppter Frame zur kompletten Folge aufgelöst.
+fn detect_image_sequence(path: &Path) -> Option<SeqDetect> {
+    let ext_lc = path.extension()?.to_string_lossy().to_lowercase();
+    if !IMAGE_EXT.contains(&ext_lc.as_str()) {
+        return None;
+    }
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    // Letzte zusammenhängende Ziffernfolge im Stamm = Frame-Nummer (z. B.
+    // "shot_v2_0007" → "0007"; "v2" bleibt Präfix). ASCII-Ziffern sind
+    // Einzelbytes ⇒ die Byte-Slices landen auf gültigen UTF-8-Grenzen.
+    let bytes = stem.as_bytes();
+    let end = bytes.iter().rposition(|b| b.is_ascii_digit())? + 1;
+    let mut begin = end;
+    while begin > 0 && bytes[begin - 1].is_ascii_digit() {
+        begin -= 1;
+    }
+    let width = end - begin;
+    let picked: u64 = stem[begin..end].parse().ok()?;
+    let prefix = stem[..begin].to_string();
+    let suffix = stem[end..].to_string(); // i. d. R. leer; toleriert "frame_0007x"
+    let ext = path.extension()?.to_string_lossy().into_owned();
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+
+    // Sicherheitskappe gegen pathologische Verzeichnisse (reale Folgen winzig).
+    const MAX_FRAMES: u64 = 10_000_000;
+    // Dateiname von Frame N — EXAKT wie ffmpegs image2 `%0Nd` formatiert (inkl.
+    // Überlauf über die Breite hinaus bei N ≥ 10^width).
+    let frame_path = |n: u64| -> PathBuf {
+        dir.join(format!("{prefix}{n:0width$}{suffix}.{ext}", width = width))
+    };
+    // Lückenlosen Lauf um den gewählten Frame bestimmen (abwärts + aufwärts).
+    let mut start = picked;
+    while start > 0 && picked - (start - 1) <= MAX_FRAMES && frame_path(start - 1).is_file() {
+        start -= 1;
+    }
+    let mut last = picked;
+    while last - start < MAX_FRAMES && frame_path(last + 1).is_file() {
+        last += 1;
+    }
+    let count = last - start + 1;
+    if count < 2 {
+        return None; // Einzelbild oder isolierter Frame → kein Sequenz-Import.
+    }
+    let first = frame_path(start);
+    let members: Vec<PathBuf> = (start..=last).map(&frame_path).collect();
+    // printf-Muster: literale '%' im Namen verdoppeln (unser %0Nd bleibt intakt).
+    let esc = |s: &str| s.replace('%', "%%");
+    let pattern = dir
+        .join(format!("{}%0{}d{}.{}", esc(&prefix), width, esc(&suffix), ext))
+        .to_string_lossy()
+        .into_owned();
+    // `frame_path` (nur geteilte Captures ⇒ Copy) wird ab hier nicht mehr
+    // benutzt; NLL gibt die Borrows auf prefix/suffix/ext frei, sodass die
+    // Felder in den Struct verschoben werden können.
+    Some(SeqDetect {
+        pattern,
+        first,
+        start,
+        count,
+        prefix,
+        width,
+        ext,
+        members,
+    })
+}
+
+/// Anzeigename einer Bildsequenz, z. B. `render_[0001-0100].png`.
+fn sequence_display_name(seq: &SeqDetect) -> String {
+    let last = seq.start + seq.count.saturating_sub(1);
+    format!(
+        "{}[{:0width$}-{:0width$}].{}",
+        seq.prefix,
+        seq.start,
+        last,
+        seq.ext,
+        width = seq.width
+    )
+}
+
+/// Eine erkannte Bildsequenz als EIN Video-Asset importieren: Maße/Pixelformat/
+/// Bittiefe aus dem ersten realen Frame proben, Bildrate + Dauer auf die Folge
+/// setzen, `image_seq` für den image2-Decode hinterlegen.
+fn import_sequence(seq: &SeqDetect) -> Result<MediaAsset, String> {
+    let first = seq.first.to_string_lossy().into_owned();
+    let mut info = probe_media(&first)?;
+    if info.video.is_empty() {
+        return Err("Bildsequenz ohne Video-Stream".into());
+    }
+    let fps = image_sequence_fps();
+    info.duration_sec = seq.count as f64 / fps;
+    if let Some(v) = info.video.first_mut() {
+        v.fps = fps;
+    }
+    let name = sequence_display_name(seq);
+    let thumbnail_path = generate_thumbnail(&first, 0.0, 320).ok();
+    Ok(MediaAsset {
+        extra: Default::default(),
+        id: new_id(),
+        path: first,
+        name,
+        kind: MediaKind::Video,
+        info,
+        thumbnail_path,
+        imported_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+        bin_id: crate::core::bin::ROOT_BIN_ID.to_string(),
+        label: None,
+        offline: false,
+        markers: Vec::new(),
+        proxy_path: None,
+        proxy_src_mtime: None,
+        proxy_offline: false,
+        image_seq: Some(crate::core::types::ImageSequence {
+            pattern: seq.pattern.clone(),
+            start: seq.start,
+            count: seq.count,
+        }),
+    })
+}
+
 /// True, wenn die Dateiendung ein unterstütztes Medienformat ist
 /// (Video/Audio/Bild). Für das rekursive Ordner-Scannen.
 pub fn is_supported_media(path: &Path) -> bool {
@@ -1609,7 +2164,28 @@ fn import_files(tx: &Sender<ServiceEvent>, paths: Vec<PathBuf>) {
     if paths.is_empty() && had_dirs {
         errors.push("Keine unterstützten Medien im Ordner gefunden".to_string());
     }
+    // Frames einer bereits als Sequenz importierten Folge nicht doppelt anlegen.
+    let mut consumed: HashSet<PathBuf> = HashSet::new();
     for path_buf in paths {
+        if consumed.contains(&path_buf) {
+            continue;
+        }
+        // Nummerierte Bildsequenz erkennen → als EIN Clip importieren.
+        if let Some(seq) = detect_image_sequence(&path_buf) {
+            for m in &seq.members {
+                consumed.insert(m.clone());
+            }
+            match import_sequence(&seq) {
+                Ok(asset) => {
+                    let _ = tx.send(ServiceEvent::AssetImported(asset));
+                }
+                Err(err) => {
+                    eprintln!("[media] Sequenz-Import fehlgeschlagen: {}: {err}", seq.pattern);
+                    errors.push(sequence_display_name(&seq));
+                }
+            }
+            continue;
+        }
         let path = path_buf.to_string_lossy().into_owned();
         match import_one(&path) {
             Ok(asset) => {
@@ -1661,6 +2237,7 @@ fn import_one(path: &str) -> Result<MediaAsset, String> {
         proxy_path: None,
         proxy_src_mtime: None,
         proxy_offline: false,
+        image_seq: None,
     })
 }
 
@@ -2250,6 +2827,71 @@ mod tests {
         assert!(expanded.contains(&single), "explizit gewählte Datei bleibt");
         assert_eq!(expanded.len(), 4); // 3 Medien + die explizite .txt
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detects_numbered_image_sequence() {
+        let root = std::env::temp_dir().join(format!("editron-seq-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Zusammenhängende Folge render_0001.png … render_0005.png.
+        for n in 1..=5 {
+            write_file(&root.join(format!("render_{n:04}.png")), 1);
+        }
+        // Fremddateien im selben Ordner dürfen die Folge nicht verfälschen.
+        write_file(&root.join("poster.png"), 1); // keine Zifferngruppe
+        write_file(&root.join("render_0003.jpg"), 1); // andere Endung
+
+        // Ein einzelner gedroppter Frame (mittendrin) → komplette Folge.
+        let seq = detect_image_sequence(&root.join("render_0003.png")).expect("Folge erkannt");
+        assert_eq!(seq.start, 1);
+        assert_eq!(seq.count, 5);
+        assert_eq!(seq.width, 4);
+        assert!(seq.pattern.ends_with("render_%04d.png"), "{}", seq.pattern);
+        assert_eq!(seq.members.len(), 5);
+        assert!(seq.first.ends_with("render_0001.png"));
+        assert_eq!(sequence_display_name(&seq), "render_[0001-0005].png");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn single_image_is_not_a_sequence() {
+        let root =
+            std::env::temp_dir().join(format!("editron-seq-single-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_file(&root.join("frame_0001.png"), 1); // allein ⇒ keine Folge
+        write_file(&root.join("logo.png"), 1); // ohne Ziffern
+        assert!(detect_image_sequence(&root.join("frame_0001.png")).is_none());
+        assert!(detect_image_sequence(&root.join("logo.png")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn folder_import_collapses_sequence_to_one() {
+        let root = std::env::temp_dir().join(format!("editron-seq-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for n in 1..=4 {
+            write_file(&root.join(format!("shot_{n:03}.png")), 1);
+        }
+        write_file(&root.join("music.wav"), 1);
+        // expand liefert alle Dateien; die Sequenz-Erkennung muss die 4 Frames
+        // zu EINEM Import zusammenfassen (nur 1 Sequenz + 1 WAV überleben).
+        let files = expand_import_paths(vec![root.clone()]);
+        let mut consumed: HashSet<PathBuf> = HashSet::new();
+        let mut imports = 0usize;
+        for p in files {
+            if consumed.contains(&p) {
+                continue;
+            }
+            if let Some(seq) = detect_image_sequence(&p) {
+                for m in &seq.members {
+                    consumed.insert(m.clone());
+                }
+            }
+            imports += 1;
+        }
+        assert_eq!(imports, 2, "1 Sequenz-Asset + 1 WAV statt 4 Einzelbilder");
         let _ = std::fs::remove_dir_all(&root);
     }
 

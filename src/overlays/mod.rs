@@ -11,3 +11,4 @@ pub mod sequence_dialog;
 pub mod settings_dialog;
 pub mod shortcut_editor;
 pub mod speed_dialog;
+pub mod transcribe_dialog;

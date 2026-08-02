@@ -312,6 +312,102 @@ fn dispatch_proxy_tasks(ctx: &mut CommandCtx, ids: &[String]) {
     status(ctx, &msg);
 }
 
+/// Aufgelöste Quelle einer Auto-Transkription: erster ausgewählter Medien-Clip
+/// (Video bevorzugt, sonst Audio) mit Online-Asset und konstanter
+/// Vorwärtsgeschwindigkeit. Trägt alles, was der Worker-Task außer Binär-/
+/// Modellpfad und Sprache braucht. Genutzt vom Command (Gate) UND vom
+/// Transkriptions-Dialog (Task-Bau).
+pub(crate) struct TranscribeSource {
+    pub clip_id: String,
+    pub clip_name: String,
+    pub src: String,
+    pub media_in: f64,
+    pub media_dur: f64,
+    pub clip_start: f64,
+    pub eff_speed: f64,
+    pub clip_dur: f64,
+}
+
+/// Den Transkriptions-Quell-Clip aus der aktuellen Auswahl bestimmen. `None`,
+/// wenn kein geeigneter Clip ausgewählt ist (Generator/Nest/Multicam, offline,
+/// Standbild/Rückwärts/Time-Remap oder ohne hörbare Mediendauer).
+pub(crate) fn transcribe_reference(state: &AppState) -> Option<TranscribeSource> {
+    use crate::core::timeline::TimelineClip;
+    let sel = &state.timeline.selected_clip_ids;
+    if sel.is_empty() {
+        return None;
+    }
+    let candidates: Vec<&TimelineClip> = state
+        .timeline
+        .clips
+        .iter()
+        .filter(|c| {
+            sel.contains(&c.id)
+                && !c.asset_id.is_empty()
+                && !c.is_generator()
+                && !c.is_nest()
+                && !c.is_multicam()
+        })
+        .collect();
+    let clip = candidates
+        .iter()
+        .find(|c| c.kind == TrackKind::Video)
+        .or_else(|| candidates.iter().find(|c| c.kind == TrackKind::Audio))
+        .or_else(|| candidates.first())
+        .copied()?;
+    // Nur konstante Vorwärtsgeschwindigkeit — sonst stimmt die Cue-Zeit nicht.
+    if clip.freeze || clip.reverse || clip.is_time_remapped() {
+        return None;
+    }
+    let asset = state.media.asset(&clip.asset_id)?;
+    if asset.offline {
+        return None;
+    }
+    // Ohne Audiospur (Bild, stummes Video) gibt es nichts zu transkribieren —
+    // ffmpeg würde sonst mit „kein Ausgabestream" scheitern.
+    if asset.info.audio.is_empty() {
+        return None;
+    }
+    let media_dur = clip.media_span();
+    if !(media_dur.is_finite() && media_dur > 0.05) {
+        return None;
+    }
+    Some(TranscribeSource {
+        clip_id: clip.id.clone(),
+        clip_name: clip.name.clone(),
+        src: asset.path.clone(),
+        media_in: clip.media_in(),
+        media_dur,
+        clip_start: clip.start,
+        eff_speed: clip.eff_speed(),
+        clip_dur: clip.duration,
+    })
+}
+
+/// Den Worker-Auftrag der Auto-Transkription aus der aktuellen Auswahl + den
+/// Einstellungen (CLI/Modell) bauen. `language` übersteuert die zuletzt
+/// gewählte Sprache (Dialog-Dropdown). `None`, wenn kein geeigneter Clip
+/// ausgewählt ist. Genutzt vom Dialog UND dem Smoke-Test-Auto-Start.
+pub(crate) fn build_transcribe_task(
+    state: &AppState,
+    language: &str,
+) -> Option<crate::services::TranscribeTask> {
+    let src = transcribe_reference(state)?;
+    Some(crate::services::TranscribeTask {
+        clip_id: src.clip_id,
+        src: src.src,
+        media_in: src.media_in,
+        media_dur: src.media_dur,
+        clip_start: src.clip_start,
+        eff_speed: src.eff_speed,
+        clip_dur: src.clip_dur,
+        sequence_id: state.timeline.active_id().to_string(),
+        whisper_bin: state.settings.whisper_bin(),
+        model: state.settings.whisper_model.clone().unwrap_or_default(),
+        language: language.to_string(),
+    })
+}
+
 fn cycle_workspace(ctx: &mut CommandCtx, offset: i32) {
     let current = ctx.state.app.active_workspace.clone();
     let index = WORKSPACE_IDS
@@ -2828,6 +2924,41 @@ pub fn build_registry() -> CommandRegistry {
         ),
         "timelineHasSubtitles",
     ));
+    // Auto-Transkription (Whisper-Klasse): Audio des ausgewählten Clips
+    // transkribieren ⇒ getimte Untertitel-Cues. Der Dialog wählt Sprache und
+    // zeigt den Modell-Status; die Ausführung läuft asynchron (siehe
+    // `core::transcribe` + `services`). Lücke gegenüber Premiere/Resolve/FCP.
+    commands.push(with_when(
+        cmd(
+            "subtitle.autoTranscribe",
+            "Auto-Transkription…",
+            "Untertitel",
+            |ctx, _| {
+                if transcribe_reference(ctx.state).is_none() {
+                    status(
+                        ctx,
+                        "Wähle einen Medien-Clip (Audio/Video) mit konstanter Geschwindigkeit auf der Timeline",
+                    );
+                    return;
+                }
+                ctx.state.dock.open_panel("subtitles");
+                ctx.state.app.open_dialog = Some(crate::stores::DialogId::Transcribe);
+            },
+        ),
+        "timelineClipSelected",
+    ));
+    commands.push(cmd(
+        "subtitle.cancelTranscribe",
+        "Auto-Transkription abbrechen",
+        "Untertitel",
+        |ctx, _| {
+            let ids: Vec<String> = ctx.state.app.transcribe_jobs.keys().cloned().collect();
+            for id in &ids {
+                ctx.services.cancel_transcribe(id);
+                ctx.state.app.clear_transcribe_job(id);
+            }
+        },
+    ));
 
     commands.push(cmd(
         "timeline.addVideoTrack",
@@ -3101,6 +3232,7 @@ mod tests {
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         };
         a.bin_id = ROOT_BIN_ID.to_string();
         state.media.add_asset(a);

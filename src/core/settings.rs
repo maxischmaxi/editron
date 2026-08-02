@@ -156,6 +156,11 @@ fn default_preview_scale() -> f64 {
     1.0
 }
 
+/// Standard-Transkriptionssprache (automatische Erkennung).
+fn default_whisper_language() -> String {
+    crate::core::transcribe::DEFAULT_LANGUAGE.to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -199,6 +204,19 @@ pub struct AppSettings {
     /// Manueller ffprobe-Pfad (`None` = im PATH suchen).
     #[serde(default)]
     pub ffprobe_path: Option<String>,
+    /// Pfad zur whisper.cpp-CLI für die Auto-Transkription (`None` = im PATH
+    /// nach `whisper-cli` suchen). Optional/konfigurierbar — die Funktion ist
+    /// ohne konfiguriertes Modell ohnehin inaktiv (siehe `core::transcribe`).
+    #[serde(default)]
+    pub whisper_path: Option<String>,
+    /// Pfad zum whisper.cpp-Modell (`ggml-*.bin`) für die Auto-Transkription
+    /// (`None` = nicht konfiguriert ⇒ Transkription deaktiviert). Modelle müssen
+    /// einmalig heruntergeladen werden — daher zwingend nutzergesetzt.
+    #[serde(default)]
+    pub whisper_model: Option<String>,
+    /// Zuletzt gewählte Transkriptionssprache (ISO-639-1-Code oder `auto`).
+    #[serde(default = "default_whisper_language")]
+    pub whisper_language: String,
     /// Zeitgesteuertes Autosave mit Versionshistorie.
     #[serde(default)]
     pub autosave: AutosaveSettings,
@@ -232,6 +250,9 @@ impl Default for AppSettings {
             default_preview_scale: default_preview_scale(),
             ffmpeg_path: None,
             ffprobe_path: None,
+            whisper_path: None,
+            whisper_model: None,
+            whisper_language: default_whisper_language(),
             autosave: AutosaveSettings::default(),
             extra: Map::new(),
         }
@@ -277,6 +298,36 @@ impl AppSettings {
         if self.ffprobe_path.as_deref().is_some_and(|p| p.trim().is_empty()) {
             self.ffprobe_path = None;
         }
+        if self.whisper_path.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            self.whisper_path = None;
+        }
+        if self.whisper_model.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            self.whisper_model = None;
+        }
+        if self.whisper_language.trim().is_empty() {
+            self.whisper_language = default_whisper_language();
+        }
+    }
+
+    /// Effektive whisper.cpp-CLI: konfigurierter Pfad, sonst der Standardname
+    /// (`whisper-cli`) im PATH.
+    pub fn whisper_bin(&self) -> String {
+        self.whisper_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or(crate::core::transcribe::DEFAULT_WHISPER_BIN)
+            .to_string()
+    }
+
+    /// Ist die Auto-Transkription einsatzbereit? Sie braucht zwingend ein
+    /// konfiguriertes, existierendes Modell (die CLI fällt sonst auf den
+    /// PATH-Standard zurück).
+    pub fn transcription_ready(&self) -> bool {
+        self.whisper_model
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|p| !p.is_empty() && std::path::Path::new(p).exists())
     }
 
     /// Persistieren. Nur aufrufen, wenn der Nutzer eine Einstellung aktiv
@@ -340,6 +391,16 @@ impl AppSettings {
             .and_then(|s| RenderCacheCodec::from_key(&s))
         {
             self.render_cache_codec = codec;
+        }
+        // Whisper-CLI/-Modell per Env übersteuern (gewinnen, wie bei ffmpeg) —
+        // u. a. für reproduzierbare Smoke-Tests ohne settings.json-Eingriff.
+        if let Ok(p) = std::env::var("EDITRON_WHISPER_PATH") {
+            let t = p.trim();
+            self.whisper_path = (!t.is_empty()).then(|| t.to_string());
+        }
+        if let Ok(p) = std::env::var("EDITRON_WHISPER_MODEL") {
+            let t = p.trim();
+            self.whisper_model = (!t.is_empty()).then(|| t.to_string());
         }
         // EDITRON_UI_SCALE: fester HiDPI-Faktor (z. B. `1.5`, `2`), `auto`/leer
         // schaltet auf automatische DPI-Erkennung zurück.

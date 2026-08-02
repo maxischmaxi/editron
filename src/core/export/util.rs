@@ -21,6 +21,52 @@ pub fn fps_arg(fps: f64) -> String {
     }
 }
 
+/// Decode-Parameter einer nummerierten Bildsequenz (VFX-Render). `start` =
+/// Nummer des ersten Frames der Folge (`ImageSequence::start`), `fps` = native
+/// Bildrate der Folge (`info.video[0].fps`). Begleitet den printf-Muster-Pfad
+/// durch Renderplan und Player-Ziele.
+#[derive(Clone, Copy, Debug)]
+pub struct SeqInput {
+    pub start: u64,
+    pub fps: f64,
+}
+
+/// Eingabe-Argumente (`-i` + Seek) für einen ffmpeg-Decode-Befehl. EINE Quelle
+/// für Player-Decoder UND Export-Worker, damit Wiedergabe und Export dieselbe
+/// Quellzeit treffen.
+///
+/// - Bildsequenz (`seq = Some`): image2-Demuxer mit der nativen `seq.fps` und
+///   einer aus `media_t` berechneten `-start_number` (= frame-genauer Einstieg
+///   OHNE `-ss`, da der image2-Input-Seek unzuverlässig ist). Der erste gelesene
+///   Frame bekommt PTS 0 — wie `-ss` ihn auf 0 zurücksetzen würde, damit die
+///   nachgelagerte `fps`/`setpts`-Kette unverändert greift.
+/// - Normales Medium (`seq = None`): `-ss media_t -i path` wie gehabt.
+///
+/// Die Argumente gehören VOR Filter/Output und können nach `-hwaccel` angehängt
+/// werden (alles Eingabe-Optionen des nächsten `-i`).
+pub fn decode_input_args(path: &str, media_t: f64, seq: Option<SeqInput>) -> Vec<String> {
+    match seq {
+        Some(s) => {
+            let fps = if s.fps > 0.0 { s.fps } else { 24.0 };
+            let off = (media_t.max(0.0) * fps).round().max(0.0) as u64;
+            vec![
+                "-framerate".to_string(),
+                fps_arg(fps),
+                "-start_number".to_string(),
+                s.start.saturating_add(off).to_string(),
+                "-i".to_string(),
+                path.to_string(),
+            ]
+        }
+        None => vec![
+            "-ss".to_string(),
+            format!("{:.4}", media_t.max(0.0)),
+            "-i".to_string(),
+            path.to_string(),
+        ],
+    }
+}
+
 /// setpts-Filterpräfix für konstante Vorwärts-Geschwindigkeit (inkl.
 /// abschließendem Komma); leer bei 1×. EINE Formelquelle für Player-Decoder,
 /// Export-Schnellpfad und Compositing-Decoder — identische Frame-Auswahl.

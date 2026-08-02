@@ -69,6 +69,8 @@ pub enum DialogId {
     ConfirmRemoveMedia,
     /// Proxy-Einstellungen (Codec + Auflösung) wählen.
     ProxySettings,
+    /// Auto-Transkription starten: Quell-Clip, Sprache wählen, Modell-Status.
+    Transcribe,
     /// Beenden bestätigen, während noch Render-Jobs laufen/warten.
     ConfirmQuitRender,
     /// Sequenz löschen, die als Nest verwendet wird (Warnung). Ziel in
@@ -188,6 +190,19 @@ pub struct AppStore {
     /// NEUEREN Formatversion geladen wurde (best-effort statt Abbruch). Der
     /// Mainloop surft den Hinweis einmalig in die Statusleiste.
     pub load_warning: Option<String>,
+    /// Laufende/fehlgeschlagene Auto-Transkriptionen je Quell-Clip (Laufzeit,
+    /// nicht persistiert) — Fortschritts-/Abbruch-Anzeige im Untertitel-Panel.
+    pub transcribe_jobs: std::collections::HashMap<String, TranscribeJobStatus>,
+}
+
+/// Laufzeit-Status einer Auto-Transkription (nicht persistiert; das Ergebnis
+/// landet als Untertitel-Spur direkt in der Timeline).
+#[derive(Clone, Debug)]
+pub enum TranscribeJobStatus {
+    /// In der Warteschlange oder läuft — Fortschritt 0..1.
+    Running(f32),
+    /// Fehlgeschlagen (Fehlertext); Quittieren über erneutes Starten/Schließen.
+    Failed(String),
 }
 
 /// Ziel einer Farbaufnahme: drei aufeinanderfolgende Effekt-Parameter
@@ -236,6 +251,7 @@ impl Default for AppStore {
             autosave_open_request: None,
             autosave_recover_hint: None,
             load_warning: None,
+            transcribe_jobs: std::collections::HashMap::new(),
         }
     }
 }
@@ -251,6 +267,32 @@ impl AppStore {
         if self.status_message.is_some() && now >= self.status_deadline {
             self.status_message = None;
         }
+    }
+
+    // ----------------------------------------------- Auto-Transkription (UI)
+
+    /// Status der Transkription eines Clips (None = kein Job).
+    pub fn transcribe_status(&self, clip_id: &str) -> Option<&TranscribeJobStatus> {
+        self.transcribe_jobs.get(clip_id)
+    }
+
+    /// Transkription als laufend markieren (Fortschritt 0..1).
+    pub fn set_transcribe_running(&mut self, clip_id: &str, pct: f32) {
+        self.transcribe_jobs.insert(
+            clip_id.to_string(),
+            TranscribeJobStatus::Running(pct.clamp(0.0, 1.0)),
+        );
+    }
+
+    /// Transkription als fehlgeschlagen markieren (Fehlertext im Panel).
+    pub fn set_transcribe_failed(&mut self, clip_id: &str, error: String) {
+        self.transcribe_jobs
+            .insert(clip_id.to_string(), TranscribeJobStatus::Failed(error));
+    }
+
+    /// Job vergessen (Erfolg/Abbruch/Quittieren).
+    pub fn clear_transcribe_job(&mut self, clip_id: &str) {
+        self.transcribe_jobs.remove(clip_id);
     }
 }
 
@@ -994,6 +1036,15 @@ pub struct AudioStore {
     /// Vom Mixer gesetzt, vom Player konsumiert: Integrated/True-Peak-Messung
     /// auf Wunsch neu starten (manueller Reset-Knopf).
     pub loudness_reset: bool,
+    /// Snapshot des zuletzt gemischten Master-Stereoblocks (interleaved L/R,
+    /// vor dem Hard-Clip) als (L, R)-Paare — Quelle für das Goniometer
+    /// (Lissajous) im Scopes-Panel. Auf eine handhabbare Punktzahl reduziert
+    /// (Software-Plot, kein GPU-Readback). Leer = keine Wiedergabe/Stille.
+    pub scope_stereo: Vec<[f32; 2]>,
+    /// Korrelationswert (-1..+1) des letzten Master-Blocks: +1 mono-identisch,
+    /// 0 dekorreliert (volle Stereobreite), -1 gegenphasig (mono-inkompatibel).
+    /// Nur gültig, solange `scope_stereo` Daten hält.
+    pub correlation: f32,
 }
 
 /// Wiedergabeauflösung: 1 = voll, darunter kleinerer Offscreen-Render.
@@ -1132,6 +1183,7 @@ mod tests {
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         }
     }
 

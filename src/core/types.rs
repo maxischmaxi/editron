@@ -80,6 +80,23 @@ pub enum MediaKind {
     Image,
 }
 
+/// Eine nummerierte Bildsequenz (VFX-Render: `render_0001.png`, `render_0002.png`,
+/// …) als EIN Asset. Das Asset trägt `kind = Video` (endliche Dauer, normales
+/// Seeking/Trimmen), `path` zeigt auf den ERSTEN realen Frame (Offline-/Relink-/
+/// Thumbnail-tauglich). Wiedergabe und Export dekodieren über das printf-Muster
+/// via ffmpeg-image2-Demuxer (`-framerate`/`-start_number`). Die Bildrate liegt
+/// in `info.video[0].fps`, die Dauer in `info.duration_sec` (= `count / fps`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageSequence {
+    /// printf-Muster mit `%0Nd`, z. B. `/renders/shot_%04d.exr` (absolut).
+    pub pattern: String,
+    /// Nummer des ersten Frames (ffmpeg `-start_number`).
+    pub start: u64,
+    /// Anzahl (zusammenhängender) Frames der Folge.
+    pub count: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaAsset {
@@ -117,6 +134,11 @@ pub struct MediaAsset {
     /// Laden + bei Proxy-Aktionen geprüft). Nicht persistiert.
     #[serde(skip)]
     pub proxy_offline: bool,
+    /// Nummerierte Bildsequenz (VFX-Render) — `path` zeigt auf den ersten Frame,
+    /// dekodiert wird über `pattern`. None = normales Einzelmedium. Persistiert
+    /// ab Formatversion 21.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_seq: Option<ImageSequence>,
     /// Felder einer NEUEREN Editron-Version, die dieser Build noch nicht kennt.
     /// Werden beim Speichern unverändert wieder herausgeschrieben (Vorwärts-
     /// kompatibilität, siehe `core::project::ProjectFile::extra`).

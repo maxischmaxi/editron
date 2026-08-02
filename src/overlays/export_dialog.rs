@@ -11,8 +11,8 @@
 
 use crate::core::export::{
     self, build_render_plan, loudness_preset_index, validate, AudioSettings, EncoderQuality,
-    ExportSettings, LoudnessNorm, QualityKind, Severity, VideoQuality, VideoSettings, CONTAINERS,
-    FRAMERATES, LOUDNESS_PRESETS, PRESETS, RESOLUTIONS, SAMPLE_RATES,
+    ExportSettings, LoudnessNorm, QualityKind, ScanMode, Severity, VideoQuality, VideoSettings,
+    CONTAINERS, FRAMERATES, LOUDNESS_PRESETS, PRESETS, RESOLUTIONS, SAMPLE_RATES,
 };
 use crate::core::export_preset::{PresetData, UserPresets};
 use crate::core::render_queue::JobState;
@@ -762,6 +762,21 @@ impl ExportDialog {
                             .replace(',', ".")
                             .parse()
                             .unwrap_or(0.0);
+                    }
+                    changed = true;
+                }
+            }
+
+            // ---- Abtastung (Broadcast: Interlaced/Progressiv) ----
+            // Nur für Broadcast-Codecs (XDCAM HD422/DNxHR/ProRes); Web-Codecs
+            // liefern stets progressiv.
+            if export::codec_supports_interlace(v.codec.id) {
+                let r = labeled_row(ui, body, "Abtastung");
+                let labels: Vec<&str> = ScanMode::ALL.iter().map(|m| m.label()).collect();
+                let current = ScanMode::ALL.iter().position(|m| *m == v.scan).unwrap_or(0);
+                if let Some(i) = select(ui, "export.scan", r, &labels, current) {
+                    if let Some(v) = &mut s.video {
+                        v.scan = ScanMode::ALL[i];
                     }
                     changed = true;
                 }
@@ -1719,6 +1734,7 @@ fn make_video(codec_id: &str, width: u32, height: u32, fps: f64) -> VideoSetting
             _ => 0,
         },
         tenbit: false,
+        scan: ScanMode::Progressive,
     }
 }
 

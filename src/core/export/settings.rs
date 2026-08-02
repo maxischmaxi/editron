@@ -32,6 +32,53 @@ pub struct VideoSettings {
     /// Bittiefe über `profile` und ignorieren dieses Flag. Siehe
     /// [`codec_tenbit_pix_fmt`].
     pub tenbit: bool,
+    /// Bild-Abtastung (Progressiv/Interlaced). Relevant für Broadcast-Codecs
+    /// (XDCAM HD422, DNxHD/HR, ProRes); Standard ist [`ScanMode::Progressive`].
+    pub scan: ScanMode,
+}
+
+/// Bild-Abtastung der Ausgabe. Broadcast-Lieferungen (Sendeserver) verlangen
+/// häufig 1080i (Halbbilder). Editron rendert progressive Frames; bei
+/// interlaced Zielen werden sie als PsF (progressive segmented frame)
+/// interlaced kodiert/getaggt — der Encoder schaltet auf Feldkodierung
+/// (`+ilme+ildct`), der `setparams`-Filter markiert die Frames als Halbbild.
+/// Siehe [`ScanMode::field_mode`] und `scan_encoder_flags` im Worker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScanMode {
+    /// Vollbild (progressiv, „p").
+    #[default]
+    Progressive,
+    /// Halbbild, oberes Feld zuerst (HD-Standard für 1080i, „i"/TFF).
+    InterlacedTff,
+    /// Halbbild, unteres Feld zuerst (SD/DV, „i"/BFF).
+    InterlacedBff,
+}
+
+impl ScanMode {
+    pub const ALL: [ScanMode; 3] =
+        [ScanMode::Progressive, ScanMode::InterlacedTff, ScanMode::InterlacedBff];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScanMode::Progressive => "Progressiv (p)",
+            ScanMode::InterlacedTff => "Interlaced — oberes Feld zuerst (i, TFF)",
+            ScanMode::InterlacedBff => "Interlaced — unteres Feld zuerst (i, BFF)",
+        }
+    }
+
+    pub fn is_interlaced(self) -> bool {
+        !matches!(self, ScanMode::Progressive)
+    }
+
+    /// `setparams=field_mode`-Wert (Frame-Feldmarkierung im Filtergraph).
+    pub fn field_mode(self) -> &'static str {
+        match self {
+            ScanMode::Progressive => "prog",
+            ScanMode::InterlacedTff => "tff",
+            ScanMode::InterlacedBff => "bff",
+        }
+    }
 }
 
 /// 10-Bit-Pixelformat eines CRF/Bitrate-Codecs (`None` = kein 10-Bit-Pfad).
@@ -197,6 +244,7 @@ pub(crate) fn default_video(codec_id: &str, width: u32, height: u32, fps: f64) -
         speed: codec.default_speed,
         profile: 0,
         tenbit: false,
+        scan: ScanMode::Progressive,
     }
 }
 
@@ -351,6 +399,48 @@ pub const PRESETS: &[ExportPreset] = &[
             let mut v = default_video("dnxhr", w, h, fps);
             v.profile = 2;
             preset_settings("mov", Some(v), Some(default_audio("pcm24", None)))
+        },
+    },
+    // ---- Broadcast-Master (MXF OP1a, Sendeserver-tauglich) ----
+    ExportPreset {
+        label: "Broadcast 1080i25 — XDCAM HD422 (MXF)",
+        build: |_, _| {
+            // XDCAM HD422 ist HD-only mit festen Rahmenmaßen/Raten — Quelle wird
+            // ignoriert. 1080i25 (= 50 Halbbilder/s), oberes Feld zuerst.
+            let mut v = default_video("xdcamhd422", 1920, 1080, 25.0);
+            v.scan = ScanMode::InterlacedTff;
+            preset_settings("mxf", Some(v), Some(default_audio("pcm24", None)))
+        },
+    },
+    ExportPreset {
+        label: "Broadcast 1080i29,97 — XDCAM HD422 (MXF)",
+        build: |_, _| {
+            let mut v = default_video("xdcamhd422", 1920, 1080, 30000.0 / 1001.0);
+            v.scan = ScanMode::InterlacedTff;
+            preset_settings("mxf", Some(v), Some(default_audio("pcm24", None)))
+        },
+    },
+    ExportPreset {
+        label: "Broadcast 1080p25 — XDCAM HD422 (MXF)",
+        build: |_, _| {
+            let v = default_video("xdcamhd422", 1920, 1080, 25.0);
+            preset_settings("mxf", Some(v), Some(default_audio("pcm24", None)))
+        },
+    },
+    ExportPreset {
+        label: "Broadcast — DNxHR HQ (MXF)",
+        build: |(w, h), fps| {
+            let mut v = default_video("dnxhr", w, h, fps);
+            v.profile = 2; // HQ
+            preset_settings("mxf", Some(v), Some(default_audio("pcm24", None)))
+        },
+    },
+    ExportPreset {
+        label: "Broadcast — ProRes 422 HQ (MXF)",
+        build: |(w, h), fps| {
+            let mut v = default_video("prores", w, h, fps);
+            v.profile = 3; // 422 HQ
+            preset_settings("mxf", Some(v), Some(default_audio("pcm24", None)))
         },
     },
     ExportPreset {

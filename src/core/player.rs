@@ -109,6 +109,9 @@ const MAX_SLEW_PER_TICK: f64 = 0.012;
 const REVERSE_AUDIO_CHUNK_FRAMES: usize = AUDIO_RATE as usize; // ~1 s Output
 /// Audio-Scrubbing: Länge eines Grains (Sekunden) und Refresh-Intervall.
 const SCRUB_GRAIN_SEC: f64 = 0.10;
+/// Höchstzahl Stereo-Punkte, die je Master-Block ins Goniometer (Scopes-Panel)
+/// übernommen werden — bei größeren Blöcken wird per Stride ausgedünnt.
+const SCOPE_MAX_POINTS: usize = 4096;
 
 // ---------------------------------------------------------------- Video
 
@@ -251,6 +254,7 @@ impl VideoSession {
     #[allow(clippy::too_many_arguments)]
     fn start(
         path: &str,
+        seq: Option<crate::core::export::SeqInput>,
         media_time: f64,
         src_w: u32,
         src_h: u32,
@@ -272,8 +276,8 @@ impl VideoSession {
         let mut cmd = Command::new(crate::services::ffmpeg_bin());
         cmd.args(["-v", "error"]);
         apply_hwaccel(&mut cmd, hw);
-        cmd.args(["-ss", &format!("{media_time:.4}")])
-            .args(["-i", path])
+        // Bildsequenz ⇒ image2-Demuxer (-framerate/-start_number), sonst -ss.
+        cmd.args(crate::core::export::decode_input_args(path, media_time, seq))
             .args(["-an", "-sn"])
             .args(["-f", "rawvideo", "-pix_fmt", "rgba"]);
         // HDR-Quellen für die SDR-Vorschau tone-mappen (vor dem Skalieren).
@@ -351,6 +355,7 @@ impl ReverseSession {
     #[allow(clippy::too_many_arguments)]
     fn start(
         path: &str,
+        seq: Option<crate::core::export::SeqInput>,
         media_top: f64,
         src_w: u32,
         src_h: u32,
@@ -377,8 +382,7 @@ impl ReverseSession {
         cmd.args(["-v", "error"]);
         apply_hwaccel(&mut cmd, hw);
         let mut child = cmd
-            .args(["-ss", &format!("{chunk_start:.4}")])
-            .args(["-i", path])
+            .args(crate::core::export::decode_input_args(path, chunk_start, seq))
             .args(["-an", "-sn"])
             .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
             .args(["-vf", &format!("{}{setpts}scale={w}:{h}", hdr_tonemap_prefix(hdr))])
@@ -460,8 +464,10 @@ struct Prefetch {
 }
 
 impl Prefetch {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         path: &str,
+        seq: Option<crate::core::export::SeqInput>,
         start_media: f64,
         w: i32,
         h: i32,
@@ -474,9 +480,9 @@ impl Prefetch {
         let mut cmd = Command::new(crate::services::ffmpeg_bin());
         cmd.args(["-v", "error"]);
         apply_hwaccel(&mut cmd, hw);
+        // Bildsequenz ⇒ image2-Demuxer; -r/FrameKey bleiben auf der Sequenzrate.
         let mut child = cmd
-            .args(["-ss", &format!("{start_media:.4}")])
-            .args(["-i", path])
+            .args(crate::core::export::decode_input_args(path, start_media, seq))
             .args(["-an", "-sn"])
             .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
             .args(["-vf", &format!("scale={w}:{h}")])
@@ -684,6 +690,26 @@ fn spawn_audio_pipe(
         }
     });
     Some((child, rx))
+}
+
+/// Zero-Lag-Korrelation (-1..+1) zwischen linkem und rechtem Kanal eines
+/// interleavten Stereoblocks (Phasen-/Mono-Kompatibilitäts-Meter):
+/// `Σ(l·r) / √(Σl²·Σr²)`. +1 = identisch (mono), 0 = dekorreliert, -1 =
+/// gegenphasig. Bei Stille (keine Energie) 0. f64-Akkumulation für Stabilität.
+fn block_correlation(buf: &[f32]) -> f32 {
+    let (mut sxy, mut sxx, mut syy) = (0f64, 0f64, 0f64);
+    for pair in buf.chunks_exact(AUDIO_CHANNELS) {
+        let (l, r) = (pair[0] as f64, pair[1] as f64);
+        sxy += l * r;
+        sxx += l * l;
+        syy += r * r;
+    }
+    let denom = (sxx * syy).sqrt();
+    if denom < 1e-12 {
+        0.0
+    } else {
+        (sxy / denom).clamp(-1.0, 1.0) as f32
+    }
 }
 
 /// Stereo-Puffer in-place umkehren (Frame-weise, L/R erhalten).
@@ -1293,6 +1319,9 @@ fn build_scrub_voice(state: &AppState, pos: f64, master_out: u64) -> Option<Clip
 #[derive(Clone)]
 struct VideoTarget {
     path: String,
+    /// Bildsequenz (VFX-Render): `path` ist das printf-Muster, dekodiert über
+    /// den image2-Demuxer (`-framerate`/`-start_number`). None = Einzelmedium.
+    seq: Option<crate::core::export::SeqInput>,
     media_time: f64,
     src_w: u32,
     src_h: u32,
@@ -1929,6 +1958,7 @@ impl PlayerEngine {
         if needs_restart {
             *session = VideoSession::start(
                 &target.path,
+                target.seq,
                 target.media_time,
                 target.src_w,
                 target.src_h,
@@ -1955,6 +1985,7 @@ impl PlayerEngine {
                 let start = s.start_media_time;
                 *session = VideoSession::start(
                     &path,
+                    target.seq,
                     start,
                     target.src_w,
                     target.src_h,
@@ -2058,6 +2089,7 @@ impl PlayerEngine {
         if needs_restart {
             *session = ReverseSession::start(
                 &target.path,
+                target.seq,
                 target.media_time,
                 target.src_w,
                 target.src_h,
@@ -2148,7 +2180,9 @@ impl PlayerEngine {
             let hw = pick_hw(hw_base, hw_failed, &target.path);
             let count = (end_frame - start_frame + 1) as u64;
             let start_media = start_frame as f64 / fps;
-            if let Some(pf) = Prefetch::start(&target.path, start_media, dw, dh, fps, count, &hw) {
+            if let Some(pf) =
+                Prefetch::start(&target.path, target.seq, start_media, dw, dh, fps, count, &hw)
+            {
                 prefetch.insert(clip_id.clone(), pf);
                 prefetched_at.insert(clip_id.clone(), center);
             }
@@ -2510,6 +2544,8 @@ impl PlayerEngine {
             self.src_clock = None;
             state.audio.track_levels.clear();
             state.audio.master_level = [0.0, 0.0];
+            state.audio.scope_stereo.clear();
+            state.audio.correlation = 0.0;
             // Momentary/Short-Term auf Stille fallen lassen, Integrated +
             // True-Peak als Messergebnis halten.
             self.loudness.pause();
@@ -2525,6 +2561,12 @@ impl PlayerEngine {
         let mut tick_tracks: std::collections::HashMap<String, [f32; 2]> =
             std::collections::HashMap::new();
         let mut tick_master = [0f32; 2];
+        // Goniometer/Korrelation: Snapshot des ZULETZT gemischten Master-Blocks
+        // (mehrere Blöcke je Tick möglich — der jüngste gewinnt; kein Block ⇒
+        // alter Stand bleibt stehen).
+        let mut scope_block: Vec<[f32; 2]> = Vec::new();
+        let mut scope_corr = 0f32;
+        let mut scope_captured = false;
         // Braucht eine Spur-Bus-Kette einen Sidechain-Key (Auto-Ducking)? Dann
         // müssen ALLE Spuren des Blocks zuerst roh vorliegen, um den Key (Summe
         // der ANDEREN Spuren) zu bilden — sonst läuft der billige Einzelpass.
@@ -2670,6 +2712,19 @@ impl PlayerEngine {
             if self.prog_clock.is_some() {
                 self.loudness.feed(&self.mix_buf);
             }
+            // Goniometer/Korrelation aus dem echten Master-Signal (pre-Clip,
+            // wie die Lautheitsmessung): Korrelation über den vollen Block,
+            // Streupunkte ggf. per Stride ausgedünnt.
+            scope_corr = block_correlation(&self.mix_buf);
+            scope_block.clear();
+            let frames = self.mix_buf.len() / AUDIO_CHANNELS;
+            let stride = frames.div_ceil(SCOPE_MAX_POINTS).max(1);
+            for (i, pair) in self.mix_buf.chunks_exact(AUDIO_CHANNELS).enumerate() {
+                if i % stride == 0 {
+                    scope_block.push([pair[0], pair[1]]);
+                }
+            }
+            scope_captured = true;
             for s in self.mix_buf.iter_mut() {
                 *s = s.clamp(-1.0, 1.0);
             }
@@ -2717,6 +2772,10 @@ impl PlayerEngine {
         if wrote_any {
             state.audio.track_levels = tick_tracks;
             state.audio.master_level = tick_master;
+            if scope_captured {
+                state.audio.scope_stereo = std::mem::take(&mut scope_block);
+                state.audio.correlation = scope_corr;
+            }
             let mut fx_gr: std::collections::HashMap<String, f32> =
                 std::collections::HashMap::new();
             for clip in &self.audio_clips {
@@ -2854,10 +2913,23 @@ fn program_video_targets(state: &AppState) -> Vec<(String, VideoTarget)> {
         // bzw. ihr Farbraum ist hier nicht bekannt).
         let from_proxy = use_proxy && asset.has_valid_proxy();
         let hdr = !from_proxy && crate::core::export::OutputColor::from_stream(video).is_hdr();
+        // Bildsequenz: über das printf-Muster (image2) dekodieren, native
+        // Bildrate als SeqInput. Sonst der Proxy-/Originalpfad.
+        let (path, seq) = match &asset.image_seq {
+            Some(s) => (
+                s.pattern.clone(),
+                Some(crate::core::export::SeqInput {
+                    start: s.start,
+                    fps: video.fps,
+                }),
+            ),
+            None => (asset.decode_path(use_proxy).to_string(), None),
+        };
         Some((
             map_id,
             VideoTarget {
-                path: asset.decode_path(use_proxy).to_string(),
+                path,
+                seq,
                 media_time,
                 src_w: video.width.max(2),
                 src_h: video.height.max(2),
@@ -3023,7 +3095,8 @@ fn compose_program_preview(state: &AppState, t: f64, w: usize, h: usize) -> Opti
             return None;
         }
         let image = asset.kind == crate::core::types::MediaKind::Image;
-        let raw = extract_leaf_frame_sync(asset.decode_path(use_proxy), media_t, image, lw, lh)?;
+        let (path, seq) = leaf_decode_src(asset, use_proxy);
+        let raw = extract_leaf_frame_sync(path, seq, media_t, image, lw, lh)?;
         let mut frame = crate::core::pixbuf::rgba8_to_f32(&raw);
         // Sichtbarer Inhalt im transparent gepolsterten Puffer (contain-fit der
         // Quelle, zentriert) — Bezugsrahmen für Effekte/Vignette, exakt wie der
@@ -3091,7 +3164,8 @@ fn compose_nest_preview(
             return None;
         }
         let image = asset.kind == crate::core::types::MediaKind::Image;
-        extract_leaf_frame_sync(asset.decode_path(use_proxy), media_t, image, lw, lh)
+        let (path, seq) = leaf_decode_src(asset, use_proxy);
+        extract_leaf_frame_sync(path, seq, media_t, image, lw, lh)
             .map(|b| crate::core::pixbuf::rgba8_to_f32(&b))
     };
     // Rekursive f32-Komposition → 8-Bit-RGBA (dithered) für den Textur-Upload
@@ -3109,10 +3183,30 @@ fn compose_nest_preview(
     Some(crate::core::pixbuf::f32_to_rgba8_dithered(&f, w, h))
 }
 
+/// Decode-Quelle eines Blatt-Assets für die synchrone Einzelbild-Extraktion:
+/// Bildsequenz ⇒ printf-Muster + SeqInput (native Bildrate), sonst Proxy-/
+/// Originalpfad. Spiegelt `plan::decode_src`/`target_for` für die CPU-Vorschau.
+fn leaf_decode_src(
+    asset: &crate::core::types::MediaAsset,
+    use_proxy: bool,
+) -> (&str, Option<crate::core::export::SeqInput>) {
+    match &asset.image_seq {
+        Some(s) => (
+            &s.pattern,
+            Some(crate::core::export::SeqInput {
+                start: s.start,
+                fps: asset.info.video.first().map(|v| v.fps).unwrap_or(24.0),
+            }),
+        ),
+        None => (asset.decode_path(use_proxy), None),
+    }
+}
+
 /// Ein Blatt-Frame synchron per ffmpeg extrahieren (contain-fit + transparent
 /// gepolstert, w×h RGBA). Blockierend — nur für die Nest-Vorschau (gecacht).
 fn extract_leaf_frame_sync(
     path: &str,
+    seq: Option<crate::core::export::SeqInput>,
     media_t: f64,
     image: bool,
     w: usize,
@@ -3125,11 +3219,12 @@ fn extract_leaf_frame_sync(
     cmd.args(["-v", "error"]);
     if image {
         cmd.args(["-loop", "1", "-framerate", "1"]);
+        cmd.args(["-i", path]);
     } else {
-        cmd.args(["-ss", &format!("{:.4}", media_t.max(0.0))]);
+        // Bildsequenz ⇒ image2-Demuxer (-framerate/-start_number), sonst -ss.
+        cmd.args(crate::core::export::decode_input_args(path, media_t, seq));
     }
-    cmd.args(["-i", path])
-        .args(["-an", "-sn"])
+    cmd.args(["-an", "-sn"])
         .args(["-vf", &filter])
         .args(["-frames:v", "1"])
         .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
@@ -3162,6 +3257,7 @@ fn render_cache_target(state: &AppState) -> Option<VideoTarget> {
     let prog_rate = state.playback.program_rate;
     Some(VideoTarget {
         path: file.to_string_lossy().into_owned(),
+        seq: None,
         media_time: local_time,
         src_w: state.timeline.settings.width.max(2),
         src_h: state.timeline.settings.height.max(2),
@@ -3192,8 +3288,20 @@ fn source_video_target(state: &AppState) -> Option<VideoTarget> {
     let video = asset.info.video.first()?;
     let from_proxy = use_proxy && asset.has_valid_proxy();
     let hdr = !from_proxy && crate::core::export::OutputColor::from_stream(video).is_hdr();
+    // Bildsequenz: über das printf-Muster (image2) dekodieren.
+    let (path, seq) = match &asset.image_seq {
+        Some(s) => (
+            s.pattern.clone(),
+            Some(crate::core::export::SeqInput {
+                start: s.start,
+                fps: video.fps,
+            }),
+        ),
+        None => (asset.decode_path(use_proxy).to_string(), None),
+    };
     Some(VideoTarget {
-        path: asset.decode_path(use_proxy).to_string(),
+        path,
+        seq,
         media_time: state.playback.source.position,
         src_w: video.width.max(2),
         src_h: video.height.max(2),
@@ -3325,6 +3433,40 @@ mod tests {
         let mut b = vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0]; // 3 Frames L/R
         reverse_stereo(&mut b);
         assert_eq!(b, vec![3.0, -3.0, 2.0, -2.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn correlation_meter_mono_inphase_antiphase() {
+        // Interleaved L/R-Blöcke aus einer Sinus-artigen Rampe.
+        let mono: Vec<f32> = (0..256)
+            .flat_map(|i| {
+                let s = ((i as f32 * 0.2).sin()) * 0.8;
+                [s, s] // L == R ⇒ perfekt mono
+            })
+            .collect();
+        assert!((block_correlation(&mono) - 1.0).abs() < 1e-4, "mono ⇒ +1");
+
+        // Gegenphasig: R = −L ⇒ Korrelation −1 (mono-inkompatibel).
+        let anti: Vec<f32> = mono
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], -p[1]])
+            .collect();
+        assert!((block_correlation(&anti) + 1.0).abs() < 1e-4, "gegenphasig ⇒ −1");
+
+        // Dekorreliert: gerade/ungerade Frames füllen je einen Kanal ⇒ ~0.
+        let decorr: Vec<f32> = (0..256)
+            .flat_map(|i| {
+                if i % 2 == 0 {
+                    [((i as f32 * 0.37).sin()), 0.0]
+                } else {
+                    [0.0, ((i as f32 * 0.61).cos())]
+                }
+            })
+            .collect();
+        assert!(block_correlation(&decorr).abs() < 1e-4, "kein Kanal-Overlap ⇒ 0");
+
+        // Stille ⇒ definiert 0 (keine Division durch null).
+        assert_eq!(block_correlation(&[0.0; 64]), 0.0);
     }
 
     /// Drift-Korrektur: über simulierte 30 min mit 0,05 % Quarz-Fehler bleibt

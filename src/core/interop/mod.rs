@@ -876,6 +876,7 @@ fn make_import_asset(m: &InteropMedia, seq_rate: FrameRate, exists: bool, now: f
         proxy_path: None,
         proxy_src_mtime: None,
         proxy_offline: false,
+        image_seq: None,
     }
 }
 

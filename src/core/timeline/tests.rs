@@ -2054,6 +2054,7 @@
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         };
         asset.markers[0].name = "Beat".into();
         let assets = vec![asset];

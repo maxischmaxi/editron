@@ -220,6 +220,13 @@ pub fn build_plan(
             skipped.push(asset.name.clone());
             continue;
         }
+        // Bildsequenzen (VFX-Renders) bestehen aus vielen Einzelframes; das
+        // Konsolidieren würde nur den ersten Frame kopieren (Datenverlust).
+        // Bis zum vollständigen Folder-Copy bleiben sie bewusst ausgeklammert.
+        if asset.image_seq.is_some() {
+            skipped.push(asset.name.clone());
+            continue;
+        }
 
         let dst_name = unique_name(&asset.info.file_name, &mut taken);
         let dst = media_dir.join(&dst_name);
@@ -399,6 +406,7 @@ mod tests {
             proxy_path: None,
             proxy_src_mtime: None,
             proxy_offline: false,
+            image_seq: None,
         }
     }
 

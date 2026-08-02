@@ -78,6 +78,7 @@ fn asset(id: &str, name: &str, path: &str, video: bool, audio: bool, fps: f64) -
         proxy_path: None,
         proxy_src_mtime: None,
         proxy_offline: false,
+        image_seq: None,
     }
 }
 

@@ -308,6 +308,8 @@ fn shared_timeline_bindings() -> Vec<Keybinding> {
         Keybinding::new("subtitle.addAtPlayhead", "Mod+U"),
         Keybinding::new("subtitle.importSrt", "Mod+Alt+U"),
         Keybinding::new("subtitle.exportSrt", "Mod+Shift+U"),
+        // Auto-Transkription des ausgewählten Clips (Whisper-Klasse).
+        Keybinding::new("subtitle.autoTranscribe", "Mod+Alt+T"),
         // Segment am Playhead teilen / mit Nachbarn zusammenführen.
         Keybinding::new("subtitle.split", "Mod+Shift+K"),
         Keybinding::new("subtitle.merge", "Mod+Shift+J"),

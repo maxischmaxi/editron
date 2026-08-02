@@ -40,6 +40,9 @@ pub struct VideoData {
     /// 10-Bit-Ausgabe für CRF/Bitrate-Codecs (HEVC main10 …).
     #[serde(default)]
     pub tenbit: bool,
+    /// Bild-Abtastung (Progressiv/Interlaced); fehlend = progressiv.
+    #[serde(default)]
+    pub scan: export::ScanMode,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -107,6 +110,7 @@ impl PresetData {
                 speed: v.speed,
                 profile: v.profile,
                 tenbit: v.tenbit,
+                scan: v.scan,
             }),
             audio: s.audio.as_ref().map(|a| AudioData {
                 codec: a.codec.id.to_string(),
@@ -146,6 +150,7 @@ impl PresetData {
                 speed: v.speed,
                 profile: v.profile,
                 tenbit: v.tenbit,
+                scan: v.scan,
             }
         });
         let audio = self.audio.as_ref().map(|a| {
@@ -319,6 +324,7 @@ mod tests {
                 speed: 99,
                 profile: 0,
                 tenbit: false,
+                scan: export::ScanMode::Progressive,
             }),
             audio: None,
             loudness: None,

@@ -1188,6 +1188,12 @@ pub fn video_codec_args(
     container: &ContainerDef,
     color: OutputColor,
 ) -> Vec<String> {
+    // Broadcast-Sonderpfad: XDCAM HD422 hat ein festes CBR-Rezept, das nicht in
+    // das generische CRF/Profil-Schema passt (und kein explizites `-profile:v`
+    // verträgt, sonst bricht der MXF-Muxer).
+    if v.codec.id == "xdcamhd422" {
+        return xdcam_hd422_args(v, color);
+    }
     let vaapi = v.encoder.vaapi;
     let mut args: Vec<String> = Vec::new();
     // VAAPI braucht das Render-Device, bevor der Encoder initialisiert wird.
@@ -1235,28 +1241,125 @@ pub fn video_codec_args(
         // Apple-Player erwarten hvc1 statt hev1.
         args.extend(["-tag:v".into(), "hvc1".into()]);
     }
+    // Interlaced-/Feld-Encoder-Flags (Broadcast; progressiv = kein Zusatz).
+    // `effective_scan` klemmt interlaced auf Codecs, die es können (nur XDCAM
+    // erreicht hier aber den frühen Sonderpfad), damit DNxHR/ProRes nie eine
+    // ungültige Feldkodierung oder eine irreführende Interlaced-Markierung
+    // bekommen — auch nicht aus einem alten/hand-editierten Preset.
+    let scan = effective_scan(v.scan, v.codec.id);
+    args.extend(scan_encoder_flags(scan, v.codec.id));
     // RGBA → Ziel-Farbraum wandeln + ehrlich taggen (BT.709 oder, bei
     // erkanntem Wide-Gamut/HDR-Material, BT.2020 (+ PQ/HLG) durchgereicht).
     // VAAPI lädt zusätzlich in eine GPU-Surface.
-    let (prim, trc, space) = color.tags();
-    let mat = color.scale_matrix();
     if vaapi {
+        // VAAPI-Pfad: 8-Bit nv12 in eine GPU-Surface; bleibt beim bisherigen
+        // (eingeschränkten) Color-Tagging, da setparams hinter hwupload nicht
+        // testbar ist. VAAPI ist nie ein Broadcast-/MXF-Pfad.
+        let mat = color.scale_matrix();
         args.extend([
             "-vf".into(),
             format!("scale=out_color_matrix={mat}:out_range=tv,format=nv12,hwupload"),
         ]);
     } else {
         args.extend(["-pix_fmt".into(), pix_fmt.into()]);
-        args.extend(["-vf".into(), format!("scale=out_color_matrix={mat}:out_range=tv")]);
+        args.extend(["-vf".into(), color_filter(color, scan)]);
     }
-    args.extend([
+    args.extend(color_tag_args(color));
+    args
+}
+
+/// scale-Filter (RGB→YUV-Matrix + TV-Range) **plus** `setparams`, der die
+/// Primaries/Transfer/Range/Feldmarkierung auf die Output-Frames schreibt. Der
+/// setparams-Schritt ist nötig: `scale` setzt nur die Matrix (`colorspace`),
+/// lässt Primaries/Transfer aber „unspecified" — diese überschreiben dann die
+/// `-color_*`-Stream-Tags, und ffprobe meldet `color_primaries=unknown` /
+/// `color_transfer=unknown`. Mit setparams überleben **alle** Tags den Mux
+/// (BT.709 wie auch durchgereichtes BT.2020-PQ/HLG), inkl. korrektem
+/// Interlaced-Feldorder.
+fn color_filter(color: OutputColor, scan: ScanMode) -> String {
+    let (prim, trc, space) = color.tags();
+    let mat = color.scale_matrix();
+    format!(
+        "scale=out_color_matrix={mat}:out_range=tv,\
+         setparams=range=tv:color_primaries={prim}:color_trc={trc}:colorspace={space}:field_mode={field}",
+        field = scan.field_mode()
+    )
+}
+
+/// Stream-Color-Tags (`-color_primaries`/`-color_trc`/`-colorspace`).
+fn color_tag_args(color: OutputColor) -> Vec<String> {
+    let (prim, trc, space) = color.tags();
+    vec![
         "-color_primaries".into(),
         prim.into(),
         "-color_trc".into(),
         trc.into(),
         "-colorspace".into(),
         space.into(),
+    ]
+}
+
+/// Effektive Abtastung: interlaced nur dort, wo der Encoder es WIRKLICH kann
+/// (XDCAM HD422). Für alle anderen Codecs wird auf progressiv geklemmt — sonst
+/// bräche der `dnxhd`-Encoder bei interlaced DNxHR ab, und `prores_ks` würde
+/// trotz Interlaced-Wunsch progressiv ausgeben (irreführend getaggt). Greift
+/// auch bei hand-editierten/alten Export-Presets, die eine ungültige
+/// Codec-/Scan-Kombination tragen. Siehe [`codec_supports_interlace`].
+fn effective_scan(scan: ScanMode, codec_id: &str) -> ScanMode {
+    if codec_supports_interlace(codec_id) {
+        scan
+    } else {
+        ScanMode::Progressive
+    }
+}
+
+/// Feld-/Interlaced-Encoder-Flags (Broadcast). Progressiv ⇒ keine. Die
+/// Frame-Feldmarkierung erledigt zusätzlich `setparams` (siehe
+/// [`color_filter`]); diese Flags schalten die eigentliche MPEG-2-Feldkodierung
+/// ein. Nur XDCAM HD422 erreicht diesen Pfad interlaced (siehe
+/// [`effective_scan`]).
+fn scan_encoder_flags(scan: ScanMode, codec_id: &str) -> Vec<String> {
+    if !scan.is_interlaced() || codec_id != "xdcamhd422" {
+        return Vec::new();
+    }
+    // MPEG-2 (XDCAM): Feldkodierung + interlaced DCT, oberes/unteres Feld zuerst.
+    vec![
+        "-flags".into(),
+        "+ilme+ildct".into(),
+        "-top".into(),
+        if scan == ScanMode::InterlacedTff { "1".into() } else { "0".into() },
+    ]
+}
+
+/// XDCAM HD422 (Sony Broadcast): MPEG-2 422P@HL, festes 50-Mbit/s-CBR mit langer
+/// GOP — der Sendeserver-Master. Eigenes Rezept, weil das generische
+/// `-profile:v`-Schema den MXF-OP1a-Muxer bricht: der Muxer liest Profil/Level
+/// aus dem MPEG-2-Bitstream („could not get mpeg2 profile and level"), daher
+/// **kein** explizites `-profile:v` — das 4:2:2-Profil leitet der Encoder aus
+/// `yuv422p` ab. CBR über minrate=maxrate=b:v plus VBV-Puffer; `intra_vlc`/
+/// `non_linear_quant` entsprechen dem Sony-Stream (verlangt `qmax ≤ 28`).
+fn xdcam_hd422_args(v: &VideoSettings, color: OutputColor) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-c:v".into(), "mpeg2video".into()];
+    args.extend(["-pix_fmt".into(), "yuv422p".into()]);
+    // 50 Mbit/s CBR + XDCAM-VBV-Puffer (17 825 792 bit).
+    args.extend([
+        "-b:v".into(), "50M".into(),
+        "-minrate".into(), "50M".into(),
+        "-maxrate".into(), "50M".into(),
+        "-bufsize".into(), "17825792".into(),
     ]);
+    // Lange GOP 15, 2 B-Frames; Sony-Quantisierung (alternative Intra-VLC +
+    // nichtlinearer Quantisierer, der qmax ≤ 28 erzwingt).
+    args.extend([
+        "-g".into(), "15".into(),
+        "-bf".into(), "2".into(),
+        "-intra_vlc".into(), "1".into(),
+        "-non_linear_quant".into(), "1".into(),
+        "-qmax".into(), "28".into(),
+    ]);
+    args.extend(scan_encoder_flags(v.scan, "xdcamhd422"));
+    args.extend(["-vf".into(), color_filter(color, v.scan)]);
+    args.extend(color_tag_args(color));
     args
 }
 
@@ -1641,6 +1744,7 @@ pub fn render_cache_plan(
         speed: 0,
         profile: 0,
         tenbit: false,
+        scan: ScanMode::Progressive,
     };
 
     let fps_s = fps_arg(fps);
@@ -1765,10 +1869,16 @@ fn render_segments(
             cmd.args(["-v", "error"]);
             if layer.image {
                 cmd.args(["-loop", "1", "-framerate", fps]);
+                cmd.args(["-i", &layer.path]);
             } else {
-                cmd.args(["-ss", &format!("{:.4}", layer.src_in)]);
+                // Bildsequenz ⇒ image2-Demuxer (-framerate/-start_number), sonst -ss.
+                cmd.args(crate::core::export::decode_input_args(
+                    &layer.path,
+                    layer.src_in,
+                    layer.seq,
+                ));
             }
-            cmd.args(["-i", &layer.path]).args(["-an", "-sn"]);
+            cmd.args(["-an", "-sn"]);
             // Konstante Geschwindigkeit über dieselbe setpts/fps-Kette wie
             // Vorschau und Compositing-Pfad (identische Frame-Auswahl);
             // Standbild: einen Frame dekodieren, Halte-Logik füllt den Rest.
@@ -1877,6 +1987,8 @@ enum LayerSource {
 /// Vorwärtspfad ⇒ identische Frame-Auswahl) und rückwärts ausgeliefert.
 struct ReverseDecode {
     path: String,
+    /// Bildsequenz (`path` = printf-Muster, image2-Decode). None = Einzelmedium.
+    seq: Option<crate::core::export::SeqInput>,
     /// Komplette -vf-Kette (setpts + fps + scale + pad).
     filter: String,
     /// Pipe-Pixelformat der Quelle ("rgba" = 4 B/px bzw. "rgba64le" = 8 B/px bei
@@ -1909,8 +2021,8 @@ impl ReverseDecode {
         let lo = (top - (want as f64 - 1.0) * self.step).max(0.0);
         let n = (((top - lo) / self.step.max(1e-9)).round() as usize) + 1;
         let mut cmd = Command::new(crate::services::ffmpeg_bin());
-        cmd.args(["-v", "error", "-ss", &format!("{lo:.4}")])
-            .args(["-i", &self.path])
+        cmd.args(["-v", "error"]);
+        cmd.args(crate::core::export::decode_input_args(&self.path, lo, self.seq))
             .args(["-an", "-sn"])
             .args(["-vf", &self.filter])
             .args(["-frames:v", &n.to_string()])
@@ -2248,11 +2360,12 @@ fn leaf_frame(
     cmd.args(["-v", "error"]);
     if info.image {
         cmd.args(["-loop", "1", "-framerate", "1"]);
+        cmd.args(["-i", &info.path]);
     } else {
-        cmd.args(["-ss", &format!("{:.4}", media_t.max(0.0))]);
+        // Bildsequenz ⇒ image2-Demuxer (-framerate/-start_number), sonst -ss.
+        cmd.args(crate::core::export::decode_input_args(&info.path, media_t, info.seq));
     }
-    cmd.args(["-i", &info.path])
-        .args(["-an", "-sn"])
+    cmd.args(["-an", "-sn"])
         .args(["-vf", &filter])
         .args(["-frames:v", "1"])
         .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
@@ -2538,6 +2651,7 @@ fn render_segment_composited(
             let chunk = (192 * 1024 * 1024 / frame_bytes.max(1)).clamp(2, 128);
             LayerSource::Reverse(ReverseDecode {
                 path: plan_layer.path.clone(),
+                seq: plan_layer.seq,
                 filter: filter.clone(),
                 src_fmt: src_fmt.to_string(),
                 media_next: plan_layer.src_in,
@@ -2551,13 +2665,18 @@ fn render_segment_composited(
             cmd.args(["-v", "error"]);
             if plan_layer.image {
                 cmd.args(["-loop", "1", "-framerate", fps_arg]);
+                cmd.args(["-i", &plan_layer.path]);
             } else {
-                cmd.args(["-ss", &format!("{:.4}", plan_layer.src_in)]);
+                // Bildsequenz ⇒ image2-Demuxer (-framerate/-start_number), sonst -ss.
+                cmd.args(crate::core::export::decode_input_args(
+                    &plan_layer.path,
+                    plan_layer.src_in,
+                    plan_layer.seq,
+                ));
             }
             // Standbild: ein Frame genügt — die Halte-Logik füllt den Rest.
             let dec_frames = if freeze { 1 } else { segment.frames };
-            cmd.args(["-i", &plan_layer.path])
-                .args(["-an", "-sn"])
+            cmd.args(["-an", "-sn"])
                 .args(["-vf", &filter])
                 .args(["-frames:v", &dec_frames.to_string()])
                 .args(["-f", "rawvideo", "-pix_fmt", src_fmt])
